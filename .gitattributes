@@ -1,2 +1,5 @@
-go.mod filter=go-mod
-*.go  diff=golang
+# Always use our version of the below files
+/.gitattributes merge=ours
+/.github/* merge=ours
+/build_dist.sh merge=ours
+/README.md merge=ours

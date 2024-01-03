@@ -1,0 +1,95 @@
+# Build
+
+name: build
+
+on:
+  # Run after synchronizing
+  workflow_run:
+    workflows:
+      - sync
+    types:
+      - completed
+
+  # Run when manually triggered
+  workflow_dispatch:
+
+jobs:
+  build_docker:
+    name: Build for Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          install-only: true
+          version: latest
+
+      - name: Build
+        run: build_dist.sh
+
+      - name: Upload 386 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-386
+          path: dist/tailscale-*-minified-386
+          retention-days: 7
+
+      - name: Upload amd64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-amd64
+          path: dist/tailscale-*-minified-amd64
+          retention-days: 7
+
+      - name: Upload arm binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-arm
+          path: dist/tailscale-*-minified-arm
+          retention-days: 7
+
+      - name: Upload arm64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-arm64
+          path: dist/tailscale-*-minified-arm64
+          retention-days: 7
+
+      - name: Upload mips binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-mips
+          path: dist/tailscale-*-minified-mips
+          retention-days: 7
+
+      - name: Upload mipsle binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-mipsle
+          path: dist/tailscale-*-minified-mipsle
+          retention-days: 7
+
+      - name: Upload mips64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-mips64
+          path: dist/tailscale-*-minified-mips64
+          retention-days: 7
+
+      - name: Upload mips64le binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-mips64le
+          path: dist/tailscale-*-minified-mips64le
+          retention-days: 7
+
+      - name: Upload riscv64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-minified-riscv64
+          path: dist/tailscale-*-minified-riscv64
+          retention-days: 7

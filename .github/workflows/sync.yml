@@ -1,0 +1,67 @@
+# Synchronize this repository with its upstream source (tailscale/tailscale)
+
+name: sync
+
+on:
+  # Run every Saturday at 00:00 UTC
+  schedule:
+    - cron: '0 0 * * 6'
+
+  # Run when manually triggered
+  workflow_dispatch:
+
+jobs:
+  synchronize:
+    name: Synchronize with upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      # Checkout downstream (This repository) twice, once for the old state and once for the new state
+      - name: Checkout downstream (Old)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: old
+
+      - name: Checkout downstream (New)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: new
+
+      # Authenticate to Git
+      - name: Authenticate to Git
+        run: |
+          git config --global user.email "github-action@users.noreply.github.com"
+          git config --global user.name "GitHub Action"
+          git config --global user.password "${{ github.token }}"
+
+      # Merge upstream (Will overwrite all changes)
+      - name: Merge upstream
+        working-directory: new
+        run: |
+          git config pull.rebase false
+          git remote add upstream https://github.com/tailscale/tailscale.git
+          git pull --strategy-option theirs --no-edit upstream main
+
+      # Merge downstream (Will restore certain files)
+      - name: Merge downstream
+        run: |
+          for file in .gitattributes .github build_dist.sh README.md; do
+            # Remove the new file
+            rm -rf new/$file
+
+            # Copy the old file
+            cp -rf old/$file new/$file
+          done
+
+      # Commit changes
+      - name: Commit changes
+        working-directory: new
+        continue-on-error: true
+        run: git commit -am "Synchronize with upstream"
+
+      # Push changes
+      - name: Push changes
+        working-directory: new
+        run: git push origin main
