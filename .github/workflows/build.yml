@@ -22,6 +22,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 'stable'
+
+      - name: Download module dependencies
+        run: go mod download
+
       - name: Install UPX
         uses: crazy-max/ghaction-upx@v3
         with:
