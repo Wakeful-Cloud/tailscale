@@ -47,7 +47,7 @@ jobs:
       # Merge downstream (Will restore certain files)
       - name: Merge downstream
         run: |
-          for file in .gitattributes .github build_dist.sh README.md; do
+          for file in .gitattributes .github build_dist.sh get_version.sh README.md; do
             # Remove the new file
             rm -rf new/$file
 

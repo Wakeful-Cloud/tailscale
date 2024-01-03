@@ -2,4 +2,5 @@
 /.gitattributes merge=ours
 /.github/* merge=ours
 /build_dist.sh merge=ours
+/get_version.sh merge=ours
 /README.md merge=ours

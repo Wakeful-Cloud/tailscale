@@ -39,9 +39,76 @@ jobs:
       - name: Build
         run: ./build_dist.sh
 
+      - name: Get the version
+        id: get_version
+        run: echo "::set-output name=version::$(./get_version.sh)"
+
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: tailscale-minified
           path: dist/*
+          retention-days: 45
+
+      - name: Upload 386 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_386
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_386
+          retention-days: 45
+
+      - name: Upload amd64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_amd64
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_amd64
+          retention-days: 45
+
+      - name: Upload arm binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_arm
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_arm
+          retention-days: 45
+
+      - name: Upload arm64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_arm64
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_arm64
+          retention-days: 45
+
+      - name: Upload mips binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_mips
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_mips
+          retention-days: 45
+
+      - name: Upload mipsle binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_mipsle
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_mipsle
+          retention-days: 45
+
+      - name: Upload mips64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_mips64
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_mips64
+          retention-days: 45
+
+      - name: Upload mips64le binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_mips64le
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_mips64le
+          retention-days: 45
+
+      - name: Upload riscv64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale_${{ steps.get_version.outputs.version }}_riscv64
+          path: dist/tailscale_${{ steps.get_version.outputs.version }}_riscv64
           retention-days: 45

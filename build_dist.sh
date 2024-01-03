@@ -1,13 +1,4 @@
 #!/usr/bin/env sh
-#
-# Runs `go build` with flags configured for binary distribution. All
-# it does differently from `go build` is burn git commit and version
-# information into the binaries, so that we can track down user
-# issues.
-#
-# If you're packaging Tailscale for a distro, please consider using
-# this script, or executing equivalent commands in your
-# distro-specific build system.
 
 # Tools
 GO="${GO:-go}"
@@ -24,35 +15,43 @@ done
 # Clean
 rm -rf dist
 
+# Build and minify binaries
+mkdir -p dist
 for GOARCH in 386 amd64 arm arm64 mips mipsle mips64 mips64le riscv64; do
 	# Log
-	echo "Building for $GOARCH..."
+	echo "Building for ${GOARCH}..."
 
 	# Update the environment variables
-	eval `CGO_ENABLED=0 GOOS=$($GO env GOHOSTOS) GOARCH=$($GO env GOHOSTARCH) $GO run ./cmd/mkversion`
-	VERSION_SHORT="$VERSION_SHORT-minified"
-	VERSION_LONG="$VERSION_LONG-minified"
+	eval `CGO_ENABLED=0 GOOS=$(${GO} env GOHOSTOS) GOARCH=$(${GO} env GOHOSTARCH) ${GO} run ./cmd/mkversion`
+	VERSION_LONG="${VERSION_LONG}_minified"
+	VERSION_SHORT="${VERSION_SHORT}_minified"
 
 	# Generate the build information
 	# See https://tailscale.com/kb/1207/small-tailscale#step-1-building-tailscale
 	TAGS="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube"
 	LDFLAGS="-s -w -X tailscale.com/version.longStamp=${VERSION_LONG} -X tailscale.com/version.shortStamp=${VERSION_SHORT}"
-	OUT="dist/tailscale-${VERSION_SHORT}-$GOARCH"
+	DIST="dist/tailscale_${VERSION_SHORT}_${GOARCH}"
+	OUT="${DIST}/tailscaled"
 
 	# Build
-	GOOS=linux GOARCH=$GOARCH $GO build -tags "$TAGS" -ldflags "$LDFLAGS" -o $OUT ./cmd/tailscaled
+	GOOS=linux GOARCH=${GOARCH} ${GO} build -tags "${TAGS}" -ldflags "${LDFLAGS}" -o "${OUT}" ./cmd/tailscaled
 
 	# Log
-	echo "Built $OUT"
+	echo "Built ${OUT}"
 
 	# Minify
-	OLD_SIZE=$(stat -c%s $OUT)
-	if $UPX_BIN --lzma --best $OUT > /dev/null 2>&1 ; then
+	OLD_SIZE=$(stat -c%s "${OUT}")
+	if ${UPX_BIN} --lzma --best "${OUT}" > /dev/null 2>&1 ; then
 		NEW_SIZE=$(stat -c%s $OUT)
 	
 		# Log
-		echo "Compressed $OUT from $OLD_SIZE B to $NEW_SIZE B (Savings: ~$((100 * ($OLD_SIZE - $NEW_SIZE) / $OLD_SIZE))%)"
+		echo "Minified ${OUT} from ${OLD_SIZE} B to ${NEW_SIZE} B (Savings: ~$((100 * (${OLD_SIZE} - ${NEW_SIZE}) / ${OLD_SIZE}))%)"
 	else
-		echo "Failed to compress $OUT (Size: $OLD_SIZE B)"
+		echo "Failed to minify ${OUT} (Size: ${OLD_SIZE} B)"
 	fi
+
+	# Copy systemd files
+	mkdir -p "${DIST}/systemd"
+	cp cmd/tailscaled/tailscaled.defaults "${DIST}/systemd"
+	cp cmd/tailscaled/tailscaled.service "${DIST}/systemd"
 done
