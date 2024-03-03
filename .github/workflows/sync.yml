@@ -39,10 +39,12 @@ jobs:
       # Merge upstream (Will overwrite all changes)
       - name: Merge upstream
         working-directory: new
+        continue-on-error: true
         run: |
           git config pull.rebase false
           git remote add upstream https://github.com/tailscale/tailscale.git
           git pull --strategy-option theirs --no-edit upstream main
+          git diff --name-only --diff-filter=U | xargs git rm
 
       # Merge downstream (Will restore certain files)
       - name: Merge downstream
