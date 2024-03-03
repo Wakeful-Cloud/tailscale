@@ -18,6 +18,7 @@ import (
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc"
+	"tailscale.com/appc/appctest"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
@@ -36,7 +37,6 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
-	"tailscale.com/util/set"
 	"tailscale.com/util/syspolicy"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
@@ -764,9 +764,6 @@ var _ legacyBackend = (*LocalBackend)(nil)
 
 func TestWatchNotificationsCallbacks(t *testing.T) {
 	b := new(LocalBackend)
-	// activeWatchSessions is typically set in NewLocalBackend
-	// so WatchNotifications expects it to be non-empty.
-	b.activeWatchSessions = make(set.Set[string])
 	n := new(ipn.Notify)
 	b.WatchNotifications(context.Background(), 0, func() {
 		b.mu.Lock()
@@ -802,7 +799,7 @@ func TestWatchNotificationsCallbacks(t *testing.T) {
 
 // tests LocalBackend.updateNetmapDeltaLocked
 func TestUpdateNetmapDelta(t *testing.T) {
-	var b LocalBackend
+	b := newTestLocalBackend(t)
 	if b.updateNetmapDeltaLocked(nil) {
 		t.Errorf("updateNetmapDeltaLocked() = true, want false with nil netmap")
 	}
@@ -1169,6 +1166,13 @@ func TestRouteAdvertiser(t *testing.T) {
 	if routes.Len() != 1 || routes.At(0) != testPrefix {
 		t.Fatalf("got routes %v, want %v", routes, []netip.Prefix{testPrefix})
 	}
+
+	must.Do(ra.UnadvertiseRoute(testPrefix))
+
+	routes = b.Prefs().AdvertiseRoutes()
+	if routes.Len() != 0 {
+		t.Fatalf("got routes %v, want none", routes)
+	}
 }
 
 func TestRouterAdvertiserIgnoresContainedRoutes(t *testing.T) {
@@ -1197,14 +1201,62 @@ func TestObserveDNSResponse(t *testing.T) {
 	// ensure no error when no app connector is configured
 	b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
 
-	rc := &routeCollector{}
+	rc := &appctest.RouteCollector{}
 	b.appConnector = appc.NewAppConnector(t.Logf, rc)
 	b.appConnector.UpdateDomains([]string{"example.com"})
+	b.appConnector.Wait(context.Background())
 
 	b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
+	b.appConnector.Wait(context.Background())
 	wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
-	if !slices.Equal(rc.routes, wantRoutes) {
-		t.Fatalf("got routes %v, want %v", rc.routes, wantRoutes)
+	if !slices.Equal(rc.Routes(), wantRoutes) {
+		t.Fatalf("got routes %v, want %v", rc.Routes(), wantRoutes)
+	}
+}
+
+func TestCoveredRouteRangeNoDefault(t *testing.T) {
+	tests := []struct {
+		existingRoute netip.Prefix
+		newRoute      netip.Prefix
+		want          bool
+	}{
+		{
+			existingRoute: netip.MustParsePrefix("192.0.0.1/32"),
+			newRoute:      netip.MustParsePrefix("192.0.0.1/32"),
+			want:          true,
+		},
+		{
+			existingRoute: netip.MustParsePrefix("192.0.0.1/32"),
+			newRoute:      netip.MustParsePrefix("192.0.0.2/32"),
+			want:          false,
+		},
+		{
+			existingRoute: netip.MustParsePrefix("192.0.0.0/24"),
+			newRoute:      netip.MustParsePrefix("192.0.0.1/32"),
+			want:          true,
+		},
+		{
+			existingRoute: netip.MustParsePrefix("192.0.0.0/16"),
+			newRoute:      netip.MustParsePrefix("192.0.0.0/24"),
+			want:          true,
+		},
+		{
+			existingRoute: netip.MustParsePrefix("0.0.0.0/0"),
+			newRoute:      netip.MustParsePrefix("192.0.0.0/24"),
+			want:          false,
+		},
+		{
+			existingRoute: netip.MustParsePrefix("::/0"),
+			newRoute:      netip.MustParsePrefix("2001:db8::/32"),
+			want:          false,
+		},
+	}
+
+	for _, tt := range tests {
+		got := coveredRouteRangeNoDefault([]netip.Prefix{tt.existingRoute}, tt.newRoute)
+		if got != tt.want {
+			t.Errorf("coveredRouteRange(%v, %v) = %v, want %v", tt.existingRoute, tt.newRoute, got, tt.want)
+		}
 	}
 }
 
@@ -1243,6 +1295,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 	}).View()
 
 	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.appConnector.Wait(context.Background())
 
 	want := []string{"example.com"}
 	if !slices.Equal(b.appConnector.Domains().AsSlice(), want) {
@@ -1340,16 +1393,6 @@ func dnsResponse(domain, address string) []byte {
 		panic("invalid address length")
 	}
 	return must.Get(b.Finish())
-}
-
-// routeCollector is a test helper that collects the list of routes advertised
-type routeCollector struct {
-	routes []netip.Prefix
-}
-
-func (rc *routeCollector) AdvertiseRoute(pfx netip.Prefix) error {
-	rc.routes = append(rc.routes, pfx)
-	return nil
 }
 
 type errorSyspolicyHandler struct {
@@ -2122,6 +2165,75 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 			b.onTailnetDefaultAutoUpdate(tt.tailnetDefault)
 			if want, got := tt.after, b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
 				t.Errorf("got: %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestTCPHandlerForDst(t *testing.T) {
+	b := newTestBackend(t)
+
+	tests := []struct {
+		desc      string
+		dst       string
+		intercept bool
+	}{
+		{
+			desc:      "intercept port 80 (Web UI) on quad100 IPv4",
+			dst:       "100.100.100.100:80",
+			intercept: true,
+		},
+		{
+			desc:      "intercept port 80 (Web UI) on quad100 IPv6",
+			dst:       "[fd7a:115c:a1e0::53]:80",
+			intercept: true,
+		},
+		{
+			desc:      "don't intercept port 80 on local ip",
+			dst:       "100.100.103.100:80",
+			intercept: false,
+		},
+		{
+			desc:      "intercept port 8080 (TailFS) on quad100 IPv4",
+			dst:       "100.100.100.100:8080",
+			intercept: true,
+		},
+		{
+			desc:      "intercept port 8080 (TailFS) on quad100 IPv6",
+			dst:       "[fd7a:115c:a1e0::53]:8080",
+			intercept: true,
+		},
+		{
+			desc:      "don't intercept port 8080 on local ip",
+			dst:       "100.100.103.100:8080",
+			intercept: false,
+		},
+		{
+			desc:      "don't intercept port 9080 on quad100 IPv4",
+			dst:       "100.100.100.100:9080",
+			intercept: false,
+		},
+		{
+			desc:      "don't intercept port 9080 on quad100 IPv6",
+			dst:       "[fd7a:115c:a1e0::53]:9080",
+			intercept: false,
+		},
+		{
+			desc:      "don't intercept port 9080 on local ip",
+			dst:       "100.100.103.100:9080",
+			intercept: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.dst, func(t *testing.T) {
+			t.Log(tt.desc)
+			src := netip.MustParseAddrPort("100.100.102.100:51234")
+			h, _ := b.TCPHandlerForDst(src, netip.MustParseAddrPort(tt.dst))
+			if !tt.intercept && h != nil {
+				t.Error("intercepted traffic we shouldn't have")
+			} else if tt.intercept && h == nil {
+				t.Error("failed to intercept traffic we should have")
 			}
 		})
 	}

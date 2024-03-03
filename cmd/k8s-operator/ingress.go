@@ -12,10 +12,12 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,6 +26,12 @@ import (
 	"tailscale.com/types/opt"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/set"
+)
+
+const (
+	tailscaleIngressClassName      = "tailscale"                                   // ingressClass.metadata.name for tailscale IngressClass resource
+	tailscaleIngressControllerName = "tailscale.com/ts-ingress"                    // ingressClass.spec.controllerName for tailscale IngressClass resource
+	ingressClassDefaultAnnotation  = "ingressclass.kubernetes.io/is-default-class" // we do not support this https://kubernetes.io/docs/concepts/services-networking/ingress/#default-ingress-class
 )
 
 type IngressReconciler struct {
@@ -109,6 +117,10 @@ func (a *IngressReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 // This function adds a finalizer to ing, ensuring that we can handle orderly
 // deprovisioning later.
 func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.SugaredLogger, ing *networkingv1.Ingress) error {
+	if err := a.validateIngressClass(ctx); err != nil {
+		logger.Warnf("error validating tailscale IngressClass: %v. In future this might be a terminal error.", err)
+
+	}
 	if !slices.Contains(ing.Finalizers, FinalizerName) {
 		// This log line is printed exactly once during initial provisioning,
 		// because once the finalizer is in place this block gets skipped. So,
@@ -120,6 +132,17 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 			return fmt.Errorf("failed to add finalizer: %w", err)
 		}
 	}
+
+	proxyClass := proxyClassForObject(ing)
+	if proxyClass != "" {
+		if ready, err := proxyClassIsReady(ctx, proxyClass, a.Client); err != nil {
+			return fmt.Errorf("error verifying ProxyClass for Ingress: %w", err)
+		} else if !ready {
+			logger.Infof("ProxyClass %s specified for the Ingress, but is not (yet) Ready, waiting..", proxyClass)
+			return nil
+		}
+	}
+
 	a.mu.Lock()
 	a.managedIngresses.Add(ing.UID)
 	gaugeIngressResources.Set(int64(a.managedIngresses.Len()))
@@ -205,8 +228,23 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 			continue
 		}
 		for _, p := range rule.HTTP.Paths {
+			// Send a warning if folks use Exact path type - to make
+			// it easier for us to support Exact path type matching
+			// in the future if needed.
+			// https://kubernetes.io/docs/concepts/services-networking/ingress/#path-types
+			if *p.PathType == networkingv1.PathTypeExact {
+				msg := "Exact path type strict matching is currently not supported and requests will be routed as for Prefix path type. This behaviour might change in the future."
+				logger.Warnf(fmt.Sprintf("Unsupported Path type exact for path %s. %s", p.Path, msg))
+				a.recorder.Eventf(ing, corev1.EventTypeWarning, "UnsupportedPathTypeExact", msg)
+			}
 			addIngressBackend(&p.Backend, p.Path)
 		}
+	}
+
+	if len(web.Handlers) == 0 {
+		logger.Warn("Ingress contains no valid backends")
+		a.recorder.Eventf(ing, corev1.EventTypeWarning, "NoValidBackends", "no valid backends")
+		return nil
 	}
 
 	crl := childResourceLabels(ing.Name, ing.Namespace, "ingress")
@@ -226,6 +264,11 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		ServeConfig:         sc,
 		Tags:                tags,
 		ChildResourceLabels: crl,
+		ProxyClass:          proxyClass,
+	}
+
+	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {
+		sts.ForwardClusterTrafficViaL7IngressProxy = true
 	}
 
 	if _, err := a.ssr.Provision(ctx, logger, sts); err != nil {
@@ -267,5 +310,28 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 func (a *IngressReconciler) shouldExpose(ing *networkingv1.Ingress) bool {
 	return ing != nil &&
 		ing.Spec.IngressClassName != nil &&
-		*ing.Spec.IngressClassName == "tailscale"
+		*ing.Spec.IngressClassName == tailscaleIngressClassName
+}
+
+// validateIngressClass attempts to validate that 'tailscale' IngressClass
+// included in Tailscale installation manifests exists and has not been modified
+// to attempt to enable features that we do not support.
+func (a *IngressReconciler) validateIngressClass(ctx context.Context) error {
+	ic := &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tailscaleIngressClassName,
+		},
+	}
+	if err := a.Get(ctx, client.ObjectKeyFromObject(ic), ic); apierrors.IsNotFound(err) {
+		return errors.New("Tailscale IngressClass not found in cluster. Latest installation manifests include a tailscale IngressClass - please update")
+	} else if err != nil {
+		return fmt.Errorf("error retrieving 'tailscale' IngressClass: %w", err)
+	}
+	if ic.Spec.Controller != tailscaleIngressControllerName {
+		return fmt.Errorf("Tailscale Ingress class controller name %s does not match tailscale Ingress controller name %s. Ensure that you are using 'tailscale' IngressClass from latest Tailscale installation manifests", ic.Spec.Controller, tailscaleIngressControllerName)
+	}
+	if ic.GetAnnotations()[ingressClassDefaultAnnotation] != "" {
+		return fmt.Errorf("%s annotation is set on 'tailscale' IngressClass, but Tailscale Ingress controller does not support default Ingress class. Ensure that you are using 'tailscale' IngressClass from latest Tailscale installation manifests", ingressClassDefaultAnnotation)
+	}
+	return nil
 }

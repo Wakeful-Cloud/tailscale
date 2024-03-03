@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/google/uuid"
+	"tailscale.com/util/ctxkey"
 )
 
 // RequestID is an opaque identifier for a HTTP request, used to correlate
@@ -24,10 +25,21 @@ import (
 // opaque string. The current implementation uses a UUID.
 type RequestID string
 
+// RequestIDKey stores and loads [RequestID] values within a [context.Context].
+var RequestIDKey ctxkey.Key[RequestID]
+
 // RequestIDHeader is a custom HTTP header that the WithRequestID middleware
 // uses to determine whether to re-use a given request ID from the client
 // or generate a new one.
 const RequestIDHeader = "X-Tailscale-Request-Id"
+
+// GenerateRequestID generates a new request ID with the current format.
+func GenerateRequestID() RequestID {
+	// REQ-1 indicates the version of the RequestID pattern. It is
+	// currently arbitrary but allows for forward compatible
+	// transitions if needed.
+	return RequestID("REQ-1" + uuid.NewString())
+}
 
 // SetRequestID is an HTTP middleware that injects a RequestID in the
 // *http.Request Context. The value of that request id is either retrieved from
@@ -35,29 +47,22 @@ const RequestIDHeader = "X-Tailscale-Request-Id"
 // handlers can retrieve this ID from the RequestIDFromContext function.
 func SetRequestID(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get(RequestIDHeader)
-		if id == "" {
-			// REQ-1 indicates the version of the RequestID pattern. It is
-			// currently arbitrary but allows for forward compatible
-			// transitions if needed.
-			id = "REQ-1" + uuid.NewString()
+		var rid RequestID
+		if id := r.Header.Get(RequestIDHeader); id != "" {
+			rid = RequestID(id)
+		} else {
+			rid = GenerateRequestID()
 		}
-		ctx := withRequestID(r.Context(), RequestID(id))
+		ctx := RequestIDKey.WithValue(r.Context(), rid)
 		r = r.WithContext(ctx)
 		h.ServeHTTP(w, r)
 	})
 }
 
-type requestIDKey struct{}
-
 // RequestIDFromContext retrieves the RequestID from context that can be set by
 // the SetRequestID function.
+//
+// Deprecated: Use [RequestIDKey.Value] instead.
 func RequestIDFromContext(ctx context.Context) RequestID {
-	val, _ := ctx.Value(requestIDKey{}).(RequestID)
-	return val
-}
-
-// withRequestID sets the given request id value in the given context.
-func withRequestID(ctx context.Context, rid RequestID) context.Context {
-	return context.WithValue(ctx, requestIDKey{}, rid)
+	return RequestIDKey.Value(ctx)
 }

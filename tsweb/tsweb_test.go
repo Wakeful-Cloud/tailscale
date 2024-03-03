@@ -11,12 +11,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"tailscale.com/tstest"
+	"tailscale.com/util/must"
 	"tailscale.com/util/vizerror"
 )
 
@@ -166,7 +168,7 @@ func TestStdHandler(t *testing.T) {
 		{
 			name:     "handler returns 404 via HTTPError with request ID",
 			rh:       handlerErr(0, Error(404, "not found", testErr)),
-			r:        req(withRequestID(bgCtx, exampleRequestID), "http://example.com/foo"),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
 			wantCode: 404,
 			wantLog: AccessLogRecord{
 				When:       startTime,
@@ -203,7 +205,7 @@ func TestStdHandler(t *testing.T) {
 		{
 			name:     "handler returns 404 with request ID and nil child error",
 			rh:       handlerErr(0, Error(404, "not found", nil)),
-			r:        req(withRequestID(bgCtx, exampleRequestID), "http://example.com/foo"),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
 			wantCode: 404,
 			wantLog: AccessLogRecord{
 				When:       startTime,
@@ -240,7 +242,7 @@ func TestStdHandler(t *testing.T) {
 		{
 			name:     "handler returns user-visible error with request ID",
 			rh:       handlerErr(0, vizerror.New("visible error")),
-			r:        req(withRequestID(bgCtx, exampleRequestID), "http://example.com/foo"),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
 			wantCode: 500,
 			wantLog: AccessLogRecord{
 				When:       startTime,
@@ -277,7 +279,7 @@ func TestStdHandler(t *testing.T) {
 		{
 			name:     "handler returns user-visible error wrapped by private error with request ID",
 			rh:       handlerErr(0, fmt.Errorf("private internal error: %w", vizerror.New("visible error"))),
-			r:        req(withRequestID(bgCtx, exampleRequestID), "http://example.com/foo"),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
 			wantCode: 500,
 			wantLog: AccessLogRecord{
 				When:       startTime,
@@ -314,7 +316,7 @@ func TestStdHandler(t *testing.T) {
 		{
 			name:     "handler returns generic error with request ID",
 			rh:       handlerErr(0, testErr),
-			r:        req(withRequestID(bgCtx, exampleRequestID), "http://example.com/foo"),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
 			wantCode: 500,
 			wantLog: AccessLogRecord{
 				When:       startTime,
@@ -350,7 +352,7 @@ func TestStdHandler(t *testing.T) {
 		{
 			name:     "handler returns error after writing response with request ID",
 			rh:       handlerErr(200, testErr),
-			r:        req(withRequestID(bgCtx, exampleRequestID), "http://example.com/foo"),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
 			wantCode: 200,
 			wantLog: AccessLogRecord{
 				When:       startTime,
@@ -446,7 +448,7 @@ func TestStdHandler(t *testing.T) {
 		{
 			name:     "error handler gets run with request ID",
 			rh:       handlerErr(0, Error(404, "not found", nil)), // status code changed in errHandler
-			r:        req(withRequestID(bgCtx, exampleRequestID), "http://example.com/"),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/"),
 			wantCode: 200,
 			errHandler: func(w http.ResponseWriter, r *http.Request, e HTTPError) {
 				requestID := RequestIDFromContext(r.Context())
@@ -613,6 +615,94 @@ func TestPort80Handler(t *testing.T) {
 			}
 			if got, want := got.Header.Get("Location"), "https://foo.com/"; got != tt.wantLoc {
 				t.Errorf("Location = %q; want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestCleanRedirectURL(t *testing.T) {
+	tailscaleHost := []string{"tailscale.com"}
+	tailscaleAndOtherHost := []string{"microsoft.com", "tailscale.com"}
+	localHost := []string{"127.0.0.1", "localhost"}
+	myServer := []string{"myserver"}
+	cases := []struct {
+		url     string
+		hosts   []string
+		want    string
+		wantErr bool
+	}{
+		{"http://tailscale.com/foo", tailscaleHost, "http://tailscale.com/foo", false},
+		{"http://tailscale.com/foo", tailscaleAndOtherHost, "http://tailscale.com/foo", false},
+		{"http://microsoft.com/foo", tailscaleAndOtherHost, "http://microsoft.com/foo", false},
+		{"https://tailscale.com/foo", tailscaleHost, "https://tailscale.com/foo", false},
+		{"/foo", tailscaleHost, "/foo", false},
+		{"//tailscale.com/foo", tailscaleHost, "//tailscale.com/foo", false},
+
+		{"/a/foobar", tailscaleHost, "/a/foobar", false},
+		{"http://127.0.0.1/a/foobar", localHost, "http://127.0.0.1/a/foobar", false},
+		{"http://127.0.0.1:123/a/foobar", localHost, "http://127.0.0.1:123/a/foobar", false},
+		{"http://127.0.0.1:31544/a/foobar", localHost, "http://127.0.0.1:31544/a/foobar", false},
+		{"http://localhost/a/foobar", localHost, "http://localhost/a/foobar", false},
+		{"http://localhost:123/a/foobar", localHost, "http://localhost:123/a/foobar", false},
+		{"http://localhost:31544/a/foobar", localHost, "http://localhost:31544/a/foobar", false},
+		{"http://myserver/a/foobar", myServer, "http://myserver/a/foobar", false},
+		{"http://myserver:123/a/foobar", myServer, "http://myserver:123/a/foobar", false},
+		{"http://myserver:31544/a/foobar", myServer, "http://myserver:31544/a/foobar", false},
+		{"http://evil.com/foo", tailscaleHost, "", true},
+		{"//evil.com", tailscaleHost, "", true},
+		{"HttP://tailscale.com", tailscaleHost, "http://tailscale.com", false},
+		{"http://TaIlScAlE.CoM/spongebob", tailscaleHost, "http://TaIlScAlE.CoM/spongebob", false},
+		{"ftp://tailscale.com", tailscaleHost, "", true},
+		{"https:/evil.com", tailscaleHost, "", true},                     // regression test for tailscale/corp#892
+		{"%2Fa%2F44869c061701", tailscaleHost, "/a/44869c061701", false}, // regression test for tailscale/corp#13288
+		{"https%3A%2Ftailscale.com", tailscaleHost, "", true},            // escaped colon-single-slash malformed URL
+		{"", nil, "", false},
+	}
+
+	for _, tc := range cases {
+		gotURL, err := CleanRedirectURL(tc.url, tc.hosts)
+		if err != nil {
+			if !tc.wantErr {
+				t.Errorf("CleanRedirectURL(%q, %v) got error: %v", tc.url, tc.hosts, err)
+			}
+		} else {
+			if tc.wantErr {
+				t.Errorf("CleanRedirectURL(%q, %v) got %q, want an error", tc.url, tc.hosts, gotURL)
+			}
+			if got := gotURL.String(); got != tc.want {
+				t.Errorf("CleanRedirectURL(%q, %v) = %q, want %q", tc.url, tc.hosts, got, tc.want)
+			}
+		}
+	}
+}
+
+func TestBucket(t *testing.T) {
+	tcs := []struct {
+		path string
+		want string
+	}{
+		{"/map", "/map"},
+		{"/key?v=63", "/key"},
+		{"/map/a87e865a9d1c7", "/map/…"},
+		{"/machine/37fc1acb57f256b69b0d76749d814d91c68b241057c6b127fee3df37e4af111e", "/machine/…"},
+		{"/machine/37fc1acb57f256b69b0d76749d814d91c68b241057c6b127fee3df37e4af111e/map", "/machine/…/map"},
+		{"/api/v2/tailnet/jeremiah@squish.com/devices", "/api/v2/tailnet/…/devices"},
+		{"/machine/ssh/wait/5227109621243650/to/7111899293970143/a/a9e4e04cc01b", "/machine/ssh/wait/…/to/…/a/…"},
+		{"/a/831a4bf39856?refreshed=true", "/a/…"},
+		{"/c2n/nxaaa1CNTRL", "/c2n/…"},
+		{"/api/v2/tailnet/blueberries.com/keys/kxaDK21CNTRL", "/api/v2/tailnet/…/keys/…"},
+		{"/api/v2/tailnet/bloop@passkey/devices", "/api/v2/tailnet/…/devices"},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.path, func(t *testing.T) {
+			o := BucketedStatsOptions{}
+			bucket := (&o).bucketForRequest(&http.Request{
+				URL: must.Get(url.Parse(tc.path)),
+			})
+
+			if bucket != tc.want {
+				t.Errorf("bucket for %q was %q, want %q", tc.path, bucket, tc.want)
 			}
 		})
 	}

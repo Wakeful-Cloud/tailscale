@@ -27,12 +27,12 @@ func TestMapResponseContainsNonPatchFields(t *testing.T) {
 		case reflect.Bool:
 			return reflect.ValueOf(true)
 		case reflect.String:
-			if reflect.TypeOf(opt.Bool("")) == t {
+			if reflect.TypeFor[opt.Bool]() == t {
 				return reflect.ValueOf("true").Convert(t)
 			}
 			return reflect.ValueOf("foo").Convert(t)
 		case reflect.Int64:
-			return reflect.ValueOf(int64(1))
+			return reflect.ValueOf(int64(1)).Convert(t)
 		case reflect.Slice:
 			return reflect.MakeSlice(t, 1, 1)
 		case reflect.Ptr:
@@ -43,7 +43,7 @@ func TestMapResponseContainsNonPatchFields(t *testing.T) {
 		panic(fmt.Sprintf("unhandled %v", t))
 	}
 
-	rt := reflect.TypeOf(tailcfg.MapResponse{})
+	rt := reflect.TypeFor[tailcfg.MapResponse]()
 	for i := 0; i < rt.NumField(); i++ {
 		f := rt.Field(i)
 

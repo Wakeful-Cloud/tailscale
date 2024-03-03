@@ -3,6 +3,8 @@ SYNO_ARCH ?= "amd64"
 SYNO_DSM ?= "7"
 TAGS ?= "latest"
 
+PLATFORM ?= "flyio" ## flyio==linux/amd64. Set to "" to build all platforms.
+
 vet: ## Run go vet
 	./tool/go vet ./...
 
@@ -18,7 +20,8 @@ updatedeps: ## Update depaware deps
 	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update \
 		tailscale.com/cmd/tailscaled \
 		tailscale.com/cmd/tailscale \
-		tailscale.com/cmd/derper
+		tailscale.com/cmd/derper \
+		tailscale.com/cmd/stund
 
 depaware: ## Run depaware checks
 	# depaware (via x/tools/go/packages) shells back to "go", so make sure the "go"
@@ -26,7 +29,8 @@ depaware: ## Run depaware checks
 	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check \
 		tailscale.com/cmd/tailscaled \
 		tailscale.com/cmd/tailscale \
-		tailscale.com/cmd/derper
+		tailscale.com/cmd/derper \
+		tailscale.com/cmd/stund
 
 buildwindows: ## Build tailscale CLI for windows/amd64
 	GOOS=windows GOARCH=amd64 ./tool/go install tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled
@@ -86,7 +90,7 @@ publishdevimage: ## Build and publish tailscale image to location specified by $
 	@test "${REPO}" != "ghcr.io/tailscale/tailscale" || (echo "REPO=... must not be ghcr.io/tailscale/tailscale" && exit 1)
 	@test "${REPO}" != "tailscale/k8s-operator" || (echo "REPO=... must not be tailscale/k8s-operator" && exit 1)
 	@test "${REPO}" != "ghcr.io/tailscale/k8s-operator" || (echo "REPO=... must not be ghcr.io/tailscale/k8s-operator" && exit 1)
-	TAGS="${TAGS}" REPOS=${REPO} PUSH=true TARGET=client ./build_docker.sh
+	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=client ./build_docker.sh
 
 publishdevoperator: ## Build and publish k8s-operator image to location specified by ${REPO}
 	@test -n "${REPO}" || (echo "REPO=... required; e.g. REPO=ghcr.io/${USER}/tailscale" && exit 1)
@@ -94,7 +98,7 @@ publishdevoperator: ## Build and publish k8s-operator image to location specifie
 	@test "${REPO}" != "ghcr.io/tailscale/tailscale" || (echo "REPO=... must not be ghcr.io/tailscale/tailscale" && exit 1)
 	@test "${REPO}" != "tailscale/k8s-operator" || (echo "REPO=... must not be tailscale/k8s-operator" && exit 1)
 	@test "${REPO}" != "ghcr.io/tailscale/k8s-operator" || (echo "REPO=... must not be ghcr.io/tailscale/k8s-operator" && exit 1)
-	TAGS="${TAGS}" REPOS=${REPO} PUSH=true TARGET=operator ./build_docker.sh
+	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=operator ./build_docker.sh
 
 help: ## Show this help
 	@echo "\nSpecify a command. The choices are:\n"

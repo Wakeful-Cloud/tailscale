@@ -5,6 +5,7 @@ package cli
 
 import (
 	"bytes"
+	stdcmp "cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,7 +25,6 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
-	"tailscale.com/util/cmpx"
 	"tailscale.com/version/distro"
 )
 
@@ -719,6 +719,24 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "via_route_good_16_bit",
+			goos: "linux",
+			args: upArgsT{
+				advertiseRoutes: "fd7a:115c:a1e0:b1a::aabb:10.0.0.0/112",
+				netfilterMode:   "off",
+			},
+			want: &ipn.Prefs{
+				WantRunning: true,
+				NoSNAT:      true,
+				AdvertiseRoutes: []netip.Prefix{
+					netip.MustParsePrefix("fd7a:115c:a1e0:b1a::aabb:10.0.0.0/112"),
+				},
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
+			},
+		},
+		{
 			name: "via_route_short_prefix",
 			goos: "linux",
 			args: upArgsT{
@@ -734,13 +752,13 @@ func TestPrefsFromUpArgs(t *testing.T) {
 				advertiseRoutes: "fd7a:115c:a1e0:b1a:1234:5678::/112",
 				netfilterMode:   "off",
 			},
-			wantErr: "route fd7a:115c:a1e0:b1a:1234:5678::/112 contains invalid site ID 12345678; must be 0xff or less",
+			wantErr: "route fd7a:115c:a1e0:b1a:1234:5678::/112 contains invalid site ID 12345678; must be 0xffff or less",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var warnBuf tstest.MemLogger
-			goos := cmpx.Or(tt.goos, "linux")
+			goos := stdcmp.Or(tt.goos, "linux")
 			st := tt.st
 			if st == nil {
 				st = new(ipnstate.Status)
@@ -784,7 +802,7 @@ func TestPrefFlagMapping(t *testing.T) {
 		}
 	}
 
-	prefType := reflect.TypeOf(ipn.Prefs{})
+	prefType := reflect.TypeFor[ipn.Prefs]()
 	for i := 0; i < prefType.NumField(); i++ {
 		prefName := prefType.Field(i).Name
 		if prefHasFlag[prefName] {
