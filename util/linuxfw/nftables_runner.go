@@ -173,7 +173,7 @@ func (n *nftablesRunner) DNATNonTailscaleTraffic(tunname string, dst netip.Addr)
 			},
 		},
 	}
-	n.conn.AddRule(dnatRule)
+	n.conn.InsertRule(dnatRule)
 	return n.conn.Flush()
 }
 
@@ -866,7 +866,7 @@ func (n *nftablesRunner) createDummyPostroutingChains() (retErr error) {
 			return fmt.Errorf("create nat table: %w", err)
 		}
 		defer func(fm nftables.TableFamily) {
-			if err := deleteTableIfExists(n.conn, table.Proto, tsDummyTableName); err != nil && retErr == nil {
+			if err := deleteTableIfExists(n.conn, fm, tsDummyTableName); err != nil && retErr == nil {
 				retErr = fmt.Errorf("delete %q table: %w", tsDummyTableName, err)
 			}
 		}(table.Proto)

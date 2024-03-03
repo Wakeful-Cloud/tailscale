@@ -8,6 +8,7 @@ import ACLTag from "src/components/acl-tag"
 import * as Control from "src/components/control-components"
 import NiceIP from "src/components/nice-ip"
 import { UpdateAvailableNotification } from "src/components/update-available"
+import { AuthResponse, canEdit } from "src/hooks/auth"
 import { NodeData } from "src/types"
 import Button from "src/ui/button"
 import Card from "src/ui/card"
@@ -16,11 +17,11 @@ import QuickCopy from "src/ui/quick-copy"
 import { useLocation } from "wouter"
 
 export default function DeviceDetailsView({
-  readonly,
   node,
+  auth,
 }: {
-  readonly: boolean
   node: NodeData
+  auth: AuthResponse
 }) {
   return (
     <>
@@ -37,11 +38,11 @@ export default function DeviceDetailsView({
                 })}
               />
             </div>
-            {!readonly && <DisconnectDialog />}
+            {canEdit("account", auth) && <DisconnectDialog />}
           </div>
         </Card>
         {node.Features["auto-update"] &&
-          !readonly &&
+          canEdit("account", auth) &&
           node.ClientVersion &&
           !node.ClientVersion.RunningLatest && (
             <UpdateAvailableNotification details={node.ClientVersion} />
@@ -226,24 +227,22 @@ function DisconnectDialog() {
   return (
     <Dialog
       className="max-w-md"
-      title="Disconnect"
-      trigger={<Button sizeVariant="small">Disconnect…</Button>}
+      title="Log out"
+      trigger={<Button sizeVariant="small">Log out…</Button>}
     >
       <Dialog.Form
         cancelButton
-        submitButton="Disconnect"
+        submitButton="Log out"
         destructive
         onSubmit={() => {
           api({ action: "logout" })
           setLocation("/disconnected")
         }}
       >
-        You are about to disconnect this device from your tailnet. To reconnect,
-        you will be required to re-authenticate this device.
-        <p className="mt-4 text-sm text-text-muted">
-          Your connection to this web interface will end as soon as you click
-          disconnect.
-        </p>
+        Logging out of this device will disconnect it from your tailnet and
+        expire its node key. You won’t be able to use this web interface until
+        you re-authenticate the device from either the Tailscale app or the
+        Tailscale command line interface.
       </Dialog.Form>
     </Dialog>
   )

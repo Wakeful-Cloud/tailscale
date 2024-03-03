@@ -2,16 +2,17 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import React from "react"
-import { ReactComponent as TailscaleIcon } from "src/assets/icons/tailscale-icon.svg"
+import TailscaleIcon from "src/assets/icons/tailscale-icon.svg?react"
 import LoginToggle from "src/components/login-toggle"
 import DeviceDetailsView from "src/components/views/device-details-view"
+import DisconnectedView from "src/components/views/disconnected-view"
 import HomeView from "src/components/views/home-view"
 import LoginView from "src/components/views/login-view"
 import SSHView from "src/components/views/ssh-view"
 import SubnetRouterView from "src/components/views/subnet-router-view"
 import { UpdatingView } from "src/components/views/updating-view"
-import useAuth, { AuthResponse } from "src/hooks/auth"
-import { Feature, featureDescription, NodeData } from "src/types"
+import useAuth, { AuthResponse, canEdit } from "src/hooks/auth"
+import { Feature, NodeData, featureDescription } from "src/types"
 import Card from "src/ui/card"
 import EmptyState from "src/ui/empty-state"
 import LoadingDots from "src/ui/loading-dots"
@@ -55,16 +56,19 @@ function WebClient({
         <Header node={node} auth={auth} newSession={newSession} />
         <Switch>
           <Route path="/">
-            <HomeView readonly={!auth.canManageNode} node={node} />
+            <HomeView node={node} auth={auth} />
           </Route>
           <Route path="/details">
-            <DeviceDetailsView readonly={!auth.canManageNode} node={node} />
+            <DeviceDetailsView node={node} auth={auth} />
           </Route>
           <FeatureRoute path="/subnets" feature="advertise-routes" node={node}>
-            <SubnetRouterView readonly={!auth.canManageNode} node={node} />
+            <SubnetRouterView
+              readonly={!canEdit("subnets", auth)}
+              node={node}
+            />
           </FeatureRoute>
           <FeatureRoute path="/ssh" feature="ssh" node={node}>
-            <SSHView readonly={!auth.canManageNode} node={node} />
+            <SSHView readonly={!canEdit("ssh", auth)} node={node} />
           </FeatureRoute>
           {/* <Route path="/serve">Share local content</Route> */}
           <FeatureRoute path="/update" feature="auto-update" node={node}>
@@ -74,9 +78,7 @@ function WebClient({
             />
           </FeatureRoute>
           <Route path="/disconnected">
-            <Card className="mt-8">
-              <EmptyState description="You have been disconnected" />
-            </Card>
+            <DisconnectedView />
           </Route>
           <Route>
             <Card className="mt-8">
