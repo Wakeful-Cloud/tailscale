@@ -331,23 +331,7 @@ func TestUpdatePeersStateFromResponse(t *testing.T) {
 			}),
 			wantStats: updateStats{changed: 1},
 		},
-		{
-			name: "change_capabilities",
-			prev: peers(n(1, "foo")),
-			mapRes: &tailcfg.MapResponse{
-				PeersChangedPatch: []*tailcfg.PeerChange{{
-					NodeID:       1,
-					Capabilities: ptr.To([]tailcfg.NodeCapability{"foo"}),
-				}},
-			},
-			want: peers(&tailcfg.Node{
-				ID:           1,
-				Name:         "foo",
-				Capabilities: []tailcfg.NodeCapability{"foo"},
-			}),
-			wantStats: updateStats{changed: 1},
-		}}
-
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if !tt.curTime.IsZero() {
@@ -784,18 +768,6 @@ func TestPeerChangeDiff(t *testing.T) {
 			want: &tailcfg.PeerChange{NodeID: 1, LastSeen: ptr.To(time.Unix(2, 0))},
 		},
 		{
-			name: "patch-capabilities-to-nonempty",
-			a:    &tailcfg.Node{ID: 1, Capabilities: []tailcfg.NodeCapability{"foo"}},
-			b:    &tailcfg.Node{ID: 1, Capabilities: []tailcfg.NodeCapability{"bar"}},
-			want: &tailcfg.PeerChange{NodeID: 1, Capabilities: ptr.To([]tailcfg.NodeCapability{"bar"})},
-		},
-		{
-			name: "patch-capabilities-to-empty",
-			a:    &tailcfg.Node{ID: 1, Capabilities: []tailcfg.NodeCapability{"foo"}},
-			b:    &tailcfg.Node{ID: 1},
-			want: &tailcfg.PeerChange{NodeID: 1, Capabilities: ptr.To([]tailcfg.NodeCapability(nil))},
-		},
-		{
 			name: "patch-online-to-true",
 			a:    &tailcfg.Node{ID: 1, Online: ptr.To(false)},
 			b:    &tailcfg.Node{ID: 1, Online: ptr.To(true)},
@@ -848,7 +820,41 @@ func TestPeerChangeDiff(t *testing.T) {
 			a:    &tailcfg.Node{ID: 1, SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
 			b:    &tailcfg.Node{ID: 1, SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3006"))},
 			want: nil,
-		}}
+		},
+		{
+			name: "patch-capmap-add-value-to-existing-key",
+			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: []tailcfg.RawMessage{"true"}}},
+			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: []tailcfg.RawMessage{"true"}}},
+		},
+		{
+			name: "patch-capmap-add-new-key",
+			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil, tailcfg.CapabilityDebug: nil}},
+			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil, tailcfg.CapabilityDebug: nil}},
+		}, {
+			name: "patch-capmap-remove-key",
+			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{}},
+			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{}},
+		}, {
+			name: "patch-capmap-remove-as-nil",
+			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			b:    &tailcfg.Node{ID: 1},
+			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{}},
+		}, {
+			name: "patch-capmap-add-key-to-empty-map",
+			a:    &tailcfg.Node{ID: 1},
+			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+		},
+		{
+			name:      "patch-capmap-no-change",
+			a:         &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			b:         &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			wantEqual: true,
+		},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pc, ok := peerChangeDiff(tt.a.View(), tt.b)

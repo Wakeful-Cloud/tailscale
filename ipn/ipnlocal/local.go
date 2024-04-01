@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -86,6 +87,7 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/deephash"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
@@ -176,10 +178,15 @@ type LocalBackend struct {
 	logFlushFunc          func()           // or nil if SetLogFlusher wasn't called
 	em                    *expiryManager   // non-nil
 	sshAtomicBool         atomic.Bool
-	webClientAtomicBool   atomic.Bool
-	shutdownCalled        bool // if Shutdown has been called
-	debugSink             *capture.Sink
-	sockstatLogger        *sockstatlog.Logger
+	// webClientAtomicBool controls whether the web client is running. This should
+	// be true unless the disable-web-client node attribute has been set.
+	webClientAtomicBool atomic.Bool
+	// exposeRemoteWebClientAtomicBool controls whether the web client is exposed over
+	// Tailscale on port 5252.
+	exposeRemoteWebClientAtomicBool atomic.Bool
+	shutdownCalled                  bool // if Shutdown has been called
+	debugSink                       *capture.Sink
+	sockstatLogger                  *sockstatlog.Logger
 
 	// getTCPHandlerForFunnelFlow returns a handler for an incoming TCP flow for
 	// the provided srcAddr and dstPort if one exists.
@@ -308,6 +315,13 @@ type LocalBackend struct {
 
 	// Last ClientVersion received in MapResponse, guarded by mu.
 	lastClientVersion *tailcfg.ClientVersion
+
+	// lastNotifiedTailFSShares keeps track of the last set of shares that we
+	// notified about.
+	lastNotifiedTailFSShares atomic.Pointer[views.SliceView[*tailfs.Share, tailfs.ShareView]]
+
+	// outgoingFiles keeps track of Taildrop outgoing files keyed to their OutgoingFile.ID
+	outgoingFiles map[string]*ipn.OutgoingFile
 }
 
 type updateStatus struct {
@@ -431,10 +445,12 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	// initialize TailFS shares from saved state
 	fs, ok := b.sys.TailFSForRemote.GetOK()
 	if ok {
-		b.mu.Lock()
-		shares, err := b.tailFSGetSharesLocked()
-		b.mu.Unlock()
-		if err == nil && len(shares) > 0 {
+		currentShares := b.pm.prefs.TailFSShares()
+		if currentShares.Len() > 0 {
+			var shares []*tailfs.Share
+			for i := 0; i < currentShares.Len(); i++ {
+				shares = append(shares, currentShares.At(i).AsStruct())
+			}
 			fs.SetShares(shares)
 		}
 	}
@@ -812,15 +828,16 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 			ss.UserID = b.netMap.User()
 			if sn := b.netMap.SelfNode; sn.Valid() {
 				peerStatusFromNode(ss, sn)
-				if c := sn.Capabilities(); c.Len() > 0 {
-					ss.Capabilities = c.AsSlice()
-				}
 				if cm := sn.CapMap(); cm.Len() > 0 {
+					ss.Capabilities = make([]tailcfg.NodeCapability, 1, cm.Len()+1)
+					ss.Capabilities[0] = "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508"
 					ss.CapMap = make(tailcfg.NodeCapMap, sn.CapMap().Len())
 					cm.Range(func(k tailcfg.NodeCapability, v views.Slice[tailcfg.RawMessage]) bool {
 						ss.CapMap[k] = v.AsSlice()
+						ss.Capabilities = append(ss.Capabilities, k)
 						return true
 					})
+					slices.Sort(ss.Capabilities[1:])
 				}
 			}
 			for _, addr := range tailscaleIPs {
@@ -1153,8 +1170,8 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 
 	// Perform all reconfiguration based on the netmap here.
 	if st.NetMap != nil {
-		b.capTailnetLock = hasCapability(st.NetMap, tailcfg.CapabilityTailnetLock)
-		b.setWebClientAtomicBoolLocked(st.NetMap, prefs.View())
+		b.capTailnetLock = st.NetMap.HasCap(tailcfg.CapabilityTailnetLock)
+		b.setWebClientAtomicBoolLocked(st.NetMap)
 
 		b.mu.Unlock() // respect locking rules for tkaSyncIfNeeded
 		if err := b.tkaSyncIfNeeded(st.NetMap, prefs.View()); err != nil {
@@ -1190,7 +1207,7 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 	}
 
 	if st.NetMap != nil {
-		if envknob.NoLogsNoSupport() && hasCapability(st.NetMap, tailcfg.CapabilityDataPlaneAuditLogs) {
+		if envknob.NoLogsNoSupport() && st.NetMap.HasCap(tailcfg.CapabilityDataPlaneAuditLogs) {
 			msg := "tailnet requires logging to be enabled. Remove --no-logs-no-support from tailscaled command line."
 			health.SetLocalLogConfigHealth(errors.New(msg))
 			// Connecting to this tailnet without logging is forbidden; boot us outta here.
@@ -1218,6 +1235,7 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 
 		b.e.SetNetworkMap(st.NetMap)
 		b.MagicConn().SetDERPMap(st.NetMap.DERPMap)
+		b.MagicConn().SetOnlyTCP443(st.NetMap.HasCap(tailcfg.NodeAttrOnlyTCP443))
 
 		// Update our cached DERP map
 		dnsfallback.UpdateCache(st.NetMap.DERPMap, b.logf)
@@ -2283,15 +2301,7 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 			ini.NetMap = b.netMap
 		}
 		if mask&ipn.NotifyInitialTailFSShares != 0 && b.tailFSSharingEnabledLocked() {
-			shares, err := b.tailFSGetSharesLocked()
-			if err != nil {
-				b.logf("unable to notify initial tailfs shares: %v", err)
-			} else {
-				ini.TailFSShares = make(map[string]*tailfs.Share, len(shares))
-				for _, share := range shares {
-					ini.TailFSShares[share.Name] = share
-				}
-			}
+			ini.TailFSShares = b.pm.prefs.TailFSShares()
 		}
 	}
 
@@ -2367,6 +2377,20 @@ func (b *LocalBackend) pollRequestEngineStatus(ctx context.Context) {
 // It should only be used via the LocalAPI's debug handler.
 func (b *LocalBackend) DebugNotify(n ipn.Notify) {
 	b.send(n)
+}
+
+// DebugNotifyLastNetMap injects a fake notify message to clients,
+// repeating whatever the last netmap was.
+//
+// It should only be used via the LocalAPI's debug handler.
+func (b *LocalBackend) DebugNotifyLastNetMap() {
+	b.mu.Lock()
+	nm := b.netMap
+	b.mu.Unlock()
+
+	if nm != nil {
+		b.send(ipn.Notify{NetMap: nm})
+	}
 }
 
 // DebugForceNetmapUpdate forces a full no-op netmap update of the current
@@ -2491,11 +2515,21 @@ func (b *LocalBackend) validPopBrowserURL(urlStr string) bool {
 	if err != nil {
 		return false
 	}
+	serverURL := b.Prefs().ControlURLOrDefault()
+	if ipn.IsLoginServerSynonym(serverURL) {
+		// When connected to the official Tailscale control plane, only allow
+		// URLs from tailscale.com or its subdomains.
+		if h := u.Hostname(); h != "tailscale.com" && !strings.HasSuffix(u.Hostname(), ".tailscale.com") {
+			return false
+		}
+		// When using a different ControlURL, we cannot be sure what legitimate
+		// PopBrowserURLs they will send. Allow any domain there to avoid
+		// breaking existing user setups.
+	}
 	switch u.Scheme {
 	case "https":
 		return true
 	case "http":
-		serverURL := b.Prefs().ControlURLOrDefault()
 		// If the control server is using plain HTTP (likely a dev server),
 		// then permit http://.
 		return strings.HasPrefix(serverURL, "http://")
@@ -2697,11 +2731,12 @@ func (b *LocalBackend) setTCPPortsIntercepted(ports []uint16) {
 	b.shouldInterceptTCPPortAtomic.Store(f)
 }
 
-// setAtomicValuesFromPrefsLocked populates sshAtomicBool, containsViaIPFuncAtomic
-// and shouldInterceptTCPPortAtomic from the prefs p, which may be !Valid().
+// setAtomicValuesFromPrefsLocked populates sshAtomicBool, containsViaIPFuncAtomic,
+// shouldInterceptTCPPortAtomic, and exposeRemoteWebClientAtomicBool from the prefs p,
+// which may be !Valid().
 func (b *LocalBackend) setAtomicValuesFromPrefsLocked(p ipn.PrefsView) {
 	b.sshAtomicBool.Store(p.Valid() && p.RunSSH() && envknob.CanSSHD())
-	b.setWebClientAtomicBoolLocked(b.netMap, p)
+	b.setExposeRemoteWebClientAtomicBoolLocked(p)
 
 	if !p.Valid() {
 		b.containsViaIPFuncAtomic.Store(tsaddr.FalseContainsIPFunc())
@@ -3040,7 +3075,7 @@ func (b *LocalBackend) checkSSHPrefsLocked(p *ipn.Prefs) error {
 		return nil
 	}
 	if b.netMap != nil {
-		if !hasCapability(b.netMap, tailcfg.CapabilitySSH) {
+		if !b.netMap.HasCap(tailcfg.CapabilitySSH) {
 			if b.isDefaultServerLocked() {
 				return errors.New("Unable to enable local Tailscale SSH server; not enabled on Tailnet. See https://tailscale.com/s/ssh")
 			}
@@ -3065,9 +3100,8 @@ func (b *LocalBackend) sshOnButUnusableHealthCheckMessageLocked() (healthMessage
 		return ""
 	}
 	isDefault := b.isDefaultServerLocked()
-	isAdmin := hasCapability(nm, tailcfg.CapabilityAdmin)
 
-	if !isAdmin {
+	if !nm.HasCap(tailcfg.CapabilityAdmin) {
 		return healthmsg.TailscaleSSHOnBut + "access controls don't allow anyone to access this device. Ask your admin to update your tailnet's ACLs to allow access."
 	}
 	if !isDefault {
@@ -3334,6 +3368,8 @@ func (b *LocalBackend) TCPHandlerForDst(src, dst netip.AddrPort) (handler func(c
 	if hittingServiceIP {
 		switch dst.Port() {
 		case 80:
+			// TODO(mpminardi): do we want to show an error message if the web client
+			// has been disabled instead of the more "basic" web UI?
 			if b.ShouldRunWebClient() {
 				return b.handleWebClientConn, opts
 			}
@@ -3358,7 +3394,7 @@ func (b *LocalBackend) TCPHandlerForDst(src, dst netip.AddrPort) (handler func(c
 		return b.handleSSHConn, opts
 	}
 	// TODO(will,sonia): allow customizing web client port ?
-	if dst.Port() == webClientPort && b.ShouldRunWebClient() {
+	if dst.Port() == webClientPort && b.ShouldExposeRemoteWebClient() {
 		return b.handleWebClientConn, opts
 	}
 	if port, ok := b.GetPeerAPIPort(dst.Addr()); ok && dst.Port() == port {
@@ -3535,7 +3571,7 @@ func (b *LocalBackend) authReconfig() {
 	prefs := b.pm.CurrentPrefs()
 	nm := b.netMap
 	hasPAC := b.prevIfState.HasPAC()
-	disableSubnetsIfPAC := hasCapability(nm, tailcfg.NodeAttrDisableSubnetsIfPAC)
+	disableSubnetsIfPAC := nm.HasCap(tailcfg.NodeAttrDisableSubnetsIfPAC)
 	dohURL, dohURLOK := exitNodeCanProxyDNS(nm, b.peers, prefs.ExitNodeID())
 	dcfg := dnsConfigForNetmap(nm, b.peers, prefs, b.logf, version.OS())
 	// If the current node is an app connector, ensure the app connector machine is started
@@ -4486,12 +4522,37 @@ func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Load() && en
 // call regardless of whether b.mu is held or not.
 func (b *LocalBackend) ShouldRunWebClient() bool { return b.webClientAtomicBool.Load() }
 
-func (b *LocalBackend) setWebClientAtomicBoolLocked(nm *netmap.NetworkMap, prefs ipn.PrefsView) {
-	shouldRun := prefs.Valid() && prefs.RunWebClient()
+// ShouldExposeRemoteWebClient reports whether the web client should
+// accept connections via [tailscale IP]:5252 in addition to the default
+// behaviour of accepting local connections over 100.100.100.100.
+//
+// This function checks both the web client user pref via
+// exposeRemoteWebClientAtomicBool and the disable-web-client node attr
+// via ShouldRunWebClient to determine whether the web client should be
+// exposed.
+func (b *LocalBackend) ShouldExposeRemoteWebClient() bool {
+	return b.ShouldRunWebClient() && b.exposeRemoteWebClientAtomicBool.Load()
+}
+
+// setWebClientAtomicBoolLocked sets webClientAtomicBool based on whether
+// tailcfg.NodeAttrDisableWebClient has been set in the netmap.NetworkMap.
+//
+// b.mu must be held.
+func (b *LocalBackend) setWebClientAtomicBoolLocked(nm *netmap.NetworkMap) {
+	shouldRun := !nm.HasCap(tailcfg.NodeAttrDisableWebClient)
 	wasRunning := b.webClientAtomicBool.Swap(shouldRun)
 	if wasRunning && !shouldRun {
 		go b.webClientShutdown() // stop web client
 	}
+}
+
+// setExposeRemoteWebClientAtomicBoolLocked sets exposeRemoteWebClientAtomicBool
+// based on whether the RunWebClient pref is set.
+//
+// b.mu must be held.
+func (b *LocalBackend) setExposeRemoteWebClientAtomicBoolLocked(prefs ipn.PrefsView) {
+	shouldExpose := prefs.Valid() && prefs.RunWebClient()
+	b.exposeRemoteWebClientAtomicBool.Store(shouldExpose)
 }
 
 // ShouldHandleViaIP reports whether ip is an IPv6 address in the
@@ -4575,13 +4636,6 @@ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
 	cc.SetNetInfo(ni)
 }
 
-func hasCapability(nm *netmap.NetworkMap, cap tailcfg.NodeCapability) bool {
-	if nm != nil {
-		return nm.SelfNode.HasCap(cap)
-	}
-	return false
-}
-
 // setNetMapLocked updates the LocalBackend state to reflect the newly
 // received nm. If nm is nil, it resets all configuration as though
 // Tailscale is turned off.
@@ -4610,15 +4664,15 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	}
 
 	// Determine if file sharing is enabled
-	fs := hasCapability(nm, tailcfg.CapabilityFileSharing)
+	fs := nm.HasCap(tailcfg.CapabilityFileSharing)
 	if fs != b.capFileSharing {
 		osshare.SetFileSharingEnabled(fs, b.logf)
 	}
 	b.capFileSharing = fs
 
-	if hasCapability(nm, tailcfg.NodeAttrLinuxMustUseIPTables) {
+	if nm.HasCap(tailcfg.NodeAttrLinuxMustUseIPTables) {
 		b.capForcedNetfilter = "iptables"
-	} else if hasCapability(nm, tailcfg.NodeAttrLinuxMustUseNfTables) {
+	} else if nm.HasCap(tailcfg.NodeAttrLinuxMustUseNfTables) {
 		b.capForcedNetfilter = "nftables"
 	} else {
 		b.capForcedNetfilter = "" // empty string means client can auto-detect
@@ -4630,8 +4684,8 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	b.setDebugLogsByCapabilityLocked(nm)
 
 	// See the netns package for documentation on what this capability does.
-	netns.SetBindToInterfaceByRoute(hasCapability(nm, tailcfg.CapabilityBindToInterfaceByRoute))
-	netns.SetDisableBindConnToInterface(hasCapability(nm, tailcfg.CapabilityDebugDisableBindConnToInterface))
+	netns.SetBindToInterfaceByRoute(nm.HasCap(tailcfg.CapabilityBindToInterfaceByRoute))
+	netns.SetDisableBindConnToInterface(nm.HasCap(tailcfg.CapabilityDebugDisableBindConnToInterface))
 
 	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(b.pm.CurrentPrefs())
 	if nm == nil {
@@ -4667,10 +4721,8 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 		}
 	}
 
-	if b.tailFSSharingEnabledLocked() {
-		b.updateTailFSPeersLocked(nm)
-		b.tailFSNotifyCurrentSharesLocked()
-	}
+	b.updateTailFSPeersLocked(nm)
+	b.tailFSNotifyCurrentSharesLocked()
 }
 
 func (b *LocalBackend) updatePeersFromNetmapLocked(nm *netmap.NetworkMap) {
@@ -4704,7 +4756,111 @@ type tailFSTransport struct {
 	b *LocalBackend
 }
 
-func (t *tailFSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+// responseBodyWrapper wraps an io.ReadCloser and stores
+// the number of bytesRead.
+type responseBodyWrapper struct {
+	io.ReadCloser
+	bytesRx       int64
+	bytesTx       int64
+	log           logger.Logf
+	method        string
+	statusCode    int
+	contentType   string
+	fileExtension string
+	shareNodeKey  string
+	selfNodeKey   string
+	contentLength int64
+}
+
+// logAccess logs the tailfs: access: log line. If the logger is nil,
+// the log will not be written.
+func (rbw *responseBodyWrapper) logAccess(err string) {
+	if rbw.log == nil {
+		return
+	}
+
+	// Some operating systems create and copy lots of 0 length hidden files for
+	// tracking various states. Omit these to keep logs from being too verbose.
+	if rbw.contentLength > 0 {
+		rbw.log("tailfs: access: %s from %s to %s: status-code=%d ext=%q content-type=%q content-length=%.f tx=%.f rx=%.f err=%q", rbw.method, rbw.selfNodeKey, rbw.shareNodeKey, rbw.statusCode, rbw.fileExtension, rbw.contentType, roundTraffic(rbw.contentLength), roundTraffic(rbw.bytesTx), roundTraffic(rbw.bytesRx), err)
+	}
+}
+
+// Read implements the io.Reader interface.
+func (rbw *responseBodyWrapper) Read(b []byte) (int, error) {
+	n, err := rbw.ReadCloser.Read(b)
+	rbw.bytesRx += int64(n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		rbw.logAccess(err.Error())
+	}
+
+	return n, err
+}
+
+// Close implements the io.Close interface.
+func (rbw *responseBodyWrapper) Close() error {
+	err := rbw.ReadCloser.Close()
+	var errStr string
+	if err != nil {
+		errStr = err.Error()
+	}
+	rbw.logAccess(errStr)
+
+	return err
+}
+
+func (t *tailFSTransport) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+	bw := &requestBodyWrapper{}
+	if req.Body != nil {
+		bw.ReadCloser = req.Body
+		req.Body = bw
+	}
+
+	defer func() {
+		contentType := "unknown"
+		switch req.Method {
+		case httpm.PUT:
+			if ct := req.Header.Get("Content-Type"); ct != "" {
+				contentType = ct
+			}
+		case httpm.GET:
+			if ct := resp.Header.Get("Content-Type"); ct != "" {
+				contentType = ct
+			}
+		default:
+			return
+		}
+
+		t.b.mu.Lock()
+		selfNodeKey := t.b.netMap.SelfNode.Key().ShortString()
+		t.b.mu.Unlock()
+		n, _, ok := t.b.WhoIs(netip.MustParseAddrPort(req.URL.Host))
+		shareNodeKey := "unknown"
+		if ok {
+			shareNodeKey = string(n.Key().ShortString())
+		}
+
+		rbw := responseBodyWrapper{
+			log:           t.b.logf,
+			method:        req.Method,
+			bytesTx:       int64(bw.bytesRead),
+			selfNodeKey:   selfNodeKey,
+			shareNodeKey:  shareNodeKey,
+			contentType:   contentType,
+			contentLength: resp.ContentLength,
+			fileExtension: parseTailFSFileExtensionForLog(req.URL.Path),
+			statusCode:    resp.StatusCode,
+			ReadCloser:    resp.Body,
+		}
+
+		if resp.StatusCode >= 400 {
+			// in case of error response, just log immediately
+			rbw.logAccess("")
+		} else {
+			resp.Body = &rbw
+		}
+	}()
+
 	// dialTimeout is fairly aggressive to avoid hangs on contacting offline or
 	// unreachable hosts.
 	dialTimeout := 1 * time.Second // TODO(oxtoacart): tune this
@@ -4719,12 +4875,38 @@ func (t *tailFSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return tr.RoundTrip(req)
 }
 
+// roundTraffic rounds bytes. This is used to preserve user privacy within logs.
+func roundTraffic(bytes int64) float64 {
+	var x float64
+	switch {
+	case bytes <= 5:
+		return float64(bytes)
+	case bytes < 1000:
+		x = 10
+	case bytes < 10_000:
+		x = 100
+	case bytes < 100_000:
+		x = 1000
+	case bytes < 1_000_000:
+		x = 10_000
+	case bytes < 10_000_000:
+		x = 100_000
+	case bytes < 100_000_000:
+		x = 1_000_000
+	case bytes < 1_000_000_000:
+		x = 10_000_000
+	default:
+		x = 100_000_000
+	}
+	return math.Round(float64(bytes)/x) * x
+}
+
 // setDebugLogsByCapabilityLocked sets debug logging based on the self node's
 // capabilities in the provided NetMap.
 func (b *LocalBackend) setDebugLogsByCapabilityLocked(nm *netmap.NetworkMap) {
 	// These are sufficiently cheap (atomic bools) that we don't need to
 	// store state and compare.
-	if hasCapability(nm, tailcfg.CapabilityDebugTSDNSResolution) {
+	if nm.HasCap(tailcfg.CapabilityDebugTSDNSResolution) {
 		dnscache.SetDebugLoggingEnabled(true)
 	} else {
 		dnscache.SetDebugLoggingEnabled(false)
@@ -4783,7 +4965,7 @@ func (b *LocalBackend) setTCPPortsInterceptedFromNetmapAndPrefsLocked(prefs ipn.
 	if prefs.Valid() && prefs.RunSSH() && envknob.CanSSHD() {
 		handlePorts = append(handlePorts, 22)
 	}
-	if b.ShouldRunWebClient() {
+	if b.ShouldExposeRemoteWebClient() {
 		handlePorts = append(handlePorts, webClientPort)
 
 		// don't listen on netmap addresses if we're in userspace mode

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 
 	"tailscale.com/atomicfile"
@@ -21,6 +22,7 @@ import (
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailfs"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
@@ -116,7 +118,8 @@ type Prefs struct {
 	// policies as configured by the Tailnet's admin(s).
 	RunSSH bool
 
-	// RunWebClient bool is whether this node should run a web client,
+	// RunWebClient bool is whether this node should expose
+	// its web client over Tailscale at port 5252,
 	// permitting access to peers according to the
 	// policies as configured by the Tailnet's admin(s).
 	RunWebClient bool
@@ -222,6 +225,10 @@ type Prefs struct {
 	// Linux-only.
 	NetfilterKind string
 
+	// TailFSShares are the configured TailFSShares, stored in increasing order
+	// by name.
+	TailFSShares []*tailfs.Share
+
 	// The Persist field is named 'Config' in the file for backward
 	// compatibility with earlier versions.
 	// TODO(apenwarr): We should move this out of here, it's not a pref.
@@ -293,6 +300,7 @@ type MaskedPrefs struct {
 	AppConnectorSet           bool                `json:",omitempty"`
 	PostureCheckingSet        bool                `json:",omitempty"`
 	NetfilterKindSet          bool                `json:",omitempty"`
+	TailFSSharesSet           bool                `json:",omitempty"`
 }
 
 type AutoUpdatePrefsMask struct {
@@ -556,6 +564,7 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.AutoUpdate.Equals(p2.AutoUpdate) &&
 		p.AppConnector == p2.AppConnector &&
 		p.PostureChecking == p2.PostureChecking &&
+		slices.EqualFunc(p.TailFSShares, p2.TailFSShares, tailfs.SharesEqual) &&
 		p.NetfilterKind == p2.NetfilterKind
 }
 

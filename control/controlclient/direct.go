@@ -42,7 +42,6 @@ import (
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tshttpproxy"
-	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
@@ -57,6 +56,7 @@ import (
 	"tailscale.com/util/singleflight"
 	"tailscale.com/util/syspolicy"
 	"tailscale.com/util/systemd"
+	"tailscale.com/util/zstdframe"
 )
 
 // Direct is the client that connects to a tailcontrol server for a node.
@@ -178,11 +178,6 @@ type ControlDialPlanner interface {
 type Pinger interface {
 	// Ping is a request to do a ping with the peer handling the given IP.
 	Ping(ctx context.Context, ip netip.Addr, pingType tailcfg.PingType, size int) (*ipnstate.PingResult, error)
-}
-
-type Decompressor interface {
-	DecodeAll(input, dst []byte) ([]byte, error)
-	Close()
 }
 
 // NetmapUpdater is the interface needed by the controlclient to enact change in
@@ -641,6 +636,9 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	if err != nil {
 		return regen, opt.URL, nil, err
 	}
+	addLBHeader(req, request.OldNodeKey)
+	addLBHeader(req, request.NodeKey)
+
 	res, err := httpc.Do(req)
 	if err != nil {
 		return regen, opt.URL, nil, fmt.Errorf("register request: %w", err)
@@ -884,10 +882,11 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 		vlogf = c.logf
 	}
 
+	nodeKey := persist.PublicNodeKey()
 	request := &tailcfg.MapRequest{
 		Version:       tailcfg.CurrentCapabilityVersion,
 		KeepAlive:     true,
-		NodeKey:       persist.PublicNodeKey(),
+		NodeKey:       nodeKey,
 		DiscoKey:      c.discoPubKey,
 		Endpoints:     eps,
 		EndpointTypes: epTypes,
@@ -942,10 +941,35 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 		url = strings.Replace(url, "http:", "https:", 1)
 	}
 
+	// Create a watchdog timer that breaks the connection if we don't receive a
+	// MapResponse from the network at least once every two minutes. The
+	// watchdog timer is stopped every time we receive a MapResponse (so it
+	// doesn't run when we're processing a MapResponse message, including any
+	// long-running requested operations like Debug.Sleep) and is reset whenever
+	// we go back to blocking on network reads.
+	// The watchdog timer also covers the initial request (effectively the
+	// pre-body and initial-body read timeouts) as we do not have any other
+	// keep-alive mechanism for the initial request.
+	watchdogTimer, watchdogTimedOut := c.clock.NewTimer(watchdogTimeout)
+	defer watchdogTimer.Stop()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			vlogf("netmap: ending timeout goroutine")
+			return
+		case <-watchdogTimedOut:
+			c.logf("map response long-poll timed out!")
+			cancel()
+			return
+		}
+	}()
+
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyData))
 	if err != nil {
 		return err
 	}
+	addLBHeader(req, nodeKey)
 
 	res, err := httpc.Do(req)
 	if err != nil {
@@ -962,6 +986,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	defer res.Body.Close()
 
 	health.NoteMapRequestHeard(request)
+	watchdogTimer.Reset(watchdogTimeout)
 
 	if nu == nil {
 		io.Copy(io.Discard, res.Body)
@@ -992,27 +1017,6 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 		}
 		c.expiry = nm.Expiry
 	}
-
-	// Create a watchdog timer that breaks the connection if we don't receive a
-	// MapResponse from the network at least once every two minutes. The
-	// watchdog timer is stopped every time we receive a MapResponse (so it
-	// doesn't run when we're processing a MapResponse message, including any
-	// long-running requested operations like Debug.Sleep) and is reset whenever
-	// we go back to blocking on network reads.
-	watchdogTimer, watchdogTimedOut := c.clock.NewTimer(watchdogTimeout)
-	defer watchdogTimer.Stop()
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			vlogf("netmap: ending timeout goroutine")
-			return
-		case <-watchdogTimedOut:
-			c.logf("map response long-poll timed out!")
-			cancel()
-			return
-		}
-	}()
 
 	// gotNonKeepAliveMessage is whether we've yet received a MapResponse message without
 	// KeepAlive set.
@@ -1203,12 +1207,7 @@ func (c *Direct) decodeMsg(msg []byte, v any, mkey key.MachinePrivate) error {
 	} else {
 		decrypted = msg
 	}
-	decoder, err := smallzstd.NewDecoder(nil)
-	if err != nil {
-		return err
-	}
-	defer decoder.Close()
-	b, err := decoder.DecodeAll(decrypted, nil)
+	b, err := zstdframe.AppendDecode(nil, decrypted)
 	if err != nil {
 		return err
 	}
@@ -1537,7 +1536,7 @@ func (c *Direct) setDNSNoise(ctx context.Context, req *tailcfg.SetDNSRequest) er
 	if err != nil {
 		return err
 	}
-	res, err := nc.post(ctx, "/machine/set-dns", &newReq)
+	res, err := nc.post(ctx, "/machine/set-dns", newReq.NodeKey, &newReq)
 	if err != nil {
 		return err
 	}
@@ -1714,8 +1713,13 @@ func (c *Direct) ReportHealthChange(sys health.Subsystem, sysErr error) {
 		// Don't report errors to control if the server doesn't support noise.
 		return
 	}
+	nodeKey, ok := c.GetPersist().PublicNodeKeyOK()
+	if !ok {
+		return
+	}
 	req := &tailcfg.HealthChangeRequest{
-		Subsys: string(sys),
+		Subsys:  string(sys),
+		NodeKey: nodeKey,
 	}
 	if sysErr != nil {
 		req.Error = sysErr.Error()
@@ -1724,7 +1728,7 @@ func (c *Direct) ReportHealthChange(sys health.Subsystem, sysErr error) {
 	// Best effort, no logging:
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res, err := np.post(ctx, "/machine/update-health", req)
+	res, err := np.post(ctx, "/machine/update-health", nodeKey, req)
 	if err != nil {
 		return
 	}
@@ -1766,6 +1770,12 @@ func decodeWrappedAuthkey(key string, logf logger.Logf) (authKey string, isWrapp
 	priv = ed25519.PrivateKey(rawPriv)
 
 	return authKey, true, sig, priv
+}
+
+func addLBHeader(req *http.Request, nodeKey key.NodePublic) {
+	if !nodeKey.IsZero() {
+		req.Header.Add(tailcfg.LBHeader, nodeKey.String())
+	}
 }
 
 var (

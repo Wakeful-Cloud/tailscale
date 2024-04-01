@@ -8,8 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"reflect"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -28,6 +31,7 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/set"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -71,6 +75,7 @@ type mapSession struct {
 	// Fields storing state over the course of multiple MapResponses.
 	lastPrintMap           time.Time
 	lastNode               tailcfg.NodeView
+	lastCapSet             set.Set[tailcfg.NodeCapability]
 	peers                  map[tailcfg.NodeID]*tailcfg.NodeView // pointer to view (oddly). same pointers as sortedPeers.
 	sortedPeers            []*tailcfg.NodeView                  // same pointers as peers, but sorted by Node.ID
 	lastDNSConfig          *tailcfg.DNSConfig
@@ -167,7 +172,15 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 			resp.Node.Capabilities = nil
 			resp.Node.CapMap = nil
 		}
-		ms.controlKnobs.UpdateFromNodeAttributes(resp.Node.Capabilities, resp.Node.CapMap)
+		// If the server is old and is still sending us Capabilities instead of
+		// CapMap, convert it to CapMap early so the rest of the client code can
+		// work only in terms of CapMap.
+		for _, c := range resp.Node.Capabilities {
+			if _, ok := resp.Node.CapMap[c]; !ok {
+				mak.Set(&resp.Node.CapMap, c, nil)
+			}
+		}
+		ms.controlKnobs.UpdateFromNodeAttributes(resp.Node.CapMap)
 	}
 
 	// Call Node.InitDisplayNames on any changed nodes.
@@ -185,6 +198,12 @@ func (ms *mapSession) HandleNonKeepAliveMapResponse(ctx context.Context, resp *t
 	// We have to rebuild the whole netmap (lots of garbage & work downstream of
 	// our UpdateFullNetmap call). This is the part we tried to avoid but
 	// some field mutations (especially rare ones) aren't yet handled.
+
+	if runtime.GOOS == "ios" {
+		// Memory is tight on iOS. Free what we can while we
+		// can before this potential burst of in-use memory.
+		debug.FreeOSMemory()
+	}
 
 	nm := ms.netmap()
 	ms.lastNetmapSummary = nm.VeryConcise()
@@ -230,6 +249,15 @@ func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 
 	if resp.Node != nil {
 		ms.lastNode = resp.Node.View()
+
+		capSet := set.Set[tailcfg.NodeCapability]{}
+		for _, c := range resp.Node.Capabilities {
+			capSet.Add(c)
+		}
+		for c := range resp.Node.CapMap {
+			capSet.Add(c)
+		}
+		ms.lastCapSet = capSet
 	}
 
 	for _, up := range resp.UserProfiles {
@@ -334,7 +362,6 @@ var (
 	patchOnline       = clientmetric.NewCounter("controlclient_patch_online")
 	patchLastSeen     = clientmetric.NewCounter("controlclient_patch_lastseen")
 	patchKeyExpiry    = clientmetric.NewCounter("controlclient_patch_keyexpiry")
-	patchCapabilities = clientmetric.NewCounter("controlclient_patch_capabilities")
 	patchCapMap       = clientmetric.NewCounter("controlclient_patch_capmap")
 	patchKeySignature = clientmetric.NewCounter("controlclient_patch_keysig")
 
@@ -455,10 +482,6 @@ func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (s
 		if v := pc.KeyExpiry; v != nil {
 			mut.KeyExpiry = *v
 			patchKeyExpiry.Add(1)
-		}
-		if v := pc.Capabilities; v != nil {
-			mut.Capabilities = *v
-			patchCapabilities.Add(1)
 		}
 		if v := pc.KeySignature; v != nil {
 			mut.KeySignature = v
@@ -581,6 +604,9 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			continue
 		case "DataPlaneAuditLogID":
 			//  Not sent for peers.
+		case "Capabilities":
+			// Deprecated; see https://github.com/tailscale/tailscale/issues/11508
+			// And it was never sent by any known control server.
 		case "ID":
 			if was.ID() != n.ID {
 				return nil, false
@@ -664,9 +690,22 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				pc().Cap = n.Cap
 			}
 		case "CapMap":
-			if n.CapMap != nil {
-				pc().CapMap = n.CapMap
+			if len(n.CapMap) != was.CapMap().Len() {
+				if n.CapMap == nil {
+					pc().CapMap = make(tailcfg.NodeCapMap)
+				} else {
+					pc().CapMap = maps.Clone(n.CapMap)
+				}
+				break
 			}
+			was.CapMap().Range(func(k tailcfg.NodeCapability, v views.Slice[tailcfg.RawMessage]) bool {
+				nv, ok := n.CapMap[k]
+				if !ok || !views.SliceEqual(v, views.SliceOf(nv)) {
+					pc().CapMap = maps.Clone(n.CapMap)
+					return false
+				}
+				return true
+			})
 		case "Tags":
 			if !views.SliceEqual(was.Tags(), views.SliceOf(n.Tags)) {
 				return nil, false
@@ -688,10 +727,6 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 		case "MachineAuthorized":
 			if was.MachineAuthorized() != n.MachineAuthorized {
 				return nil, false
-			}
-		case "Capabilities":
-			if !views.SliceEqual(was.Capabilities(), views.SliceOf(n.Capabilities)) {
-				pc().Capabilities = ptr.To(n.Capabilities)
 			}
 		case "UnsignedPeerAPIOnly":
 			if was.UnsignedPeerAPIOnly() != n.UnsignedPeerAPIOnly {
@@ -781,6 +816,7 @@ func (ms *mapSession) netmap() *netmap.NetworkMap {
 		nm.SelfNode = node
 		nm.Expiry = node.KeyExpiry()
 		nm.Name = node.Name()
+		nm.AllCaps = ms.lastCapSet
 	}
 
 	ms.addUserProfile(nm, nm.User())

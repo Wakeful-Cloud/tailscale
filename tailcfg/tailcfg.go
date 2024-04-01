@@ -128,7 +128,9 @@ type CapabilityVersion int
 //   - 85: 2024-01-05: Client understands MaxKeyDuration
 //   - 86: 2024-01-23: Client understands NodeAttrProbeUDPLifetime
 //   - 87: 2024-02-11: UserProfile.Groups removed (added in 66)
-const CurrentCapabilityVersion CapabilityVersion = 87
+//   - 88: 2024-03-05: Client understands NodeAttrSuggestExitNode
+//   - 89: 2024-03-23: Client no longer respects deleted PeerChange.Capabilities (use CapMap)
+const CurrentCapabilityVersion CapabilityVersion = 89
 
 type StableID string
 
@@ -324,7 +326,7 @@ type Node struct {
 	//    "https://tailscale.com/cap/is-admin"
 	//    "https://tailscale.com/cap/file-sharing"
 	//
-	// Deprecated: use CapMap instead.
+	// Deprecated: use CapMap instead. See https://github.com/tailscale/tailscale/issues/11508
 	Capabilities []NodeCapability `json:",omitempty"`
 
 	// CapMap is a map of capabilities to their optional argument/data values.
@@ -414,7 +416,7 @@ func (v NodeView) HasCap(cap NodeCapability) bool {
 // HasCap reports whether the node has the given capability.
 // It is safe to call on a nil Node.
 func (v *Node) HasCap(cap NodeCapability) bool {
-	return v != nil && (v.CapMap.Contains(cap) || slices.Contains(v.Capabilities, cap))
+	return v != nil && v.CapMap.Contains(cap)
 }
 
 // DisplayName returns the user-facing name for a node which should
@@ -2131,6 +2133,13 @@ const (
 	// e.g. https://tailscale.com/cap/funnel-ports?ports=80,443,8080-8090
 	CapabilityFunnelPorts NodeCapability = "https://tailscale.com/cap/funnel-ports"
 
+	// NodeAttrOnlyTCP443 specifies that the client should not attempt to generate
+	// any outbound traffic that isn't TCP on port 443 (HTTPS). This is used for
+	// clients in restricted environments where only HTTPS traffic is allowed
+	// other types of traffic trips outbound firewall alarms. This thus implies
+	// all traffic is over DERP.
+	NodeAttrOnlyTCP443 NodeCapability = "only-tcp-443"
+
 	// NodeAttrFunnel grants the ability for a node to host ingress traffic.
 	NodeAttrFunnel NodeCapability = "funnel"
 	// NodeAttrSSHAggregator grants the ability for a node to collect SSH sessions.
@@ -2214,6 +2223,13 @@ const (
 
 	// NodeAttrsTailFSAccess enables accessing shares via TailFS.
 	NodeAttrsTailFSAccess NodeCapability = "tailfs:access"
+
+	// NodeAttrSuggestExitNode is applied to each exit node which the control plane has determined
+	// is a recommended exit node.
+	NodeAttrSuggestExitNode NodeCapability = "suggest-exit-node"
+
+	// NodeAttrDisableWebClient disables using the web client.
+	NodeAttrDisableWebClient NodeCapability = "disable-web-client"
 )
 
 // SetDNSRequest is a request to add a DNS record.
@@ -2258,6 +2274,10 @@ type SetDNSResponse struct{}
 type HealthChangeRequest struct {
 	Subsys string // a health.Subsystem value in string form
 	Error  string // or empty if cleared
+
+	// NodeKey is the client's current node key.
+	// In clients <= 1.62.0 it was always the zero value.
+	NodeKey key.NodePublic
 }
 
 // SSHPolicy is the policy for how to handle incoming SSH connections
@@ -2648,11 +2668,6 @@ type PeerChange struct {
 
 	// KeyExpiry, if non-nil, changes the NodeID's key expiry.
 	KeyExpiry *time.Time `json:",omitempty"`
-
-	// Capabilities, if non-nil, means that the NodeID's capabilities changed.
-	// It's a pointer to a slice for "omitempty", to allow differentiating
-	// a change to empty from no change.
-	Capabilities *[]NodeCapability `json:",omitempty"`
 }
 
 // DerpMagicIP is a fake WireGuard endpoint IP address that means to
@@ -2675,3 +2690,21 @@ type EarlyNoise struct {
 	// the client to prove possession of a wireguard private key.
 	NodeKeyChallenge key.ChallengePublic `json:"nodeKeyChallenge"`
 }
+
+// LBHeader is the HTTP request header used to provide a load balancer or
+// internal reverse proxy with information about the request body without the
+// reverse proxy needing to read the body to parse it out. Think of it akin to
+// an HTTP Host header or SNI. The value may be absent (notably for old clients)
+// but if present, it should match the request. A non-empty value that doesn't
+// match the request body's.
+//
+// The possible values depend on the request path, but for /machine (Noise)
+// requests, they'll usually be a node public key (in key.NodePublic.String
+// format), matching the Request JSON body's NodeKey.
+//
+// Note that this is not a security or authentication header; it's strictly
+// denormalized redundant data as an optimization.
+//
+// For some request types, the header may have multiple values. (e.g. OldNodeKey
+// vs NodeKey)
+const LBHeader = "Ts-Lb"

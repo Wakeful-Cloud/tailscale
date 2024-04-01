@@ -28,6 +28,7 @@ require (
 	github.com/evanw/esbuild v0.19.11
 	github.com/frankban/quicktest v1.14.6
 	github.com/fxamacker/cbor/v2 v2.5.0
+	github.com/gaissmai/bart v0.4.1
 	github.com/go-json-experiment/json v0.0.0-20231102232822-2e55bd4e08b0
 	github.com/go-logr/zapr v1.3.0
 	github.com/go-ole/go-ole v1.3.0
@@ -93,14 +94,14 @@ require (
 	golang.org/x/net v0.20.0
 	golang.org/x/oauth2 v0.16.0
 	golang.org/x/sync v0.6.0
-	golang.org/x/sys v0.16.0
+	golang.org/x/sys v0.17.0
 	golang.org/x/term v0.16.0
 	golang.org/x/time v0.5.0
 	golang.org/x/tools v0.17.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
 	golang.zx2c4.com/wireguard/windows v0.5.3
 	gopkg.in/square/go-jose.v2 v2.6.0
-	gvisor.dev/gvisor v0.0.0-20240119233241-c9c1d4f9b186
+	gvisor.dev/gvisor v0.0.0-20240306221502-ee1e1f6070e3
 	honnef.co/go/tools v0.4.6
 	k8s.io/api v0.29.1
 	k8s.io/apimachinery v0.29.1
@@ -115,6 +116,7 @@ require (
 
 require (
 	github.com/Microsoft/go-winio v0.6.1 // indirect
+	github.com/bits-and-blooms/bitset v1.13.0 // indirect
 	github.com/cyphar/filepath-securejoin v0.2.4 // indirect
 	github.com/dave/astrid v0.0.0-20170323122508-8c2895878b14 // indirect
 	github.com/dave/brenda v1.1.0 // indirect
@@ -180,7 +182,7 @@ require (
 	github.com/denis-tingaikin/go-header v0.4.3 // indirect
 	github.com/docker/cli v25.0.0+incompatible // indirect
 	github.com/docker/distribution v2.8.3+incompatible // indirect
-	github.com/docker/docker v25.0.0+incompatible // indirect
+	github.com/docker/docker v25.0.5+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.8.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.11.2 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect

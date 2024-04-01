@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -27,11 +28,11 @@ import (
 const (
 	domain = `test$%domain.com`
 
-	remote1 = `remote$%1`
-	remote2 = `_remote$%2`
-	share11 = `share$%11`
-	share12 = `_share$%12`
-	file111 = `file$%111.txt`
+	remote1 = `rem ote$%1`
+	remote2 = `_rem ote$%2`
+	share11 = `sha re$%11`
+	share12 = `_sha re$%12`
+	file111 = `fi le$%111.txt`
 )
 
 func init() {
@@ -206,13 +207,14 @@ func (s *system) addShare(remoteName, shareName string, permission tailfs.Permis
 	r.shares[shareName] = f
 	r.permissions[shareName] = permission
 
-	shares := make(map[string]*tailfs.Share, len(r.shares))
+	shares := make([]*tailfs.Share, 0, len(r.shares))
 	for shareName, folder := range r.shares {
-		shares[shareName] = &tailfs.Share{
+		shares = append(shares, &tailfs.Share{
 			Name: shareName,
 			Path: folder,
-		}
+		})
 	}
+	slices.SortFunc(shares, tailfs.CompareShares)
 	r.fs.SetShares(shares)
 	r.fileServer.SetShares(r.shares)
 }

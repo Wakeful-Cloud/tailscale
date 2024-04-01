@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"tailscale.com/metrics"
 	"tailscale.com/version"
@@ -85,8 +87,29 @@ func prometheusMetric(prefix string, key string) (string, string, string) {
 			label, key = a, b
 		}
 	}
+
+	// Convert the metric to a valid Prometheus metric name.
+	// "Metric names may contain ASCII letters, digits, underscores, and colons.
+	// It must match the regex [a-zA-Z_:][a-zA-Z0-9_:]*"
+	mapInvalidMetricRunes := func(r rune) rune {
+		if r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			r == '_' || r == ':' {
+			return r
+		}
+		if r < utf8.RuneSelf && unicode.IsPrint(r) {
+			return '_'
+		}
+		return -1
+	}
+	metricName := strings.Map(mapInvalidMetricRunes, prefix+key)
+	if metricName == "" || unicode.IsDigit(rune(metricName[0])) {
+		metricName = "_" + metricName
+	}
+
 	d := &prometheusMetricDetails{
-		Name:  strings.ReplaceAll(prefix+key, "-", "_"),
+		Name:  metricName,
 		Type:  typ,
 		Label: label,
 	}
@@ -109,6 +132,9 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 		v.Do(func(kv expvar.KeyValue) {
 			writePromExpVar(w, name+"_", kv)
 		})
+		return
+	case PrometheusWriter:
+		v.WritePrometheus(w, name)
 		return
 	case PrometheusMetricsReflectRooter:
 		root := v.PrometheusMetricsReflectRoot()
@@ -210,6 +236,14 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 	}
 }
 
+// PrometheusWriter is the interface implemented by metrics that can write
+// themselves into Prometheus exposition format.
+//
+// As of 2024-03-25, this is only *metrics.MultiLabelMap.
+type PrometheusWriter interface {
+	WritePrometheus(w io.Writer, name string)
+}
+
 var sortedKVsPool = &sync.Pool{New: func() any { return new(sortedKVs) }}
 
 // sortedKV is a KeyValue with a sort key.
@@ -240,7 +274,7 @@ type sortedKVs struct {
 //
 // This will evolve over time, or perhaps be replaced.
 func Handler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	w.Header().Set("Content-Type", "text/plain;version=0.0.4;charset=utf-8")
 
 	s := sortedKVsPool.Get().(*sortedKVs)
 	defer sortedKVsPool.Put(s)

@@ -198,6 +198,8 @@ type Conn struct {
 	mu     sync.Mutex
 	muCond *sync.Cond
 
+	onlyTCP443 atomic.Bool
+
 	closed  bool        // Close was called
 	closing atomic.Bool // Close is in progress (or done)
 
@@ -444,7 +446,10 @@ func NewConn(opts Options) (*Conn, error) {
 	c.idleFunc = opts.IdleFunc
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
-	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "), opts.NetMon, nil, opts.ControlKnobs, c.onPortMapChanged)
+	portMapOpts := &portmapper.DebugKnobs{
+		DisableAll: func() bool { return c.onlyTCP443.Load() },
+	}
+	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "), opts.NetMon, portMapOpts, opts.ControlKnobs, c.onPortMapChanged)
 	if opts.NetMon != nil {
 		c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
 	}
@@ -682,16 +687,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	ni.OSHasIPv6.Set(report.OSHasIPv6)
 	ni.WorkingUDP.Set(report.UDP)
 	ni.WorkingICMPv4.Set(report.ICMPv4)
-	ni.PreferredDERP = report.PreferredDERP
-
-	if ni.PreferredDERP == 0 {
-		// Perhaps UDP is blocked. Pick a deterministic but arbitrary
-		// one.
-		ni.PreferredDERP = c.pickDERPFallback()
-	}
-	if !c.setNearestDERP(ni.PreferredDERP) {
-		ni.PreferredDERP = 0
-	}
+	ni.PreferredDERP = c.maybeSetNearestDERP(report)
 	ni.FirewallMode = hostinfo.FirewallMode()
 
 	c.callNetInfoCallback(ni)
@@ -1076,6 +1072,9 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
 // sendUDP sends UDP packet b to addr.
 // See sendAddr's docs on the return value meanings.
 func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) {
+	if c.onlyTCP443.Load() {
+		return false, nil
+	}
 	switch {
 	case addr.Addr().Is4():
 		_, err = c.pconn4.WriteToUDPAddrPort(b, addr)
@@ -1824,9 +1823,11 @@ func debugRingBufferSize(numPeers int) int {
 	}
 	var maxRingBufferSize int
 	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
-		maxRingBufferSize = 1 * 1024 * 1024
+		maxRingBufferSize = 1 << 20
+		// But as of 2024-03-20, we now just disable the ring buffer entirely
+		// on mobile as it hadn't proven useful enough to justify even 1 MB.
 	} else {
-		maxRingBufferSize = 4 * 1024 * 1024
+		maxRingBufferSize = 4 << 20
 	}
 	if v := debugRingBufferMaxSizeBytes(); v > 0 {
 		maxRingBufferSize = v
@@ -1993,7 +1994,6 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 
 		ep = &endpoint{
 			c:                 c,
-			debugUpdates:      ringbuffer.New[EndpointChange](entriesPerBuffer),
 			nodeID:            n.ID(),
 			publicKey:         n.Key(),
 			publicKeyHex:      n.Key().UntypedHexString(),
@@ -2001,6 +2001,14 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 			endpointState:     map[netip.AddrPort]*endpointState{},
 			heartbeatDisabled: flags.heartbeatDisabled,
 			isWireguardOnly:   n.IsWireGuardOnly(),
+		}
+		switch runtime.GOOS {
+		case "ios", "android":
+			// Omit, to save memory. Prior to 2024-03-20 we used to limit it to
+			// ~1MB on mobile but we never used the data so the memory was just
+			// wasted.
+		default:
+			ep.debugUpdates = ringbuffer.New[EndpointChange](entriesPerBuffer)
 		}
 		if n.Addresses().Len() > 0 {
 			ep.nodeAddr = n.Addresses().At(0).Addr()

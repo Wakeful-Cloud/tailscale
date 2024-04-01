@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,7 @@ import (
 	tslogger "tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/util/set"
+	"tailscale.com/util/zstdframe"
 )
 
 // DefaultHost is the default host name to upload logs to when
@@ -62,7 +64,10 @@ type Config struct {
 	Stderr         io.Writer       // if set, logs are sent here instead of os.Stderr
 	StderrLevel    int             // max verbosity level to write to stderr; 0 means the non-verbose messages only
 	Buffer         Buffer          // temp storage, if nil a MemoryBuffer
-	NewZstdEncoder func() Encoder  // if set, used to compress logs for transmission
+	CompressLogs   bool            // whether to compress the log uploads
+
+	// Deprecated: Use CompressUploads instead.
+	NewZstdEncoder func() Encoder // if set, used to compress logs for transmission
 
 	// MetricsDelta, if non-nil, is a func that returns an encoding
 	// delta in clientmetrics to upload alongside existing logs.
@@ -156,6 +161,7 @@ func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
 		shutdownDone:  make(chan struct{}),
 	}
 	l.SetSockstatsLabel(sockstats.LabelLogtailLogger)
+	l.compressLogs = cfg.CompressLogs
 	if cfg.NewZstdEncoder != nil {
 		l.zstdEncoder = cfg.NewZstdEncoder()
 	}
@@ -180,10 +186,12 @@ type Logger struct {
 	netMonitor     *netmon.Monitor
 	buffer         Buffer
 	drainWake      chan struct{}        // signal to speed up drain
+	drainBuf       bytes.Buffer         // owned by drainPending for reuse
 	flushDelayFn   func() time.Duration // negative or zero return value to upload aggressively, or >0 to batch at this delay
 	flushPending   atomic.Bool
 	sentinel       chan int32
 	clock          tstime.Clock
+	compressLogs   bool
 	zstdEncoder    Encoder
 	uploadCancel   func()
 	explainedRaw   bool
@@ -296,10 +304,10 @@ func (l *Logger) drainBlock() (shuttingDown bool) {
 }
 
 // drainPending drains and encodes a batch of logs from the buffer for upload.
-// It uses scratch as its initial buffer.
 // If no logs are available, drainPending blocks until logs are available.
-func (l *Logger) drainPending(scratch []byte) (res []byte) {
-	buf := bytes.NewBuffer(scratch[:0])
+func (l *Logger) drainPending() (res []byte) {
+	buf := &l.drainBuf
+	buf.Reset()
 	buf.WriteByte('[')
 	entries := 0
 
@@ -315,6 +323,14 @@ func (l *Logger) drainPending(scratch []byte) (res []byte) {
 		} else if b == nil {
 			if entries > 0 {
 				break
+			}
+
+			// We're about to block. If we're holding on to too much memory
+			// in our buffer from a previous large write, let it go.
+			if buf.Available() > 4<<10 {
+				cur := buf.Bytes()
+				l.drainBuf = bytes.Buffer{}
+				buf.Write(cur)
 			}
 
 			batchDone = l.drainBlock()
@@ -359,13 +375,22 @@ func (l *Logger) drainPending(scratch []byte) (res []byte) {
 func (l *Logger) uploading(ctx context.Context) {
 	defer close(l.shutdownDone)
 
-	scratch := make([]byte, 4096) // reusable buffer to write into
 	for {
-		body := l.drainPending(scratch)
+		body := l.drainPending()
 		origlen := -1 // sentinel value: uncompressed
 		// Don't attempt to compress tiny bodies; not worth the CPU cycles.
-		if l.zstdEncoder != nil && len(body) > 256 {
-			zbody := l.zstdEncoder.EncodeAll(body, nil)
+		if (l.compressLogs || l.zstdEncoder != nil) && len(body) > 256 {
+			var zbody []byte
+			switch {
+			case l.zstdEncoder != nil:
+				zbody = l.zstdEncoder.EncodeAll(body, nil)
+			case l.lowMem:
+				zbody = zstdframe.AppendEncode(nil, body,
+					zstdframe.FastestCompression, zstdframe.LowMemory(true))
+			default:
+				zbody = zstdframe.AppendEncode(nil, body)
+			}
+
 			// Only send it compressed if the bandwidth savings are sufficient.
 			// Just the extra headers associated with enabling compression
 			// are 50 bytes by themselves.
@@ -466,6 +491,19 @@ func (l *Logger) upload(ctx context.Context, body []byte, origlen int) (retryAft
 	if origlen != -1 {
 		req.Header.Add("Content-Encoding", "zstd")
 		req.Header.Add("Orig-Content-Length", strconv.Itoa(origlen))
+	}
+	if runtime.GOOS == "js" {
+		// We once advertised we'd accept optional client certs (for internal use)
+		// on log.tailscale.io but then Tailscale SSH js/wasm clients prompted
+		// users (on some browsers?) to pick a client cert. We'll fix the server's
+		// TLS ServerHello, but we can also fix it client side for good measure.
+		//
+		// Corp details: https://github.com/tailscale/corp/issues/18177#issuecomment-2026598715
+		// and https://github.com/tailscale/corp/pull/18775#issuecomment-2027505036
+		//
+		// See https://github.com/golang/go/wiki/WebAssembly#configuring-fetch-options-while-using-nethttp
+		// and https://developer.mozilla.org/en-US/docs/Web/API/fetch#credentials
+		req.Header.Set("js.fetch:credentials", "omit")
 	}
 	req.Header["User-Agent"] = nil // not worth writing one; save some bytes
 
