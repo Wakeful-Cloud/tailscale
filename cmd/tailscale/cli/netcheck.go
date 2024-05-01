@@ -28,7 +28,7 @@ import (
 
 var netcheckCmd = &ffcli.Command{
 	Name:       "netcheck",
-	ShortUsage: "netcheck",
+	ShortUsage: "tailscale netcheck",
 	ShortHelp:  "Print an analysis of local network conditions",
 	Exec:       runNetcheck,
 	FlagSet: (func() *flag.FlagSet {
@@ -53,6 +53,7 @@ func runNetcheck(ctx context.Context, args []string) error {
 		return err
 	}
 	c := &netcheck.Client{
+		NetMon:      netMon,
 		PortMapper:  portmapper.NewClient(logf, netMon, nil, nil, nil),
 		UseDNSCache: false, // always resolve, don't cache
 	}

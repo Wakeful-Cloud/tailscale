@@ -23,7 +23,7 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		fields = append(fields, t.Field(i).Name)
 	}
 	return
@@ -848,9 +848,9 @@ func TestDeps(t *testing.T) {
 	deptest.DepChecker{
 		BadDeps: map[string]string{
 			// Make sure we don't again accidentally bring in a dependency on
-			// TailFS or its transitive dependencies
-			"tailscale.com/tailfs/tailfsimpl": "https://github.com/tailscale/tailscale/pull/10631",
-			"github.com/studio-b12/gowebdav":  "https://github.com/tailscale/tailscale/pull/10631",
+			// drive or its transitive dependencies
+			"tailscale.com/drive/driveimpl":  "https://github.com/tailscale/tailscale/pull/10631",
+			"github.com/studio-b12/gowebdav": "https://github.com/tailscale/tailscale/pull/10631",
 		},
 	}.Check(t)
 }

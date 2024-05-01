@@ -101,6 +101,16 @@ func TestResolversWithDelays(t *testing.T) {
 			in:   q("https://dns.nextdns.io/c3a884"),
 			want: o("https://dns.nextdns.io/c3a884"),
 		},
+		{
+			name: "controld-ipv6-expand",
+			in:   q("2606:1a40:0:6:7b5b:5949:35ad:0"),
+			want: o("https://dns.controld.com/hyq3ipr2ct"),
+		},
+		{
+			name: "controld-doh-input",
+			in:   q("https://dns.controld.com/hyq3ipr2ct"),
+			want: o("https://dns.controld.com/hyq3ipr2ct"),
+		},
 	}
 
 	for _, tt := range tests {
@@ -189,7 +199,7 @@ func BenchmarkNameFromQuery(b *testing.B) {
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, err := nameFromQuery(msg)
 		if err != nil {
 			b.Fatal(err)
@@ -403,7 +413,7 @@ func makeLargeResponse(tb testing.TB, domain string) (request, response []byte) 
 		Class: dns.ClassINET,
 	})
 	builder.StartAnswers()
-	for i := 0; i < 120; i++ {
+	for i := range 120 {
 		builder.AResource(dns.ResourceHeader{
 			Name:  name,
 			Class: dns.ClassINET,

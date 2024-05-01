@@ -28,6 +28,7 @@ import (
 
 	"go4.org/mem"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/drive"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -35,7 +36,6 @@ import (
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailfs"
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/tkatype"
@@ -1418,53 +1418,62 @@ func (lc *LocalClient) CheckUpdate(ctx context.Context) (*tailcfg.ClientVersion,
 	return &cv, nil
 }
 
-// TailFSSetFileServerAddr instructs TailFS to use the server at addr to access
+// SetUseExitNode toggles the use of an exit node on or off.
+// To turn it on, there must have been a previously used exit node.
+// The most previously used one is reused.
+// This is a convenience method for GUIs. To select an actual one, update the prefs.
+func (lc *LocalClient) SetUseExitNode(ctx context.Context, on bool) error {
+	_, err := lc.send(ctx, "POST", "/localapi/v0/set-use-exit-node-enabled?enabled="+strconv.FormatBool(on), http.StatusOK, nil)
+	return err
+}
+
+// DriveSetServerAddr instructs Taildrive to use the server at addr to access
 // the filesystem. This is used on platforms like Windows and MacOS to let
-// TailFS know to use the file server running in the GUI app.
-func (lc *LocalClient) TailFSSetFileServerAddr(ctx context.Context, addr string) error {
-	_, err := lc.send(ctx, "PUT", "/localapi/v0/tailfs/fileserver-address", http.StatusCreated, strings.NewReader(addr))
+// Taildrive know to use the file server running in the GUI app.
+func (lc *LocalClient) DriveSetServerAddr(ctx context.Context, addr string) error {
+	_, err := lc.send(ctx, "PUT", "/localapi/v0/drive/fileserver-address", http.StatusCreated, strings.NewReader(addr))
 	return err
 }
 
-// TailFSShareSet adds or updates the given share in the list of shares that
-// TailFS will serve to remote nodes. If a share with the same name already
+// DriveShareSet adds or updates the given share in the list of shares that
+// Taildrive will serve to remote nodes. If a share with the same name already
 // exists, the existing share is replaced/updated.
-func (lc *LocalClient) TailFSShareSet(ctx context.Context, share *tailfs.Share) error {
-	_, err := lc.send(ctx, "PUT", "/localapi/v0/tailfs/shares", http.StatusCreated, jsonBody(share))
+func (lc *LocalClient) DriveShareSet(ctx context.Context, share *drive.Share) error {
+	_, err := lc.send(ctx, "PUT", "/localapi/v0/drive/shares", http.StatusCreated, jsonBody(share))
 	return err
 }
 
-// TailFSShareRemove removes the share with the given name from the list of
-// shares that TailFS will serve to remote nodes.
-func (lc *LocalClient) TailFSShareRemove(ctx context.Context, name string) error {
+// DriveShareRemove removes the share with the given name from the list of
+// shares that Taildrive will serve to remote nodes.
+func (lc *LocalClient) DriveShareRemove(ctx context.Context, name string) error {
 	_, err := lc.send(
 		ctx,
 		"DELETE",
-		"/localapi/v0/tailfs/shares",
+		"/localapi/v0/drive/shares",
 		http.StatusNoContent,
 		strings.NewReader(name))
 	return err
 }
 
-// TailFSShareRename renames the share from old to new name.
-func (lc *LocalClient) TailFSShareRename(ctx context.Context, oldName, newName string) error {
+// DriveShareRename renames the share from old to new name.
+func (lc *LocalClient) DriveShareRename(ctx context.Context, oldName, newName string) error {
 	_, err := lc.send(
 		ctx,
 		"POST",
-		"/localapi/v0/tailfs/shares",
+		"/localapi/v0/drive/shares",
 		http.StatusNoContent,
 		jsonBody([2]string{oldName, newName}))
 	return err
 }
 
-// TailFSShareList returns the list of shares that TailFS is currently serving
+// DriveShareList returns the list of shares that drive is currently serving
 // to remote nodes.
-func (lc *LocalClient) TailFSShareList(ctx context.Context) ([]*tailfs.Share, error) {
-	result, err := lc.get200(ctx, "/localapi/v0/tailfs/shares")
+func (lc *LocalClient) DriveShareList(ctx context.Context) ([]*drive.Share, error) {
+	result, err := lc.get200(ctx, "/localapi/v0/drive/shares")
 	if err != nil {
 		return nil, err
 	}
-	var shares []*tailfs.Share
+	var shares []*drive.Share
 	err = json.Unmarshal(result, &shares)
 	return shares, err
 }
@@ -1504,4 +1513,13 @@ func (w *IPNBusWatcher) Next() (ipn.Notify, error) {
 		return ipn.Notify{}, err
 	}
 	return n, nil
+}
+
+// SuggestExitNode requests an exit node suggestion and returns the exit node's details.
+func (lc *LocalClient) SuggestExitNode(ctx context.Context) (apitype.ExitNodeSuggestionResponse, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/suggest-exit-node")
+	if err != nil {
+		return apitype.ExitNodeSuggestionResponse{}, err
+	}
+	return decodeJSON[apitype.ExitNodeSuggestionResponse](body)
 }

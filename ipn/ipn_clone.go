@@ -9,8 +9,8 @@ import (
 	"maps"
 	"net/netip"
 
+	"tailscale.com/drive"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailfs"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 )
@@ -25,10 +25,10 @@ func (src *Prefs) Clone() *Prefs {
 	*dst = *src
 	dst.AdvertiseTags = append(src.AdvertiseTags[:0:0], src.AdvertiseTags...)
 	dst.AdvertiseRoutes = append(src.AdvertiseRoutes[:0:0], src.AdvertiseRoutes...)
-	if src.TailFSShares != nil {
-		dst.TailFSShares = make([]*tailfs.Share, len(src.TailFSShares))
-		for i := range dst.TailFSShares {
-			dst.TailFSShares[i] = src.TailFSShares[i].Clone()
+	if src.DriveShares != nil {
+		dst.DriveShares = make([]*drive.Share, len(src.DriveShares))
+		for i := range dst.DriveShares {
+			dst.DriveShares[i] = src.DriveShares[i].Clone()
 		}
 	}
 	dst.Persist = src.Persist.Clone()
@@ -42,6 +42,7 @@ var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	AllowSingleHosts       bool
 	ExitNodeID             tailcfg.StableNodeID
 	ExitNodeIP             netip.Addr
+	InternalExitNodePrior  tailcfg.StableNodeID
 	ExitNodeAllowLANAccess bool
 	CorpDNS                bool
 	RunSSH                 bool
@@ -63,7 +64,7 @@ var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	AppConnector           AppConnectorPrefs
 	PostureChecking        bool
 	NetfilterKind          string
-	TailFSShares           []*tailfs.Share
+	DriveShares            []*drive.Share
 	Persist                *persist.Persist
 }{})
 

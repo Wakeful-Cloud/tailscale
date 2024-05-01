@@ -470,6 +470,10 @@ func (n *fakeIPTablesRunner) AddDNATRule(origDst, dst netip.Addr) error {
 	return errors.New("not implemented")
 }
 
+func (n *fakeIPTablesRunner) DNATWithLoadBalancer(netip.Addr, []netip.Addr) error {
+	return errors.New("not implemented")
+}
+
 func (n *fakeIPTablesRunner) AddSNATRuleForDst(src, dst netip.Addr) error {
 	return errors.New("not implemented")
 }
@@ -882,7 +886,7 @@ func newLinuxRootTest(t *testing.T) *linuxTest {
 	mon.Start()
 	lt.mon = mon
 
-	r, err := newUserspaceRouter(logf, lt.tun, mon)
+	r, err := newUserspaceRouter(logf, lt.tun, mon, nil)
 	if err != nil {
 		lt.Close()
 		t.Fatal(err)
@@ -909,7 +913,7 @@ func TestDelRouteIdempotent(t *testing.T) {
 			t.Error(err)
 			continue
 		}
-		for i := 0; i < 2; i++ {
+		for i := range 2 {
 			if err := lt.r.delRoute(cidr); err != nil {
 				t.Errorf("delRoute(i=%d): %v", i, err)
 			}

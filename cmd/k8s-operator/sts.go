@@ -87,6 +87,7 @@ const (
 	// ensure that it does not get removed when a ProxyClass configuration
 	// is applied.
 	podAnnotationLastSetClusterIP         = "tailscale.com/operator-last-set-cluster-ip"
+	podAnnotationLastSetClusterDNSName    = "tailscale.com/operator-last-set-cluster-dns-name"
 	podAnnotationLastSetTailnetTargetIP   = "tailscale.com/operator-last-set-ts-tailnet-target-ip"
 	podAnnotationLastSetTailnetTargetFQDN = "tailscale.com/operator-last-set-ts-tailnet-target-fqdn"
 	// podAnnotationLastSetConfigFileHash is sha256 hash of the current tailscaled configuration contents.
@@ -109,8 +110,9 @@ type tailscaleSTSConfig struct {
 	ParentResourceUID   string
 	ChildResourceLabels map[string]string
 
-	ServeConfig     *ipn.ServeConfig // if serve config is set, this is a proxy for Ingress
-	ClusterTargetIP string           // ingress target
+	ServeConfig          *ipn.ServeConfig // if serve config is set, this is a proxy for Ingress
+	ClusterTargetIP      string           // ingress target IP
+	ClusterTargetDNSName string           // ingress target DNS name
 	// If set to true, operator should configure containerboot to forward
 	// cluster traffic via the proxy set up for Kubernetes Ingress.
 	ForwardClusterTrafficViaL7IngressProxy bool
@@ -536,6 +538,12 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 			Value: sts.ClusterTargetIP,
 		})
 		mak.Set(&ss.Spec.Template.Annotations, podAnnotationLastSetClusterIP, sts.ClusterTargetIP)
+	} else if sts.ClusterTargetDNSName != "" {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "TS_EXPERIMENTAL_DEST_DNS_NAME",
+			Value: sts.ClusterTargetDNSName,
+		})
+		mak.Set(&ss.Spec.Template.Annotations, podAnnotationLastSetClusterDNSName, sts.ClusterTargetDNSName)
 	} else if sts.TailnetTargetIP != "" {
 		container.Env = append(container.Env, corev1.EnvVar{
 			Name:  "TS_TAILNET_TARGET_IP",
@@ -574,7 +582,7 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 	logger.Debugf("reconciling statefulset %s/%s", ss.GetNamespace(), ss.GetName())
 	if sts.ProxyClass != "" {
 		logger.Debugf("configuring proxy resources with ProxyClass %s", sts.ProxyClass)
-		ss = applyProxyClassToStatefulSet(proxyClass, ss)
+		ss = applyProxyClassToStatefulSet(proxyClass, ss, sts, logger)
 	}
 	updateSS := func(s *appsv1.StatefulSet) {
 		s.Spec = ss.Spec
@@ -605,8 +613,28 @@ func mergeStatefulSetLabelsOrAnnots(current, custom map[string]string, managed [
 	return custom
 }
 
-func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet) *appsv1.StatefulSet {
-	if pc == nil || ss == nil || pc.Spec.StatefulSet == nil {
+func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, stsCfg *tailscaleSTSConfig, logger *zap.SugaredLogger) *appsv1.StatefulSet {
+	if pc == nil || ss == nil {
+		return ss
+	}
+	if pc.Spec.Metrics != nil && pc.Spec.Metrics.Enable {
+		if stsCfg.TailnetTargetFQDN == "" && stsCfg.TailnetTargetIP == "" && !stsCfg.ForwardClusterTrafficViaL7IngressProxy {
+			enableMetrics(ss, pc)
+		} else if stsCfg.ForwardClusterTrafficViaL7IngressProxy {
+			// TODO (irbekrm): fix this
+			// For Ingress proxies that have been configured with
+			// tailscale.com/experimental-forward-cluster-traffic-via-ingress
+			// annotation, all cluster traffic is forwarded to the
+			// Ingress backend(s).
+			logger.Info("ProxyClass specifies that metrics should be enabled, but this is currently not supported for Ingress proxies that accept cluster traffic.")
+		} else {
+			// TODO (irbekrm): fix this
+			// For egress proxies, currently all cluster traffic is forwarded to the tailnet target.
+			logger.Info("ProxyClass specifies that metrics should be enabled, but this is currently not supported for Ingress proxies that accept cluster traffic.")
+		}
+	}
+
+	if pc.Spec.StatefulSet == nil {
 		return ss
 	}
 
@@ -633,6 +661,7 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet) 
 	ss.Spec.Template.Spec.ImagePullSecrets = wantsPod.ImagePullSecrets
 	ss.Spec.Template.Spec.NodeName = wantsPod.NodeName
 	ss.Spec.Template.Spec.NodeSelector = wantsPod.NodeSelector
+	ss.Spec.Template.Spec.Affinity = wantsPod.Affinity
 	ss.Spec.Template.Spec.Tolerations = wantsPod.Tolerations
 
 	// Update containers.
@@ -644,6 +673,15 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet) 
 			base.SecurityContext = overlay.SecurityContext
 		}
 		base.Resources = overlay.Resources
+		for _, e := range overlay.Env {
+			// Env vars configured via ProxyClass might override env
+			// vars that have been specified by the operator, i.e
+			// TS_USERSPACE. The intended behaviour is to allow this
+			// and in practice it works without explicitly removing
+			// the operator configured value here as a later value
+			// in the env var list overrides an earlier one.
+			base.Env = append(base.Env, corev1.EnvVar{Name: string(e.Name), Value: e.Value})
+		}
 		return base
 	}
 	for i, c := range ss.Spec.Template.Spec.Containers {
@@ -661,6 +699,21 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet) 
 		}
 	}
 	return ss
+}
+
+func enableMetrics(ss *appsv1.StatefulSet, pc *tsapi.ProxyClass) {
+	for i, c := range ss.Spec.Template.Spec.Containers {
+		if c.Name == "tailscale" {
+			// Serve metrics on on <pod-ip>:9001/debug/metrics. If
+			// we didn't specify Pod IP here, the proxy would, in
+			// some cases, also listen to its Tailscale IP- we don't
+			// want folks to start relying on this side-effect as a
+			// feature.
+			ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env, corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(POD_IP):9001"})
+			ss.Spec.Template.Spec.Containers[i].Ports = append(ss.Spec.Template.Spec.Containers[i].Ports, corev1.ContainerPort{Name: "metrics", Protocol: "TCP", HostPort: 9001, ContainerPort: 9001})
+			break
+		}
+	}
 }
 
 // tailscaledConfig takes a proxy config, a newly generated auth key if

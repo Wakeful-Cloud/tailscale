@@ -62,6 +62,11 @@ type nftable struct {
 //   - The table and chain conventions followed here are those used by
 //     `iptables-nft` and `ufw`, so that those tools co-exist and do not
 //     negatively affect Tailscale function.
+//   - Be mindful that 1) all chains attached to a given hook (i.e the forward hook)
+//     will be processed in priority order till either a rule in one of the chains issues a drop verdict
+//     or there are no more chains for that hook
+//     2) processing of individual rules within a chain will stop once one of them issues a final verdict (accept, drop).
+//     https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains
 type nftablesRunner struct {
 	conn *nftables.Conn
 	nft4 *nftable
@@ -109,7 +114,6 @@ func (n *nftablesRunner) AddDNATRule(origDst netip.Addr, dst netip.Addr) error {
 		dadderLen = 16
 		fam = unix.NFPROTO_IPV6
 	}
-
 	dnatRule := &nftables.Rule{
 		Table: nat,
 		Chain: preroutingCh,
@@ -138,6 +142,15 @@ func (n *nftablesRunner) AddDNATRule(origDst netip.Addr, dst netip.Addr) error {
 	}
 	n.conn.InsertRule(dnatRule)
 	return n.conn.Flush()
+}
+
+// DNATWithLoadBalancer currently just forwards all traffic destined for origDst
+// to the first IP address from the backend targets.
+// TODO (irbekrm): instead of doing this load balance traffic evenly to all
+// backend destinations.
+// https://github.com/tailscale/tailscale/commit/d37f2f508509c6c35ad724fd75a27685b90b575b#diff-a3bcbcd1ca198799f4f768dc56fea913e1945a6b3ec9dbec89325a84a19a85e7R148-R232
+func (n *nftablesRunner) DNATWithLoadBalancer(origDst netip.Addr, dsts []netip.Addr) error {
+	return n.AddDNATRule(origDst, dsts[0])
 }
 
 func (n *nftablesRunner) DNATNonTailscaleTraffic(tunname string, dst netip.Addr) error {
@@ -238,6 +251,25 @@ func (n *nftablesRunner) AddSNATRuleForDst(src, dst netip.Addr) error {
 	return n.conn.Flush()
 }
 
+// ClampMSSToPMTU ensures that all packets with TCP flags (SYN, ACK, RST) set
+// being forwarded via the given interface (tun) have MSS set to <MTU of the
+// interface> - 40 (IP and TCP headers). This can be useful if this tailscale
+// instance is expected to run as a forwarding proxy, forwarding packets from an
+// endpoint with higher MTU in an environment where path MTU discovery is
+// expected to not work (such as the proxies created by the Tailscale Kubernetes
+// operator). ClamMSSToPMTU creates a new base-chain ts-clamp in the filter
+// table with accept policy and priority -150. In practice, this means that for
+// SYN packets the clamp rule in this chain will likely run first and accept the
+// packet. This is fine because 1) nftables run ALL chains with the same hook
+// type unless a rule in one of them drops the packet and 2) this chain does not
+// have functionality to drop the packet- so in practice a matching clamp rule
+// will always be followed by the custom tailscale filtering rules in the other
+// chains attached to the filter hook (FORWARD, ts-forward).
+// We do not want to place the clamping rule into FORWARD/ts-forward chains
+// because wgengine populates those chains with rules that contain accept
+// verdicts that would cause no further procesing within that chain. This
+// functionality is currently invoked from outside wgengine (containerboot), so
+// we don't want to race with wgengine for rule ordering within chains.
 func (n *nftablesRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
 	polAccept := nftables.ChainPolicyAccept
 	table := n.getNFTByAddr(addr)
@@ -246,13 +278,13 @@ func (n *nftablesRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
 		return fmt.Errorf("error ensuring filter table: %w", err)
 	}
 
-	// ensure forwarding chain exists
+	// ensure ts-clamp chain exists
 	fwChain, err := getOrCreateChain(n.conn, chainInfo{
 		table:         filterTable,
-		name:          "FORWARD",
+		name:          "ts-clamp",
 		chainType:     nftables.ChainTypeFilter,
 		chainHook:     nftables.ChainHookForward,
-		chainPriority: nftables.ChainPriorityFilter,
+		chainPriority: nftables.ChainPriorityMangle,
 		chainPolicy:   &polAccept,
 	})
 	if err != nil {
@@ -289,7 +321,7 @@ func (n *nftablesRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
 				Xor:            []byte{0x00},
 			},
 			&expr.Cmp{
-				Op:       expr.CmpOpNeq,
+				Op:       expr.CmpOpNeq, // match any packet with a TCP flag set (SYN, ACK, RST)
 				Register: 1,
 				Data:     []byte{0x00},
 			},
@@ -423,7 +455,7 @@ func getOrCreateChain(c *nftables.Conn, cinfo chainInfo) (*nftables.Chain, error
 		// type/hook/priority, but for "conventional chains" assume they're what
 		// we expect (in case iptables-nft/ufw make minor behavior changes in
 		// the future).
-		if isTSChain(chain.Name) && (chain.Type != cinfo.chainType || chain.Hooknum != cinfo.chainHook || chain.Priority != cinfo.chainPriority) {
+		if isTSChain(chain.Name) && (chain.Type != cinfo.chainType || *chain.Hooknum != *cinfo.chainHook || *chain.Priority != *cinfo.chainPriority) {
 			return nil, fmt.Errorf("chain %s already exists with different type/hook/priority", cinfo.name)
 		}
 		return chain, nil
@@ -500,6 +532,14 @@ type NetfilterRunner interface {
 	// to the provided destination, as used in the Kubernetes ingress proxies.
 	AddDNATRule(origDst, dst netip.Addr) error
 
+	// DNATWithLoadBalancer adds a rule to the nat/PREROUTING chain to DNAT
+	// traffic destined for the given original destination to the given new
+	// destination(s) using round robin to load balance if more than one
+	// destination is provided. This is used to forward all traffic destined
+	// for the Tailscale interface to the provided destination(s), as used
+	// in the Kubernetes ingress proxies.
+	DNATWithLoadBalancer(origDst netip.Addr, dsts []netip.Addr) error
+
 	// AddSNATRuleForDst adds a rule to the nat/POSTROUTING chain to SNAT
 	// traffic destined for dst to src.
 	// This is used to forward traffic destined for the local machine over
@@ -509,7 +549,7 @@ type NetfilterRunner interface {
 	// DNATNonTailscaleTraffic adds a rule to the nat/PREROUTING chain to DNAT
 	// all traffic inbound from any interface except exemptInterface to dst.
 	// This is used to forward traffic destined for the local machine over
-	// the Tailscale interface, as used in the Kubernetes egress proxies.//
+	// the Tailscale interface, as used in the Kubernetes egress proxies.
 	DNATNonTailscaleTraffic(exemptInterface string, dst netip.Addr) error
 
 	// ClampMSSToPMTU adds a rule to the mangle/FORWARD chain to clamp MSS for

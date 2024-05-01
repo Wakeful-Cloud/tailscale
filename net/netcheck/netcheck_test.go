@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
@@ -154,13 +154,19 @@ func TestHairpinWait(t *testing.T) {
 	})
 }
 
+func newTestClient(t testing.TB) *Client {
+	c := &Client{
+		NetMon: netmon.NewStatic(),
+		Logf:   t.Logf,
+	}
+	return c
+}
+
 func TestBasic(t *testing.T) {
 	stunAddr, cleanup := stuntest.Serve(t)
 	defer cleanup()
 
-	c := &Client{
-		Logf: t.Logf,
-	}
+	c := newTestClient(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -202,9 +208,8 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 	dm := stuntest.DERPMapOf(stunAddr)
 	dm.Regions[1].Nodes[0].STUNOnly = true
 
-	c := &Client{
-		Logf: t.Logf,
-	}
+	c := newTestClient(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
@@ -410,7 +415,7 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			},
 			opts: &GetReportOpts{
 				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
-					1: startTime.Add(2*time.Second + preferredDERPFrameTime/2), // within active window of step (3)
+					1: startTime.Add(2*time.Second + PreferredDERPFrameTime/2), // within active window of step (3)
 				}),
 			},
 			wantPrevLen: 3,
@@ -425,7 +430,7 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			},
 			opts: &GetReportOpts{
 				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
-					1: startTime.Add(4*time.Second - preferredDERPFrameTime - 1), // not within active window of (3)
+					1: startTime.Add(4*time.Second - PreferredDERPFrameTime - 1), // not within active window of (3)
 				}),
 			},
 			wantPrevLen: 3,
@@ -667,7 +672,7 @@ func TestMakeProbePlan(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ifState := &interfaces.State{
+			ifState := &netmon.State{
 				HaveV6: tt.have6if,
 				HaveV4: !tt.no4,
 			}
@@ -895,14 +900,11 @@ func TestNoCaptivePortalWhenUDP(t *testing.T) {
 	stunAddr, cleanup := stuntest.Serve(t)
 	defer cleanup()
 
-	c := &Client{
-		Logf:              t.Logf,
-		testEnoughRegions: 1,
-
-		// Set the delay long enough that we have time to cancel it
-		// when our STUN probe succeeds.
-		testCaptivePortalDelay: 10 * time.Second,
-	}
+	c := newTestClient(t)
+	c.testEnoughRegions = 1
+	// Set the delay long enough that we have time to cancel it
+	// when our STUN probe succeeds.
+	c.testCaptivePortalDelay = 10 * time.Second
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()

@@ -130,7 +130,9 @@ type CapabilityVersion int
 //   - 87: 2024-02-11: UserProfile.Groups removed (added in 66)
 //   - 88: 2024-03-05: Client understands NodeAttrSuggestExitNode
 //   - 89: 2024-03-23: Client no longer respects deleted PeerChange.Capabilities (use CapMap)
-const CurrentCapabilityVersion CapabilityVersion = 89
+//   - 90: 2024-04-03: Client understands PeerCapabilityTaildrive.
+//   - 91: 2024-04-24: Client understands PeerCapabilityTaildriveSharer.
+const CurrentCapabilityVersion CapabilityVersion = 91
 
 type StableID string
 
@@ -339,6 +341,16 @@ type Node struct {
 	// CapMap with an empty value.
 	//
 	// See NodeCapability for more information on keys.
+	//
+	// Metadata about nodes can be transmitted in 3 ways:
+	// 1. MapResponse.Node.CapMap describes attributes that affect behavior for
+	//    this node, such as which features have been enabled through the admin
+	//    panel and any associated configuration details.
+	// 2. MapResponse.PacketFilter(s) describes access (both IP and application
+	//    based) that should be granted to peers.
+	// 3. MapResponse.Peers[].CapMap describes attributes regarding a peer node,
+	//    such as which features the peer supports or if that peer is preferred
+	//    for a particular task vs other peers that could also be chosen.
 	CapMap NodeCapMap `json:",omitempty"`
 
 	// UnsignedPeerAPIOnly means that this node is not signed nor subject to TKA
@@ -1058,10 +1070,11 @@ func (st SignatureType) String() string {
 // in response to a RegisterRequest.
 type RegisterResponseAuth struct {
 	_ structs.Incomparable
-	// One of Provider/LoginName, Oauth2Token, or AuthKey is set.
-	Provider, LoginName string
-	Oauth2Token         *Oauth2Token
-	AuthKey             string
+
+	// At most one of Oauth2Token or AuthKey is set.
+
+	Oauth2Token *Oauth2Token `json:",omitempty"`
+	AuthKey     string       `json:",omitempty"`
 }
 
 // RegisterRequest is sent by a client to register the key for a node.
@@ -1082,7 +1095,7 @@ type RegisterRequest struct {
 	NodeKey    key.NodePublic
 	OldNodeKey key.NodePublic
 	NLKey      key.NLPublic
-	Auth       RegisterResponseAuth
+	Auth       *RegisterResponseAuth `json:",omitempty"`
 	// Expiry optionally specifies the requested key expiry.
 	// The server policy may override.
 	// As a special case, if Expiry is in the past and NodeKey is
@@ -1345,8 +1358,12 @@ const (
 	// PeerCapabilityWebUI grants the ability for a peer to edit features from the
 	// device Web UI.
 	PeerCapabilityWebUI PeerCapability = "tailscale.com/cap/webui"
-	// PeerCapabilityTailFS grants the ability for a peer to access tailfs shares.
-	PeerCapabilityTailFS PeerCapability = "tailscale.com/cap/tailfs"
+	// PeerCapabilityTaildrive grants the ability for a peer to access Taildrive
+	// shares.
+	PeerCapabilityTaildrive PeerCapability = "tailscale.com/cap/drive"
+	// PeerCapabilityTaildriveSharer indicates that a peer has the ability to
+	// share folders with us.
+	PeerCapabilityTaildriveSharer PeerCapability = "tailscale.com/cap/drive-sharer"
 )
 
 // NodeCapMap is a map of capabilities to their optional values. It is valid for
@@ -2218,11 +2235,11 @@ const (
 	// tail end of an active direct connection in magicsock.
 	NodeAttrProbeUDPLifetime NodeCapability = "probe-udp-lifetime"
 
-	// NodeAttrsTailFSShare enables sharing via TailFS.
-	NodeAttrsTailFSShare NodeCapability = "tailfs:share"
+	// NodeAttrsTaildriveShare enables sharing via Taildrive.
+	NodeAttrsTaildriveShare NodeCapability = "drive:share"
 
-	// NodeAttrsTailFSAccess enables accessing shares via TailFS.
-	NodeAttrsTailFSAccess NodeCapability = "tailfs:access"
+	// NodeAttrsTaildriveAccess enables accessing shares via Taildrive.
+	NodeAttrsTaildriveAccess NodeCapability = "drive:access"
 
 	// NodeAttrSuggestExitNode is applied to each exit node which the control plane has determined
 	// is a recommended exit node.
@@ -2230,6 +2247,18 @@ const (
 
 	// NodeAttrDisableWebClient disables using the web client.
 	NodeAttrDisableWebClient NodeCapability = "disable-web-client"
+
+	// NodeAttrLogExitFlows enables exit node destinations in network flow logs.
+	NodeAttrLogExitFlows NodeCapability = "log-exit-flows"
+
+	// NodeAttrAutoExitNode permits the automatic exit nodes feature.
+	NodeAttrAutoExitNode NodeCapability = "auto-exit-node"
+
+	// NodeAttrStoreAppCRoutes configures the node to store app connector routes persistently.
+	NodeAttrStoreAppCRoutes NodeCapability = "store-appc-routes"
+
+	// NodeAttrSuggestExitNodeUI allows the currently suggested exit node to appear in the client GUI.
+	NodeAttrSuggestExitNodeUI NodeCapability = "suggest-exit-node-ui"
 )
 
 // SetDNSRequest is a request to add a DNS record.

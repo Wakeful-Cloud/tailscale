@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.org/x/time/rate"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/preftype"
@@ -69,7 +70,7 @@ type linuxRouter struct {
 	magicsockPortV6 uint16
 }
 
-func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Monitor) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (Router, error) {
 	tunname, err := tunDev.Name()
 	if err != nil {
 		return nil, err
@@ -403,6 +404,12 @@ func (r *linuxRouter) Set(cfg *Config) error {
 	}
 	r.snatSubnetRoutes = cfg.SNATSubnetRoutes
 
+	// Issue 11405: enable IP forwarding on gokrazy.
+	advertisingRoutes := len(cfg.SubnetRoutes) > 0
+	if distro.Get() == distro.Gokrazy && advertisingRoutes {
+		r.enableIPForwarding()
+	}
+
 	return multierr.New(errs...)
 }
 
@@ -463,7 +470,7 @@ func (r *linuxRouter) UpdateMagicsockPort(port uint16, network string) error {
 // reflect the new mode, and r.snatSubnetRoutes is updated to reflect
 // the current state of subnet SNATing.
 func (r *linuxRouter) setNetfilterMode(mode preftype.NetfilterMode) error {
-	if distro.Get() == distro.Synology {
+	if !platformCanNetfilter() {
 		mode = netfilterOff
 	}
 
@@ -909,6 +916,28 @@ func (r *linuxRouter) upInterface() error {
 		return fmt.Errorf("bringing interface up, %w", err)
 	}
 	return netlink.LinkSetUp(link)
+}
+
+func (r *linuxRouter) enableIPForwarding() {
+	sysctls := map[string]string{
+		"net.ipv4.ip_forward":          "1",
+		"net.ipv6.conf.all.forwarding": "1",
+	}
+	for k, v := range sysctls {
+		if err := writeSysctl(k, v); err != nil {
+			r.logf("warning: %v", k, v, err)
+			continue
+		}
+		r.logf("sysctl(%v=%v): ok", k, v)
+	}
+}
+
+func writeSysctl(key, val string) error {
+	fn := "/proc/sys/" + strings.Replace(key, ".", "/", -1)
+	if err := os.WriteFile(fn, []byte(val), 0644); err != nil {
+		return fmt.Errorf("sysctl(%v=%v): %v", key, val, err)
+	}
+	return nil
 }
 
 // downInterface sets the tunnel interface administratively down.
@@ -1368,12 +1397,27 @@ func normalizeCIDR(cidr netip.Prefix) string {
 	return cidr.Masked().String()
 }
 
-// cleanup removes all the rules and routes that were added by the linux router.
-// The function calls cleanup for both iptables and nftables since which ever
-// netfilter runner is used, the cleanup function for the other one doesn't do anything.
-func cleanup(logf logger.Logf, interfaceName string) {
-	if interfaceName != "userspace-networking" {
-		linuxfw.IPTablesCleanup(logf)
+// platformCanNetfilter reports whether the current distro/environment supports
+// running iptables/nftables commands.
+func platformCanNetfilter() bool {
+	switch distro.Get() {
+	case distro.Synology:
+		// Synology doesn't support iptables or nftables. Attempting to run it
+		// just blocks for a long time while it logs about failures.
+		//
+		// See https://github.com/tailscale/tailscale/issues/11737 for one such
+		// prior regression where we tried to run iptables on Synology.
+		return false
+	}
+	return true
+}
+
+// cleanUp removes all the rules and routes that were added by the linux router.
+// The function calls cleanUp for both iptables and nftables since which ever
+// netfilter runner is used, the cleanUp function for the other one doesn't do anything.
+func cleanUp(logf logger.Logf, interfaceName string) {
+	if interfaceName != "userspace-networking" && platformCanNetfilter() {
+		linuxfw.IPTablesCleanUp(logf)
 		linuxfw.NfTablesCleanUp(logf)
 	}
 }

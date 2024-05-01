@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
@@ -23,14 +25,16 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc"
 	"tailscale.com/appc/appctest"
+	"tailscale.com/clientupdate"
 	"tailscale.com/control/controlclient"
+	"tailscale.com/drive"
+	"tailscale.com/drive/driveimpl"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailfs"
-	"tailscale.com/tailfs/tailfsimpl"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
@@ -49,6 +53,8 @@ import (
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
 )
+
+func fakeStoreRoutes(*appc.RouteInfo) error { return nil }
 
 func inRemove(ip netip.Addr) bool {
 	for _, pfx := range removeFromDefaultRoute {
@@ -455,6 +461,99 @@ func TestLazyMachineKeyGeneration(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 }
 
+func TestZeroExitNodeViaLocalAPI(t *testing.T) {
+	lb := newTestLocalBackend(t)
+
+	// Give it an initial exit node in use.
+	if _, err := lb.EditPrefs(&ipn.MaskedPrefs{
+		ExitNodeIDSet: true,
+		Prefs: ipn.Prefs{
+			ExitNodeID: "foo",
+		},
+	}); err != nil {
+		t.Fatalf("enabling first exit node: %v", err)
+	}
+
+	// SetUseExitNodeEnabled(false) "remembers" the prior exit node.
+	if _, err := lb.SetUseExitNodeEnabled(false); err != nil {
+		t.Fatal("expected failure")
+	}
+
+	// Zero the exit node
+	pv, err := lb.EditPrefs(&ipn.MaskedPrefs{
+		ExitNodeIDSet: true,
+		Prefs: ipn.Prefs{
+			ExitNodeID: "",
+		},
+	})
+
+	if err != nil {
+		t.Fatalf("enabling first exit node: %v", err)
+	}
+
+	// We just set the internal exit node to the empty string, so InternalExitNodePrior should
+	// also be zero'd
+	if got, want := pv.InternalExitNodePrior(), tailcfg.StableNodeID(""); got != want {
+		t.Fatalf("unexpected InternalExitNodePrior %q, want: %q", got, want)
+	}
+
+}
+
+func TestSetUseExitNodeEnabled(t *testing.T) {
+	lb := newTestLocalBackend(t)
+
+	// Can't turn it on if it never had an old value.
+	if _, err := lb.SetUseExitNodeEnabled(true); err == nil {
+		t.Fatal("expected success")
+	}
+
+	// But we can turn it off when it's already off.
+	if _, err := lb.SetUseExitNodeEnabled(false); err != nil {
+		t.Fatal("expected failure")
+	}
+
+	// Give it an initial exit node in use.
+	if _, err := lb.EditPrefs(&ipn.MaskedPrefs{
+		ExitNodeIDSet: true,
+		Prefs: ipn.Prefs{
+			ExitNodeID: "foo",
+		},
+	}); err != nil {
+		t.Fatalf("enabling first exit node: %v", err)
+	}
+
+	// Now turn off that exit node.
+	if prefs, err := lb.SetUseExitNodeEnabled(false); err != nil {
+		t.Fatal("expected failure")
+	} else {
+		if g, w := prefs.ExitNodeID(), tailcfg.StableNodeID(""); g != w {
+			t.Fatalf("unexpected exit node ID %q; want %q", g, w)
+		}
+		if g, w := prefs.InternalExitNodePrior(), tailcfg.StableNodeID("foo"); g != w {
+			t.Fatalf("unexpected exit node prior %q; want %q", g, w)
+		}
+	}
+
+	// And turn it back on.
+	if prefs, err := lb.SetUseExitNodeEnabled(true); err != nil {
+		t.Fatal("expected failure")
+	} else {
+		if g, w := prefs.ExitNodeID(), tailcfg.StableNodeID("foo"); g != w {
+			t.Fatalf("unexpected exit node ID %q; want %q", g, w)
+		}
+		if g, w := prefs.InternalExitNodePrior(), tailcfg.StableNodeID("foo"); g != w {
+			t.Fatalf("unexpected exit node prior %q; want %q", g, w)
+		}
+	}
+
+	// Verify we block setting an Internal field.
+	if _, err := lb.EditPrefs(&ipn.MaskedPrefs{
+		InternalExitNodePriorSet: true,
+	}); err == nil {
+		t.Fatalf("unexpected success; want an error trying to set an internal field")
+	}
+}
+
 func TestFileTargets(t *testing.T) {
 	b := new(LocalBackend)
 	_, err := b.FileTargets()
@@ -505,7 +604,7 @@ func TestFileTargets(t *testing.T) {
 
 func TestInternalAndExternalInterfaces(t *testing.T) {
 	type interfacePrefix struct {
-		i   interfaces.Interface
+		i   netmon.Interface
 		pfx netip.Prefix
 	}
 
@@ -515,7 +614,7 @@ func TestInternalAndExternalInterfaces(t *testing.T) {
 		}
 		return pfxs
 	}
-	iList := func(ips ...interfacePrefix) (il interfaces.List) {
+	iList := func(ips ...interfacePrefix) (il netmon.InterfaceList) {
 		for _, ip := range ips {
 			il = append(il, ip.i)
 		}
@@ -523,7 +622,7 @@ func TestInternalAndExternalInterfaces(t *testing.T) {
 	}
 	newInterface := func(name, pfx string, wsl2, loopback bool) interfacePrefix {
 		ippfx := netip.MustParsePrefix(pfx)
-		ip := interfaces.Interface{
+		ip := netmon.Interface{
 			Interface: &net.Interface{},
 			AltAddrs: []net.Addr{
 				netipx.PrefixIPNet(ippfx),
@@ -547,7 +646,7 @@ func TestInternalAndExternalInterfaces(t *testing.T) {
 	tests := []struct {
 		name    string
 		goos    string
-		il      interfaces.List
+		il      netmon.InterfaceList
 		wantInt []netip.Prefix
 		wantExt []netip.Prefix
 	}{
@@ -708,31 +807,87 @@ func TestPacketFilterPermitsUnlockedNodes(t *testing.T) {
 	}
 }
 
-func TestStatusWithoutPeers(t *testing.T) {
+func TestStatusPeerCapabilities(t *testing.T) {
+	tests := []struct {
+		name                     string
+		peers                    []tailcfg.NodeView
+		expectedPeerCapabilities map[tailcfg.StableNodeID][]tailcfg.NodeCapability
+		expectedPeerCapMap       map[tailcfg.StableNodeID]tailcfg.NodeCapMap
+	}{
+		{
+			name: "peers-with-capabilities",
+			peers: []tailcfg.NodeView{
+				(&tailcfg.Node{
+					ID:              1,
+					StableID:        "foo",
+					IsWireGuardOnly: true,
+					Hostinfo:        (&tailcfg.Hostinfo{}).View(),
+					Capabilities:    []tailcfg.NodeCapability{tailcfg.CapabilitySSH},
+					CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+						tailcfg.CapabilitySSH: nil,
+					}),
+				}).View(),
+				(&tailcfg.Node{
+					ID:           2,
+					StableID:     "bar",
+					Hostinfo:     (&tailcfg.Hostinfo{}).View(),
+					Capabilities: []tailcfg.NodeCapability{tailcfg.CapabilityAdmin},
+					CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+						tailcfg.CapabilityAdmin: {`{"test": "true}`},
+					}),
+				}).View(),
+			},
+			expectedPeerCapabilities: map[tailcfg.StableNodeID][]tailcfg.NodeCapability{
+				tailcfg.StableNodeID("foo"): {tailcfg.CapabilitySSH},
+				tailcfg.StableNodeID("bar"): {tailcfg.CapabilityAdmin},
+			},
+			expectedPeerCapMap: map[tailcfg.StableNodeID]tailcfg.NodeCapMap{
+				tailcfg.StableNodeID("foo"): (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+					tailcfg.CapabilitySSH: nil,
+				}),
+				tailcfg.StableNodeID("bar"): (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+					tailcfg.CapabilityAdmin: {`{"test": "true}`},
+				}),
+			},
+		},
+		{
+			name: "peers-without-capabilities",
+			peers: []tailcfg.NodeView{
+				(&tailcfg.Node{
+					ID:              1,
+					StableID:        "foo",
+					IsWireGuardOnly: true,
+					Hostinfo:        (&tailcfg.Hostinfo{}).View(),
+				}).View(),
+				(&tailcfg.Node{
+					ID:       2,
+					StableID: "bar",
+					Hostinfo: (&tailcfg.Hostinfo{}).View(),
+				}).View(),
+			},
+		},
+	}
 	b := newTestLocalBackend(t)
 
-	var cc *mockControl
-	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
-		cc = newClient(t, opts)
-
-		t.Logf("ccGen: new mockControl.")
-		cc.called("New")
-		return cc, nil
-	})
-	b.Start(ipn.Options{})
-	b.Login(nil)
-	cc.send(nil, "", false, &netmap.NetworkMap{
-		SelfNode: (&tailcfg.Node{
-			MachineAuthorized: true,
-			Addresses:         ipps("100.101.101.101"),
-		}).View(),
-	})
-	got := b.StatusWithoutPeers()
-	if got.TailscaleIPs == nil {
-		t.Errorf("got nil, expected TailscaleIPs value to not be nil")
-	}
-	if !reflect.DeepEqual(got.TailscaleIPs, got.Self.TailscaleIPs) {
-		t.Errorf("got %v, expected %v", got.TailscaleIPs, got.Self.TailscaleIPs)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b.setNetMapLocked(&netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					MachineAuthorized: true,
+					Addresses:         ipps("100.101.101.101"),
+				}).View(),
+				Peers: tt.peers,
+			})
+			got := b.Status()
+			for _, peer := range got.Peer {
+				if !reflect.DeepEqual(peer.Capabilities, tt.expectedPeerCapabilities[peer.ID]) {
+					t.Errorf("peer capabilities: expected %v got %v", tt.expectedPeerCapabilities, peer.Capabilities)
+				}
+				if !reflect.DeepEqual(peer.CapMap, tt.expectedPeerCapMap[peer.ID]) {
+					t.Errorf("peer capmap: expected %v got %v", tt.expectedPeerCapMap, peer.CapMap)
+				}
+			}
+		})
 	}
 }
 
@@ -748,21 +903,6 @@ type legacyBackend interface {
 	// Start starts or restarts the backend, typically when a
 	// frontend client connects.
 	Start(ipn.Options) error
-	// StartLoginInteractive requests to start a new interactive login
-	// flow. This should trigger a new BrowseToURL notification
-	// eventually.
-	StartLoginInteractive()
-	// Login logs in with an OAuth2 token.
-	Login(token *tailcfg.Oauth2Token)
-	// SetPrefs installs a new set of user preferences, including
-	// WantRunning. This may cause the wireguard engine to
-	// reconfigure or stop.
-	SetPrefs(*ipn.Prefs)
-	// RequestEngineStatus polls for an update from the wireguard
-	// engine. Only needed if you want to display byte
-	// counts. Connection events are emitted automatically without
-	// polling.
-	RequestEngineStatus()
 }
 
 // Verify that LocalBackend still implements the legacyBackend interface
@@ -812,7 +952,7 @@ func TestUpdateNetmapDelta(t *testing.T) {
 	}
 
 	b.netMap = &netmap.NetworkMap{}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		b.netMap.Peers = append(b.netMap.Peers, (&tailcfg.Node{ID: (tailcfg.NodeID(i) + 1)}).View())
 	}
 	b.updatePeersFromNetmapLocked(b.netMap)
@@ -1152,13 +1292,19 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 }
 
 func TestOfferingAppConnector(t *testing.T) {
-	b := newTestBackend(t)
-	if b.OfferingAppConnector() {
-		t.Fatal("unexpected offering app connector")
-	}
-	b.appConnector = appc.NewAppConnector(t.Logf, nil)
-	if !b.OfferingAppConnector() {
-		t.Fatal("unexpected not offering app connector")
+	for _, shouldStore := range []bool{false, true} {
+		b := newTestBackend(t)
+		if b.OfferingAppConnector() {
+			t.Fatal("unexpected offering app connector")
+		}
+		if shouldStore {
+			b.appConnector = appc.NewAppConnector(t.Logf, nil, &appc.RouteInfo{}, fakeStoreRoutes)
+		} else {
+			b.appConnector = appc.NewAppConnector(t.Logf, nil, nil, nil)
+		}
+		if !b.OfferingAppConnector() {
+			t.Fatal("unexpected not offering app connector")
+		}
 	}
 }
 
@@ -1203,21 +1349,27 @@ func TestRouterAdvertiserIgnoresContainedRoutes(t *testing.T) {
 }
 
 func TestObserveDNSResponse(t *testing.T) {
-	b := newTestBackend(t)
+	for _, shouldStore := range []bool{false, true} {
+		b := newTestBackend(t)
 
-	// ensure no error when no app connector is configured
-	b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
+		// ensure no error when no app connector is configured
+		b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
 
-	rc := &appctest.RouteCollector{}
-	b.appConnector = appc.NewAppConnector(t.Logf, rc)
-	b.appConnector.UpdateDomains([]string{"example.com"})
-	b.appConnector.Wait(context.Background())
+		rc := &appctest.RouteCollector{}
+		if shouldStore {
+			b.appConnector = appc.NewAppConnector(t.Logf, rc, &appc.RouteInfo{}, fakeStoreRoutes)
+		} else {
+			b.appConnector = appc.NewAppConnector(t.Logf, rc, nil, nil)
+		}
+		b.appConnector.UpdateDomains([]string{"example.com"})
+		b.appConnector.Wait(context.Background())
 
-	b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
-	b.appConnector.Wait(context.Background())
-	wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
-	if !slices.Equal(rc.Routes(), wantRoutes) {
-		t.Fatalf("got routes %v, want %v", rc.Routes(), wantRoutes)
+		b.ObserveDNSResponse(dnsResponse("example.com.", "192.0.0.8"))
+		b.appConnector.Wait(context.Background())
+		wantRoutes := []netip.Prefix{netip.MustParsePrefix("192.0.0.8/32")}
+		if !slices.Equal(rc.Routes(), wantRoutes) {
+			t.Fatalf("got routes %v, want %v", rc.Routes(), wantRoutes)
+		}
 	}
 }
 
@@ -1430,6 +1582,11 @@ func (h *errorSyspolicyHandler) ReadBoolean(key string) (bool, error) {
 	return false, syspolicy.ErrNoSuchKey
 }
 
+func (h *errorSyspolicyHandler) ReadStringArray(key string) ([]string, error) {
+	h.t.Errorf("ReadStringArray(%q) unexpectedly called", key)
+	return nil, syspolicy.ErrNoSuchKey
+}
+
 type mockSyspolicyHandler struct {
 	t *testing.T
 	// stringPolicies is the collection of policies that we expect to see
@@ -1467,6 +1624,13 @@ func (h *mockSyspolicyHandler) ReadBoolean(key string) (bool, error) {
 		h.t.Errorf("ReadBoolean(%q) unexpectedly called", key)
 	}
 	return false, syspolicy.ErrNoSuchKey
+}
+
+func (h *mockSyspolicyHandler) ReadStringArray(key string) ([]string, error) {
+	if h.failUnknownPolicies {
+		h.t.Errorf("ReadStringArray(%q) unexpectedly called", key)
+	}
+	return nil, syspolicy.ErrNoSuchKey
 }
 
 func TestSetExitNodeIDPolicy(t *testing.T) {
@@ -1690,7 +1854,8 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 			b.netMap = test.nm
 			b.pm = pm
 			changed := setExitNodeID(b.pm.prefs.AsStruct(), test.nm)
-			b.SetPrefs(pm.CurrentPrefs().AsStruct())
+			b.SetPrefsForTest(pm.CurrentPrefs().AsStruct())
+
 			if got := b.pm.prefs.ExitNodeID(); got != tailcfg.StableNodeID(test.exitNodeIDWant) {
 				t.Errorf("got %v want %v", got, test.exitNodeIDWant)
 			}
@@ -1953,14 +2118,6 @@ func TestApplySysPolicy(t *testing.T) {
 				}
 			})
 
-			t.Run("set prefs", func(t *testing.T) {
-				b := newTestBackend(t)
-				b.SetPrefs(tt.prefs.Clone())
-				if !b.Prefs().Equals(tt.wantPrefs.View()) {
-					t.Errorf("prefs=%v, want %v", b.Prefs().Pretty(), tt.wantPrefs.Pretty())
-				}
-			})
-
 			t.Run("status update", func(t *testing.T) {
 				// Profile manager fills in blank ControlURL but it's not set
 				// in most test cases to avoid cluttering them, so adjust for
@@ -2126,7 +2283,6 @@ func TestPreferencePolicyInfo(t *testing.T) {
 
 func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 	tests := []struct {
-		desc           string
 		before, after  opt.Bool
 		tailnetDefault bool
 	}{
@@ -2162,7 +2318,7 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		t.Run(fmt.Sprintf("before=%s after=%s", tt.before, tt.after), func(t *testing.T) {
+		t.Run(fmt.Sprintf("before=%s,after=%s", tt.before, tt.after), func(t *testing.T) {
 			b := newTestBackend(t)
 			p := ipn.NewPrefs()
 			p.AutoUpdate.Apply = tt.before
@@ -2170,7 +2326,14 @@ func TestOnTailnetDefaultAutoUpdate(t *testing.T) {
 				t.Fatal(err)
 			}
 			b.onTailnetDefaultAutoUpdate(tt.tailnetDefault)
-			if want, got := tt.after, b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
+			want := tt.after
+			// On platforms that don't support auto-update we can never
+			// transition to auto-updates being enabled. The value should
+			// remain unchanged after onTailnetDefaultAutoUpdate.
+			if !clientupdate.CanAutoUpdate() && want.EqualBool(true) {
+				want = tt.before
+			}
+			if got := b.pm.CurrentPrefs().AutoUpdate().Apply; got != want {
 				t.Errorf("got: %q, want %q", got, want)
 			}
 		})
@@ -2201,12 +2364,12 @@ func TestTCPHandlerForDst(t *testing.T) {
 			intercept: false,
 		},
 		{
-			desc:      "intercept port 8080 (TailFS) on quad100 IPv4",
+			desc:      "intercept port 8080 (Taildrive) on quad100 IPv4",
 			dst:       "100.100.100.100:8080",
 			intercept: true,
 		},
 		{
-			desc:      "intercept port 8080 (TailFS) on quad100 IPv6",
+			desc:      "intercept port 8080 (Taildrive) on quad100 IPv6",
 			dst:       "[fd7a:115c:a1e0::53]:8080",
 			intercept: true,
 		},
@@ -2246,24 +2409,24 @@ func TestTCPHandlerForDst(t *testing.T) {
 	}
 }
 
-func TestTailFSManageShares(t *testing.T) {
+func TestDriveManageShares(t *testing.T) {
 	tests := []struct {
 		name     string
 		disabled bool
-		existing []*tailfs.Share
-		add      *tailfs.Share
+		existing []*drive.Share
+		add      *drive.Share
 		remove   string
 		rename   [2]string
 		expect   any
 	}{
 		{
 			name: "append",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "b"},
 				{Name: "d"},
 			},
-			add: &tailfs.Share{Name: "  E  "},
-			expect: []*tailfs.Share{
+			add: &drive.Share{Name: "  E  "},
+			expect: []*drive.Share{
 				{Name: "b"},
 				{Name: "d"},
 				{Name: "e"},
@@ -2271,12 +2434,12 @@ func TestTailFSManageShares(t *testing.T) {
 		},
 		{
 			name: "prepend",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "b"},
 				{Name: "d"},
 			},
-			add: &tailfs.Share{Name: "  A  "},
-			expect: []*tailfs.Share{
+			add: &drive.Share{Name: "  A  "},
+			expect: []*drive.Share{
 				{Name: "a"},
 				{Name: "b"},
 				{Name: "d"},
@@ -2284,12 +2447,12 @@ func TestTailFSManageShares(t *testing.T) {
 		},
 		{
 			name: "insert",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "b"},
 				{Name: "d"},
 			},
-			add: &tailfs.Share{Name: "  C  "},
-			expect: []*tailfs.Share{
+			add: &drive.Share{Name: "  C  "},
+			expect: []*drive.Share{
 				{Name: "b"},
 				{Name: "c"},
 				{Name: "d"},
@@ -2297,43 +2460,43 @@ func TestTailFSManageShares(t *testing.T) {
 		},
 		{
 			name: "replace",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "b", Path: "i"},
 				{Name: "d"},
 			},
-			add: &tailfs.Share{Name: "  B  ", Path: "ii"},
-			expect: []*tailfs.Share{
+			add: &drive.Share{Name: "  B  ", Path: "ii"},
+			expect: []*drive.Share{
 				{Name: "b", Path: "ii"},
 				{Name: "d"},
 			},
 		},
 		{
 			name:   "add_bad_name",
-			add:    &tailfs.Share{Name: "$"},
-			expect: ErrInvalidShareName,
+			add:    &drive.Share{Name: "$"},
+			expect: drive.ErrInvalidShareName,
 		},
 		{
 			name:     "add_disabled",
 			disabled: true,
-			add:      &tailfs.Share{Name: "a"},
-			expect:   ErrTailFSNotEnabled,
+			add:      &drive.Share{Name: "a"},
+			expect:   drive.ErrDriveNotEnabled,
 		},
 		{
 			name: "remove",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "a"},
 				{Name: "b"},
 				{Name: "c"},
 			},
 			remove: "b",
-			expect: []*tailfs.Share{
+			expect: []*drive.Share{
 				{Name: "a"},
 				{Name: "c"},
 			},
 		},
 		{
 			name: "remove_non_existing",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "a"},
 				{Name: "b"},
 				{Name: "c"},
@@ -2345,23 +2508,23 @@ func TestTailFSManageShares(t *testing.T) {
 			name:     "remove_disabled",
 			disabled: true,
 			remove:   "b",
-			expect:   ErrTailFSNotEnabled,
+			expect:   drive.ErrDriveNotEnabled,
 		},
 		{
 			name: "rename",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "a"},
 				{Name: "b"},
 			},
 			rename: [2]string{"a", "  C  "},
-			expect: []*tailfs.Share{
+			expect: []*drive.Share{
 				{Name: "b"},
 				{Name: "c"},
 			},
 		},
 		{
 			name: "rename_not_exist",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "a"},
 				{Name: "b"},
 			},
@@ -2370,7 +2533,7 @@ func TestTailFSManageShares(t *testing.T) {
 		},
 		{
 			name: "rename_exists",
-			existing: []*tailfs.Share{
+			existing: []*drive.Share{
 				{Name: "a"},
 				{Name: "b"},
 			},
@@ -2380,19 +2543,19 @@ func TestTailFSManageShares(t *testing.T) {
 		{
 			name:   "rename_bad_name",
 			rename: [2]string{"a", "$"},
-			expect: ErrInvalidShareName,
+			expect: drive.ErrInvalidShareName,
 		},
 		{
 			name:     "rename_disabled",
 			disabled: true,
 			rename:   [2]string{"a", "c"},
-			expect:   ErrTailFSNotEnabled,
+			expect:   drive.ErrDriveNotEnabled,
 		},
 	}
 
-	tailfs.DisallowShareAs = true
+	drive.DisallowShareAs = true
 	t.Cleanup(func() {
-		tailfs.DisallowShareAs = false
+		drive.DisallowShareAs = false
 	})
 
 	for _, tt := range tests {
@@ -2400,20 +2563,20 @@ func TestTailFSManageShares(t *testing.T) {
 			b := newTestBackend(t)
 			b.mu.Lock()
 			if tt.existing != nil {
-				b.tailFSSetSharesLocked(tt.existing)
+				b.driveSetSharesLocked(tt.existing)
 			}
 			if !tt.disabled {
 				self := b.netMap.SelfNode.AsStruct()
-				self.CapMap = tailcfg.NodeCapMap{tailcfg.NodeAttrsTailFSShare: nil}
+				self.CapMap = tailcfg.NodeCapMap{tailcfg.NodeAttrsTaildriveShare: nil}
 				b.netMap.SelfNode = self.View()
-				b.sys.Set(tailfsimpl.NewFileSystemForRemote(b.logf))
+				b.sys.Set(driveimpl.NewFileSystemForRemote(b.logf))
 			}
 			b.mu.Unlock()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			t.Cleanup(cancel)
 
-			result := make(chan views.SliceView[*tailfs.Share, tailfs.ShareView], 1)
+			result := make(chan views.SliceView[*drive.Share, drive.ShareView], 1)
 
 			var wg sync.WaitGroup
 			wg.Add(1)
@@ -2423,7 +2586,7 @@ func TestTailFSManageShares(t *testing.T) {
 				func() { wg.Done() },
 				func(n *ipn.Notify) bool {
 					select {
-					case result <- n.TailFSShares:
+					case result <- n.DriveShares:
 					default:
 						//
 					}
@@ -2435,11 +2598,11 @@ func TestTailFSManageShares(t *testing.T) {
 			var err error
 			switch {
 			case tt.add != nil:
-				err = b.TailFSSetShare(tt.add)
+				err = b.DriveSetShare(tt.add)
 			case tt.remove != "":
-				err = b.TailFSRemoveShare(tt.remove)
+				err = b.DriveRemoveShare(tt.remove)
 			default:
-				err = b.TailFSRenameShare(tt.rename[0], tt.rename[1])
+				err = b.DriveRenameShare(tt.rename[0], tt.rename[1])
 			}
 
 			switch e := tt.expect.(type) {
@@ -2447,7 +2610,7 @@ func TestTailFSManageShares(t *testing.T) {
 				if !errors.Is(err, e) {
 					t.Errorf("expected error, want: %v got: %v", e, err)
 				}
-			case []*tailfs.Share:
+			case []*drive.Share:
 				if err != nil {
 					t.Errorf("unexpected error: %v", err)
 				} else {
@@ -2530,6 +2693,844 @@ func TestRoundTraffic(t *testing.T) {
 				t.Errorf("unexpected rounding got %v want %v", result, tt.want)
 			}
 		})
+	}
+}
 
+func (b *LocalBackend) SetPrefsForTest(newp *ipn.Prefs) {
+	if newp == nil {
+		panic("SetPrefsForTest got nil prefs")
+	}
+	unlock := b.lockAndGetUnlock()
+	defer unlock()
+	b.setPrefsLockedOnEntry(newp, unlock)
+}
+
+func TestSuggestExitNode(t *testing.T) {
+	tests := []struct {
+		name         string
+		lastReport   netcheck.Report
+		netMap       netmap.NetworkMap
+		wantID       tailcfg.StableNodeID
+		wantName     string
+		wantLocation tailcfg.LocationView
+		wantError    error
+	}{
+		{
+			name: "2 exit nodes in same region",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 10 * time.Millisecond,
+					2: 20 * time.Millisecond,
+					3: 30 * time.Millisecond,
+				},
+				PreferredDERP: 1,
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {},
+						2: {},
+						3: {},
+					},
+				},
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{
+						ID:       2,
+						Name:     "2",
+						StableID: "2",
+						DERP:     "127.3.3.40:1",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+					(&tailcfg.Node{
+						ID:       3,
+						Name:     "3",
+						StableID: "3",
+						DERP:     "127.3.3.40:1",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+				},
+			},
+			wantName: "3",
+			wantID:   tailcfg.StableNodeID("3"),
+		},
+		{
+			name: "2 derp based exit nodes, different regions, no latency measurements",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 0,
+					2: 0,
+					3: 0,
+				},
+				PreferredDERP: 1,
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {},
+						2: {},
+						3: {},
+					},
+				},
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{
+						ID:       2,
+						StableID: "2",
+						Name:     "2",
+						DERP:     "127.3.3.40:2",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+					(&tailcfg.Node{
+						ID:       3,
+						StableID: "3",
+						Name:     "3",
+						DERP:     "127.3.3.40:3",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+				},
+			},
+			wantName: "3",
+			wantID:   tailcfg.StableNodeID("3"),
+		},
+		{
+			name: "2 derp based exit nodes, different regions, same latency",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 10,
+					2: 10,
+					3: 0,
+				},
+				PreferredDERP: 1,
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {},
+						2: {},
+						3: {},
+					},
+				},
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{
+						ID:       2,
+						StableID: "2",
+						Name:     "2",
+						DERP:     "127.3.3.40:1",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+					(&tailcfg.Node{
+						ID:       3,
+						StableID: "3",
+						Name:     "3",
+						DERP:     "127.3.3.40:2",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+				},
+			},
+			wantName: "2",
+			wantID:   tailcfg.StableNodeID("2"),
+		},
+		{
+			name: "mullvad nodes, no derp based exit nodes",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 0,
+					2: 0,
+					3: 0,
+				},
+				PreferredDERP: 1,
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {
+							Latitude:  40.73061,
+							Longitude: -73.935242,
+						},
+						2: {},
+						3: {},
+					},
+				},
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{
+						ID:       2,
+						StableID: "2",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						Name: "Dallas",
+						Hostinfo: (&tailcfg.Hostinfo{
+							Location: &tailcfg.Location{
+								Latitude:  32.89748,
+								Longitude: -97.040443,
+								Priority:  100,
+							},
+						}).View(),
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+					(&tailcfg.Node{
+						ID:       3,
+						StableID: "3",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						Name: "San Jose",
+						Hostinfo: (&tailcfg.Hostinfo{
+							Location: &tailcfg.Location{
+								Latitude:  37.3382082,
+								Longitude: -121.8863286,
+								Priority:  20,
+							},
+						}).View(),
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+				},
+			},
+			wantID: tailcfg.StableNodeID("2"),
+			wantLocation: (&tailcfg.Location{
+				Latitude:  32.89748,
+				Longitude: -97.040443,
+				Priority:  100,
+			}).View(),
+			wantName: "Dallas",
+		},
+		{
+			name: "mullvad nodes close to each other, different priorities",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 0,
+					2: 0,
+					3: 0,
+				},
+				PreferredDERP: 1,
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {
+							Latitude:  40.73061,
+							Longitude: -73.935242,
+						},
+						2: {},
+						3: {},
+					},
+				},
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{
+						ID:       2,
+						StableID: "2",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						Name: "Dallas",
+						Hostinfo: (&tailcfg.Hostinfo{
+							Location: &tailcfg.Location{
+								Latitude:  32.89748,
+								Longitude: -97.040443,
+								Priority:  10,
+							},
+						}).View(),
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+					(&tailcfg.Node{
+						ID:       3,
+						StableID: "3",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						Name: "Fort Worth",
+						Hostinfo: (&tailcfg.Hostinfo{
+							Location: &tailcfg.Location{
+								Latitude:  37.768799,
+								Longitude: -97.309341,
+								Priority:  50,
+							},
+						}).View(),
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+				},
+			},
+			wantID: tailcfg.StableNodeID("3"),
+			wantLocation: (&tailcfg.Location{
+				Latitude:  37.768799,
+				Longitude: -97.309341,
+				Priority:  50,
+			}).View(),
+			wantName: "Fort Worth",
+		},
+		{
+			name: "mullvad nodes, no preferred derp region exit nodes",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 0,
+					2: 0,
+					3: 0,
+				},
+				PreferredDERP: 1,
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {
+							Latitude:  40.73061,
+							Longitude: -73.935242,
+						},
+						2: {},
+						3: {},
+					},
+				},
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{
+						ID:       2,
+						StableID: "2",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						Name: "Dallas",
+						Hostinfo: (&tailcfg.Hostinfo{
+							Location: &tailcfg.Location{
+								Latitude:  32.89748,
+								Longitude: -97.040443,
+								Priority:  20,
+							},
+						}).View(),
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+					(&tailcfg.Node{
+						ID:       3,
+						StableID: "3",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						Name: "San Jose",
+						Hostinfo: (&tailcfg.Hostinfo{
+							Location: &tailcfg.Location{
+								Latitude:  37.3382082,
+								Longitude: -121.8863286,
+								Priority:  30,
+							},
+						}).View(),
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+					(&tailcfg.Node{
+						ID:       3,
+						StableID: "3",
+						Name:     "3",
+						DERP:     "127.3.3.40:2",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+							tailcfg.NodeAttrSuggestExitNode: {},
+						}),
+					}).View(),
+				},
+			},
+			wantID:   tailcfg.StableNodeID("3"),
+			wantName: "3",
+		},
+		{
+			name: "no mullvad nodes; no derp nodes",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 0,
+					2: 0,
+					3: 0,
+				},
+				PreferredDERP: 1,
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {},
+						2: {},
+						3: {},
+					},
+				},
+			},
+		},
+		{
+			name: "no preferred derp region",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 0,
+					2: -1,
+					3: 0,
+				},
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {},
+						2: {},
+						3: {},
+					},
+				},
+			},
+			wantError: ErrNoPreferredDERP,
+		},
+		{
+			name: "derp exit node and mullvad exit node both with no suggest exit node attribute",
+			lastReport: netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 0,
+					2: 0,
+					3: 0,
+				},
+				PreferredDERP: 1,
+			},
+			netMap: netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						netip.MustParsePrefix("100.64.1.1/32"),
+						netip.MustParsePrefix("fe70::1/128"),
+					},
+				}).View(),
+				DERPMap: &tailcfg.DERPMap{
+					Regions: map[int]*tailcfg.DERPRegion{
+						1: {},
+						2: {},
+						3: {},
+					},
+				},
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{
+						ID:       2,
+						StableID: "2",
+						Name:     "2",
+						DERP:     "127.3.3.40:1",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+					}).View(),
+					(&tailcfg.Node{
+						ID:       2,
+						StableID: "2",
+						AllowedIPs: []netip.Prefix{
+							netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+						},
+						Name: "Dallas",
+						Hostinfo: (&tailcfg.Hostinfo{
+							Location: &tailcfg.Location{
+								Latitude:  32.89748,
+								Longitude: -97.040443,
+								Priority:  30,
+							},
+						}).View(),
+					}).View(),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := rand.New(rand.NewSource(100))
+			got, err := suggestExitNode(&tt.lastReport, &tt.netMap, r)
+			if got.Name != tt.wantName {
+				t.Errorf("name=%v, want %v", got.Name, tt.wantName)
+			}
+			if got.ID != tt.wantID {
+				t.Errorf("ID=%v, want %v", got.ID, tt.wantID)
+			}
+			if tt.wantError == nil && err != nil {
+				t.Errorf("err=%v, want no error", err)
+			}
+			if tt.wantError != nil && !errors.Is(err, tt.wantError) {
+				t.Errorf("err=%v, want %v", err, tt.wantError)
+			}
+			if !reflect.DeepEqual(got.Location, tt.wantLocation) {
+				t.Errorf("location=%v, want %v", got.Location, tt.wantLocation)
+			}
+		})
+	}
+}
+
+func TestSuggestExitNodePickWeighted(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates []tailcfg.NodeView
+		wantValue  tailcfg.NodeView
+		wantValid  bool
+	}{
+		{
+			name: ">1 candidates",
+			candidates: []tailcfg.NodeView{
+				(&tailcfg.Node{
+					ID:       2,
+					StableID: "2",
+					AllowedIPs: []netip.Prefix{
+						netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+					},
+					Hostinfo: (&tailcfg.Hostinfo{
+						Location: &tailcfg.Location{
+							Priority: 20,
+						},
+					}).View(),
+				}).View(),
+				(&tailcfg.Node{
+					ID:       3,
+					StableID: "3",
+					AllowedIPs: []netip.Prefix{
+						netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+					},
+					Hostinfo: (&tailcfg.Hostinfo{
+						Location: &tailcfg.Location{
+							Priority: 10,
+						},
+					}).View(),
+				}).View(),
+			},
+			wantValue: (&tailcfg.Node{
+				ID:       2,
+				StableID: "2",
+				AllowedIPs: []netip.Prefix{
+					netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+				},
+				Hostinfo: (&tailcfg.Hostinfo{
+					Location: &tailcfg.Location{
+						Priority: 20,
+					},
+				}).View(),
+			}).View(),
+			wantValid: true,
+		},
+		{
+			name:       "<1 candidates",
+			candidates: []tailcfg.NodeView{},
+			wantValid:  false,
+		},
+		{
+			name: "1 candidate",
+			candidates: []tailcfg.NodeView{
+				(&tailcfg.Node{
+					ID:       2,
+					StableID: "2",
+					AllowedIPs: []netip.Prefix{
+						netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+					},
+					Hostinfo: (&tailcfg.Hostinfo{
+						Location: &tailcfg.Location{
+							Priority: 20,
+						},
+					}).View(),
+				}).View(),
+			},
+			wantValue: (&tailcfg.Node{
+				ID:       2,
+				StableID: "2",
+				AllowedIPs: []netip.Prefix{
+					netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0"),
+				},
+				Hostinfo: (&tailcfg.Hostinfo{
+					Location: &tailcfg.Location{
+						Priority: 20,
+					},
+				}).View(),
+			}).View(),
+			wantValid: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pickWeighted(tt.candidates)
+			if !reflect.DeepEqual(got, tt.wantValue) {
+				t.Errorf("got value %v want %v", got, tt.wantValue)
+				if tt.wantValid != got.Valid() {
+					t.Errorf("got invalid candidate expected valid")
+				}
+				if tt.wantValid {
+					if !reflect.DeepEqual(got, tt.wantValue) {
+						t.Errorf("got value %v want %v", got, tt.wantValue)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestSuggestExitNodeLongLatDistance(t *testing.T) {
+	tests := []struct {
+		name     string
+		fromLat  float64
+		fromLong float64
+		toLat    float64
+		toLong   float64
+		want     float64
+	}{
+		{
+			name:     "zero values",
+			fromLat:  0,
+			fromLong: 0,
+			toLat:    0,
+			toLong:   0,
+			want:     0,
+		},
+		{
+			name:     "valid values",
+			fromLat:  40.73061,
+			fromLong: -73.935242,
+			toLat:    37.3382082,
+			toLong:   -121.8863286,
+			want:     4117266.873301274,
+		},
+		{
+			name:     "valid values, locations in north and south of equator",
+			fromLat:  40.73061,
+			fromLong: -73.935242,
+			toLat:    -33.861481,
+			toLong:   151.205475,
+			want:     15994089.144368416,
+		},
+	}
+	// The wanted values are computed using a more precise algorithm using the WGS84 model but
+	// longLatDistance uses a spherical approximation for simplicity. To account for this, we allow for
+	// 10km of error.
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := longLatDistance(tt.fromLat, tt.fromLong, tt.toLat, tt.toLong)
+			const maxError = 10000 // 10km
+			if math.Abs(got-tt.want) > maxError {
+				t.Errorf("distance=%vm, want within %vm of %vm", got, maxError, tt.want)
+			}
+		})
+	}
+}
+
+func TestMinLatencyDERPregion(t *testing.T) {
+	tests := []struct {
+		name       string
+		regions    []int
+		report     *netcheck.Report
+		wantRegion int
+	}{
+		{
+			name:       "regions, no latency values",
+			regions:    []int{1, 2, 3},
+			wantRegion: 0,
+			report:     &netcheck.Report{},
+		},
+		{
+			name:       "regions, different latency values",
+			regions:    []int{1, 2, 3},
+			wantRegion: 2,
+			report: &netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 10 * time.Millisecond,
+					2: 5 * time.Millisecond,
+					3: 30 * time.Millisecond,
+				},
+			},
+		},
+		{
+			name:       "regions, same values",
+			regions:    []int{1, 2, 3},
+			wantRegion: 1,
+			report: &netcheck.Report{
+				RegionLatency: map[int]time.Duration{
+					1: 10 * time.Millisecond,
+					2: 10 * time.Millisecond,
+					3: 10 * time.Millisecond,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := minLatencyDERPRegion(tt.regions, tt.report)
+			if got != tt.wantRegion {
+				t.Errorf("got region %v want region %v", got, tt.wantRegion)
+			}
+		})
+	}
+}
+
+func TestEnableAutoUpdates(t *testing.T) {
+	lb := newTestLocalBackend(t)
+
+	_, err := lb.EditPrefs(&ipn.MaskedPrefs{
+		AutoUpdateSet: ipn.AutoUpdatePrefsMask{
+			ApplySet: true,
+		},
+		Prefs: ipn.Prefs{
+			AutoUpdate: ipn.AutoUpdatePrefs{
+				Apply: opt.NewBool(true),
+			},
+		},
+	})
+	// Enabling may fail, depending on which environment we are running this
+	// test in.
+	wantErr := !clientupdate.CanAutoUpdate()
+	gotErr := err != nil
+	if gotErr != wantErr {
+		t.Fatalf("enabling auto-updates: got error: %v (%v); want error: %v", gotErr, err, wantErr)
+	}
+
+	// Disabling should always succeed.
+	if _, err := lb.EditPrefs(&ipn.MaskedPrefs{
+		AutoUpdateSet: ipn.AutoUpdatePrefsMask{
+			ApplySet: true,
+		},
+		Prefs: ipn.Prefs{
+			AutoUpdate: ipn.AutoUpdatePrefs{
+				Apply: opt.NewBool(false),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("disabling auto-updates: got error: %v", err)
+	}
+}
+
+func TestReadWriteRouteInfo(t *testing.T) {
+	// set up a backend with more than one profile
+	b := newTestBackend(t)
+	prof1 := ipn.LoginProfile{ID: "id1", Key: "key1"}
+	prof2 := ipn.LoginProfile{ID: "id2", Key: "key2"}
+	b.pm.knownProfiles["id1"] = &prof1
+	b.pm.knownProfiles["id2"] = &prof2
+	b.pm.currentProfile = &prof1
+
+	// set up routeInfo
+	ri1 := &appc.RouteInfo{}
+	ri1.Wildcards = []string{"1"}
+
+	ri2 := &appc.RouteInfo{}
+	ri2.Wildcards = []string{"2"}
+
+	// read before write
+	readRi, err := b.readRouteInfoLocked()
+	if readRi != nil {
+		t.Fatalf("read before writing: want nil, got %v", readRi)
+	}
+	if err != ipn.ErrStateNotExist {
+		t.Fatalf("read before writing: want %v, got %v", ipn.ErrStateNotExist, err)
+	}
+
+	// write the first routeInfo
+	if err := b.storeRouteInfo(ri1); err != nil {
+		t.Fatal(err)
+	}
+
+	// write the other routeInfo as the other profile
+	if err := b.pm.SwitchProfile("id2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.storeRouteInfo(ri2); err != nil {
+		t.Fatal(err)
+	}
+
+	// read the routeInfo of the first profile
+	if err := b.pm.SwitchProfile("id1"); err != nil {
+		t.Fatal(err)
+	}
+	readRi, err = b.readRouteInfoLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(readRi.Wildcards, ri1.Wildcards) {
+		t.Fatalf("read prof1 routeInfo wildcards:  want %v, got %v", ri1.Wildcards, readRi.Wildcards)
+	}
+
+	// read the routeInfo of the second profile
+	if err := b.pm.SwitchProfile("id2"); err != nil {
+		t.Fatal(err)
+	}
+	readRi, err = b.readRouteInfoLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(readRi.Wildcards, ri2.Wildcards) {
+		t.Fatalf("read prof2 routeInfo wildcards:  want %v, got %v", ri2.Wildcards, readRi.Wildcards)
 	}
 }

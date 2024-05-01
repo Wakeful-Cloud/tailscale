@@ -7,6 +7,7 @@ package linuxfw
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -19,6 +20,14 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/multierr"
 )
+
+// isNotExistError needs to be overridden in tests that rely on distinguishing
+// this error, because we don't have a good way how to create a new
+// iptables.Error of that type.
+var isNotExistError = func(err error) bool {
+	var e *iptables.Error
+	return errors.As(err, &e) && e.IsNotExist()
+}
 
 type iptablesInterface interface {
 	// Adding this interface for testing purposes so we can mock out
@@ -156,10 +165,6 @@ func (i *iptablesRunner) HasIPV6NAT() bool {
 	return i.v6NATAvailable
 }
 
-func isErrChainNotExist(err error) bool {
-	return errCode(err) == 1
-}
-
 // getIPTByAddr returns the iptablesInterface with correct IP family
 // that we will be using for the given address.
 func (i *iptablesRunner) getIPTByAddr(addr netip.Addr) iptablesInterface {
@@ -261,7 +266,7 @@ func (i *iptablesRunner) AddChains() error {
 	// If the chain already exists, it is a no-op.
 	create := func(ipt iptablesInterface, table, chain string) error {
 		err := ipt.ClearChain(table, chain)
-		if isErrChainNotExist(err) {
+		if isNotExistError(err) {
 			// nonexistent chain. let's create it!
 			return ipt.NewChain(table, chain)
 		}
@@ -373,6 +378,27 @@ func (i *iptablesRunner) DNATNonTailscaleTraffic(tun string, dst netip.Addr) err
 	return table.Insert("nat", "PREROUTING", 1, "!", "-i", tun, "-j", "DNAT", "--to-destination", dst.String())
 }
 
+// DNATWithLoadBalancer adds iptables rules to forward all traffic received for
+// originDst to the backend dsts. Traffic will be load balanced using round robin.
+func (i *iptablesRunner) DNATWithLoadBalancer(origDst netip.Addr, dsts []netip.Addr) error {
+	table := i.getIPTByAddr(dsts[0])
+	if err := table.ClearChain("nat", "PREROUTING"); err != nil && !isNotExistError(err) {
+		// If clearing the PREROUTING chain fails, fail the whole operation. This
+		// rule is currently only used in Kubernetes containers where a
+		// failed container gets restarted which should hopefully fix things.
+		return fmt.Errorf("error clearing nat PREROUTING chain: %w", err)
+	}
+	// If dsts contain more than one address, for n := n in range(len(dsts)..2) route packets for every nth connection to dsts[n].
+	for i := len(dsts); i >= 2; i-- {
+		dst := dsts[i-1] // the order in which rules for addrs are installed does not matter
+		if err := table.Append("nat", "PREROUTING", "--destination", origDst.String(), "-m", "statistic", "--mode", "nth", "--every", fmt.Sprint(i), "--packet", "0", "-j", "DNAT", "--to-destination", dst.String()); err != nil {
+			return fmt.Errorf("error adding DNAT rule for %s: %w", dst.String(), err)
+		}
+	}
+	// If the packet falls through to this rule, we route to the first destination in the list unconditionally.
+	return table.Append("nat", "PREROUTING", "--destination", origDst.String(), "-j", "DNAT", "--to-destination", dsts[0].String())
+}
+
 func (i *iptablesRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
 	table := i.getIPTByAddr(addr)
 	return table.Append("mangle", "FORWARD", "-o", tun, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu")
@@ -433,7 +459,7 @@ func (i *iptablesRunner) DelChains() error {
 func (i *iptablesRunner) DelBase() error {
 	del := func(ipt iptablesInterface, table, chain string) error {
 		if err := ipt.ClearChain(table, chain); err != nil {
-			if isErrChainNotExist(err) {
+			if isNotExistError(err) {
 				// nonexistent chain. That's fine, since it's
 				// the desired state anyway.
 				return nil
@@ -561,9 +587,9 @@ func (i *iptablesRunner) DelMagicsockPortRule(port uint16, network string) error
 	return nil
 }
 
-// IPTablesCleanup removes all Tailscale added iptables rules.
+// IPTablesCleanUp removes all Tailscale added iptables rules.
 // Any errors that occur are logged to the provided logf.
-func IPTablesCleanup(logf logger.Logf) {
+func IPTablesCleanUp(logf logger.Logf) {
 	err := clearRules(iptables.ProtocolIPv4, logf)
 	if err != nil {
 		logf("linuxfw: clear iptables: %v", err)
@@ -581,14 +607,8 @@ func IPTablesCleanup(logf logger.Logf) {
 func delTSHook(ipt iptablesInterface, table, chain string, logf logger.Logf) error {
 	tsChain := tsChain(chain)
 	args := []string{"-j", tsChain}
-	if err := ipt.Delete(table, chain, args...); err != nil {
-		// TODO(apenwarr): check for errCode(1) here.
-		// Unfortunately the error code from the iptables
-		// module resists unwrapping, unlike with other
-		// calls. So we have to assume if Delete fails,
-		// it's because there is no such rule.
-		logf("deleting %v in %s/%s: %v", args, table, chain, err)
-		return nil
+	if err := ipt.Delete(table, chain, args...); err != nil && !isNotExistError(err) {
+		return fmt.Errorf("deleting %v in %s/%s: %v", args, table, chain, err)
 	}
 	return nil
 }
@@ -597,7 +617,7 @@ func delTSHook(ipt iptablesInterface, table, chain string, logf logger.Logf) err
 // since the desired state is already achieved. otherwise, it returns an error.
 func delChain(ipt iptablesInterface, table, chain string) error {
 	if err := ipt.ClearChain(table, chain); err != nil {
-		if isErrChainNotExist(err) {
+		if isNotExistError(err) {
 			// nonexistent chain. nothing to do.
 			return nil
 		}

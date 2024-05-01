@@ -26,7 +26,7 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		fields = append(fields, t.Field(i).Name)
 	}
 	return
@@ -41,6 +41,7 @@ func TestPrefsEqual(t *testing.T) {
 		"AllowSingleHosts",
 		"ExitNodeID",
 		"ExitNodeIP",
+		"InternalExitNodePrior",
 		"ExitNodeAllowLANAccess",
 		"CorpDNS",
 		"RunSSH",
@@ -62,7 +63,7 @@ func TestPrefsEqual(t *testing.T) {
 		"AppConnector",
 		"PostureChecking",
 		"NetfilterKind",
-		"TailFSShares",
+		"DriveShares",
 		"Persist",
 	}
 	if have := fieldsOf(reflect.TypeFor[Prefs]()); !reflect.DeepEqual(have, prefsHandles) {
@@ -614,6 +615,19 @@ func TestLoadPrefsFileWithZeroInIt(t *testing.T) {
 	t.Fatalf("unexpected prefs=%#v, err=%v", p, err)
 }
 
+func TestMaskedPrefsSetsInternal(t *testing.T) {
+	for _, f := range fieldsOf(reflect.TypeFor[MaskedPrefs]()) {
+		if !strings.HasSuffix(f, "Set") || !strings.HasPrefix(f, "Internal") {
+			continue
+		}
+		mp := new(MaskedPrefs)
+		reflect.ValueOf(mp).Elem().FieldByName(f).SetBool(true)
+		if !mp.SetsInternal() {
+			t.Errorf("MaskedPrefs.%sSet=true but SetsInternal=false", f)
+		}
+	}
+}
+
 func TestMaskedPrefsFields(t *testing.T) {
 	have := map[string]bool{}
 	for _, f := range fieldsOf(reflect.TypeFor[Prefs]()) {
@@ -647,7 +661,7 @@ func TestMaskedPrefsFields(t *testing.T) {
 	// ApplyEdits assumes.
 	pt := reflect.TypeFor[Prefs]()
 	mt := reflect.TypeFor[MaskedPrefs]()
-	for i := 0; i < mt.NumField(); i++ {
+	for i := range mt.NumField() {
 		name := mt.Field(i).Name
 		if i == 0 {
 			if name != "Prefs" {

@@ -27,7 +27,6 @@ import (
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/envknob"
 	"tailscale.com/net/dnscache"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
@@ -159,19 +158,17 @@ func cloneDurationMap(m map[int]time.Duration) map[int]time.Duration {
 // active probes, and must receive STUN packet replies via ReceiveSTUNPacket.
 // Client can be used in a standalone fashion via the Standalone method.
 type Client struct {
+	// NetMon is the netmon.Monitor to use to get the current
+	// (cached) network interface.
+	// It must be non-nil.
+	NetMon *netmon.Monitor
+
 	// Verbose enables verbose logging.
 	Verbose bool
 
 	// Logf optionally specifies where to log to.
 	// If nil, log.Printf is used.
 	Logf logger.Logf
-
-	// NetMon optionally provides a netmon.Monitor to use to get the current
-	// (cached) network interface.
-	// If nil, the interface will be looked up dynamically.
-	// TODO(bradfitz): make NetMon required. As of 2023-08-01, it basically always is
-	// present anyway.
-	NetMon *netmon.Monitor
 
 	// TimeNow, if non-nil, is used instead of time.Now.
 	TimeNow func() time.Time
@@ -391,7 +388,7 @@ const numIncrementalRegions = 3
 
 // makeProbePlan generates the probe plan for a DERPMap, given the most
 // recent report and whether IPv6 is configured on an interface.
-func makeProbePlan(dm *tailcfg.DERPMap, ifState *interfaces.State, last *Report) (plan probePlan) {
+func makeProbePlan(dm *tailcfg.DERPMap, ifState *netmon.State, last *Report) (plan probePlan) {
 	if last == nil || len(last.RegionLatency) == 0 {
 		return makeProbePlanInitial(dm, ifState)
 	}
@@ -471,7 +468,7 @@ func makeProbePlan(dm *tailcfg.DERPMap, ifState *interfaces.State, last *Report)
 	return plan
 }
 
-func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *interfaces.State) (plan probePlan) {
+func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan probePlan) {
 	plan = make(probePlan)
 
 	for _, reg := range dm.Regions {
@@ -781,6 +778,9 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	if dm == nil {
 		return nil, errors.New("netcheck: GetReport: DERP map is nil")
 	}
+	if c.NetMon == nil {
+		return nil, errors.New("netcheck: GetReport: Client.NetMon is nil")
+	}
 
 	c.mu.Lock()
 	if c.curState != nil {
@@ -844,18 +844,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		return c.finishAndStoreReport(rs, dm), nil
 	}
 
-	var ifState *interfaces.State
-	if c.NetMon == nil {
-		directState, err := interfaces.GetState()
-		if err != nil {
-			c.logf("[v1] interfaces: %v", err)
-			return nil, err
-		} else {
-			ifState = directState
-		}
-	} else {
-		ifState = c.NetMon.InterfaceState()
-	}
+	ifState := c.NetMon.InterfaceState()
 
 	// See if IPv6 works at all, or if it's been hard disabled at the
 	// OS level.
@@ -1388,10 +1377,11 @@ const (
 	// node is near region 1 @ 4ms and region 2 @ 5ms, region 1 getting
 	// 5ms slower would cause a flap).
 	preferredDERPAbsoluteDiff = 10 * time.Millisecond
-	// preferredDERPFrameTime is the time which, if a DERP frame has been
+	// PreferredDERPFrameTime is the time which, if a DERP frame has been
 	// received within that period, we treat that region as being present
 	// even without receiving a STUN response.
-	preferredDERPFrameTime = 2 * time.Second
+	// Note: must remain higher than the derp package frameReceiveRecordRate
+	PreferredDERPFrameTime = 8 * time.Second
 )
 
 // addReportHistoryAndSetPreferredDERP adds r to the set of recent Reports
@@ -1480,7 +1470,7 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 			now := c.timeNow()
 
 			heardFromOldRegionRecently = lastHeard.After(rs.start)
-			heardFromOldRegionRecently = heardFromOldRegionRecently || lastHeard.After(now.Add(-preferredDERPFrameTime))
+			heardFromOldRegionRecently = heardFromOldRegionRecently || lastHeard.After(now.Add(-PreferredDERPFrameTime))
 		}
 	}
 
@@ -1666,7 +1656,6 @@ func (c *Client) nodeAddr(ctx context.Context, n *tailcfg.DERPNode, proto probeP
 				Forward:     net.DefaultResolver,
 				UseLastGood: true,
 				Logf:        c.logf,
-				NetMon:      c.NetMon,
 			}
 		}
 		resolver := c.resolver

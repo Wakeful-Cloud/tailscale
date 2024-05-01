@@ -64,6 +64,10 @@ The Tailscale API does not currently support pagination. All results are returne
   - Update device key: [`POST /api/v2/device/{deviceID}/key`](#update-device-key)
 - **IP Address**
   - Set device IPv4 address: [`POST /api/v2/device/{deviceID}/ip`](#set-device-ipv4-address)
+- **Device posture attributes**
+  - Get device posture attributes: [`GET /api/v2/device/{deviceID}/attributes`](#get-device-posture-attributes)
+  - Set custom device posture attributes: [`POST /api/v2/device/{deviceID}/attributes/{attributeKey}`](#set-device-posture-attributes)
+  - Delete custom device posture attributes: [`DELETE /api/v2/device/{deviceID}/attributes/{attributeKey}`](#delete-custom-device-posture-attributes)
 
 **[Tailnet](#tailnet)**
 
@@ -89,6 +93,10 @@ The Tailscale API does not currently support pagination. All results are returne
   - **Search paths**
     - Get search paths: [`GET /api/v2/tailnet/{tailnet}/dns/searchpaths`](#get-search-paths)
     - Set search paths: [`POST /api/v2/tailnet/{tailnet}/dns/searchpaths`](#set-search-paths)
+  - **Split DNS**
+    - Get split DNS: [`GET /api/v2/tailnet/{tailnet}/dns/split-dns`](#get-split-dns)
+    - Update split DNS: [`PATCH /api/v2/tailnet/{tailnet}/dns/split-dns`](#update-split-dns)
+    - Set split DNS: [`PUT /api/v2/tailnet/{tailnet}/dns/split-dns`](#set-split-dns)
 
 # Device
 
@@ -424,7 +432,8 @@ The ID of the device.
 
 ```sh
 curl -X POST 'https://api.tailscale.com/api/v2/device/12345/expire' \
-  -u "tskey-api-xxxxx:"
+  -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json"
 ```
 
 ### Response
@@ -504,6 +513,7 @@ The new list of enabled subnet routes.
 ```sh
 curl "https://api.tailscale.com/api/v2/device/11055/routes" \
 -u "tskey-api-xxxxx:" \
+-H "Content-Type: application/json" \
 --data-binary '{"routes": ["10.0.0.0/16", "192.168.1.0/24"]}'
 ```
 
@@ -552,6 +562,7 @@ Specify whether the device is authorized. False to deauthorize an authorized dev
 ```sh
 curl "https://api.tailscale.com/api/v2/device/11055/authorized" \
 -u "tskey-api-xxxxx:" \
+-H "Content-Type: application/json" \
 --data-binary '{"authorized": true}'
 ```
 
@@ -601,6 +612,7 @@ The new list of tags for the device.
 ```sh
 curl "https://api.tailscale.com/api/v2/device/11055/tags" \
 -u "tskey-api-xxxxx:" \
+-H "Content-Type: application/json" \
 --data-binary '{"tags": ["tag:foo", "tag:bar"]}'
 ```
 
@@ -663,6 +675,7 @@ This returns a 2xx code on success, with an empty JSON object in the response bo
 ```sh
 curl "https://api.tailscale.com/api/v2/device/11055/key" \
 -u "tskey-api-xxxxx:" \
+-H "Content-Type: application/json" \
 --data-binary '{"keyExpiryDisabled": true}'
 ```
 
@@ -708,7 +721,138 @@ This returns a 2xx code on success, with an empty JSON object in the response bo
 ```sh
 curl "https://api.tailscale.com/api/v2/device/11055/ip" \
 -u "tskey-api-xxxxx:" \
+-H "Content-Type: application/json" \
 --data-binary '{"ipv4": "100.80.0.1"}'
+```
+
+### Response
+
+The response is 2xx on success. The response body is currently an empty JSON object.
+
+## Get device posture attributes
+
+The posture attributes API endpoints can be called with OAuth access tokens with
+an `acl` or `devices` [scope](https://tailscale.com/kb/1215/oauth-clients#scopes), or personal access belonging to
+[user roles](https://tailscale.com/kb/1138/user-roles) Owners, Admins, Network Admins, or IT Admins.
+
+```
+GET /api/v2/device/{deviceID}/attributes
+```
+
+Retrieve all posture attributes for the specified device. This returns a JSON object of all the key-value pairs of posture attributes for the device.
+
+### Parameters
+
+#### `deviceID` (required in URL path)
+
+The ID of the device to fetch posture attributes for.
+
+### Request example
+
+```
+curl "https://api.tailscale.com/api/v2/device/11055/attributes" \
+-u "tskey-api-xxxxx:"
+```
+
+### Response
+
+The response is 200 on success. The response body is a JSON object containing all the posture attributes assigned to the node. Attribute values can be strings, numbers or booleans.
+
+```json
+{
+  "attributes": {
+    "custom:myScore": 87,
+    "custom:diskEncryption": true,
+    "custom:myAttribute": "my_value",
+    "node:os": "linux",
+    "node:osVersion": "5.19.0-42-generic",
+    "node:tsReleaseTrack": "stable",
+    "node:tsVersion": "1.40.0",
+    "node:tsAutoUpdate": false
+  }
+}
+```
+
+## Set custom device posture attributes
+
+```
+POST /api/v2/device/{deviceID}/attributes/{attributeKey}
+```
+
+Create or update a custom posture attribute on the specified device. User-managed attributes must be in the `custom` namespace, which is indicated by prefixing the attribute key with `custom:`.
+
+Custom device posture attributes are available for the Personal and Enterprise plans.
+
+### Parameters
+
+#### `deviceID` (required in URL path)
+
+The ID of the device on which to set the custom posture attribute.
+
+#### `attributeKey` (required in URL path)
+
+The name of the posture attribute to set. This must be prefixed with `custom:`.
+
+Keys have a maximum length of 50 characters including the namespace, and can only contain letters, numbers, underscores, and colon.
+
+Keys are case-sensitive. Keys must be unique, but are checked for uniqueness in a case-insensitive manner. For example, `custom:MyAttribute` and `custom:myattribute` cannot both be set within a single tailnet.
+
+All values for a given key need to be of the same type, which is determined when the first value is written for a given key. For example, `custom:myattribute` cannot have a numeric value (`87`) for one node and a string value (`"78"`) for another node within the same tailnet.
+
+### Posture attribute `value` (required in POST body)
+
+```json
+{
+  "value": "foo"
+}
+```
+
+A value can be either a string, number or boolean.
+
+A string value can have a maximum length of 50 characters, and can only contain letters, numbers, underscores, and periods.
+
+A number value is an integer and must be a JSON safe number (up to 2^53 - 1).
+
+### Request example
+
+```
+curl "https://api.tailscale.com/api/v2/device/11055/attributes/custom:my_attribute" \
+-u "tskey-api-xxxxx:" \
+-H "Content-Type: application/json" \
+--data-binary '{"value": "my_value"}'
+```
+
+### Response
+
+The response is 2xx on success. The response body is currently an empty JSON object.
+
+## Delete custom device posture attributes
+
+```
+DELETE /api/v2/device/{deviceID}/attributes/{attributeKey}
+```
+
+Delete a posture attribute from the specified device. This is only applicable to user-managed posture attributes in the `custom` namespace, which is indicated by prefixing the attribute key with `custom:`.
+
+<PricingPlanNote feature="Custom device posture attributes" verb="are" plan="the Personal and Enterprise plans" />
+
+### Parameters
+
+#### `deviceID` (required in URL path)
+
+The ID of the device from which to delete the posture attribute.
+
+#### `attributeKey` (required in URL path)
+
+The name of the posture attribute to delete. This must be prefixed with `custom:`.
+
+Keys have a maximum length of 50 characters including the namespace, and can only contain letters, numbers, underscores, and a delimiting colon.
+
+### Request example
+
+```
+curl -X DELETE "https://api.tailscale.com/api/v2/device/11055/attributes/custom:my_attribute" \
+-u "tskey-api-xxxxx:"
 ```
 
 ### Response
@@ -785,7 +929,7 @@ The response will contain a JSON object with the fields:
 
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/acl" \
-  -u "tskey-api-xxxxx:" \
+  -u "tskey-api-xxxxx:"
 ```
 
 ### Response in HuJSON format
@@ -825,8 +969,8 @@ Etag: "e0b2816b418b3f266309d94426ac7668ab3c1fa87798785bf82f1085cc2f6d9c"
 
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/acl" \
-  -u "tskey-api-xxxxx:" \
-  -H "Accept: application/json" \
+  -u "tskey-api-xxxxx:"
+  -H "Accept: application/json"
 ```
 
 ### Response in JSON format
@@ -867,7 +1011,7 @@ Etag: "e0b2816b418b3f266309d94426ac7668ab3c1fa87798785bf82f1085cc2f6d9c"
 
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/acl?details=1" \
-  -u "tskey-api-xxxxx:" \
+  -u "tskey-api-xxxxx:"
 ```
 
 ### Response (with details)
@@ -939,6 +1083,7 @@ Learn about the [ACL policy properties you can include in the request](https://t
 POST /api/v2/tailnet/example.com/acl
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/acl" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   -H "If-Match: \"e0b2816b418b3f266309d94426ac7668ab3c1fa87798785bf82f1085cc2f6d9c\""
   --data-binary '// Example/default ACLs for unrestricted connections.
 {
@@ -1051,6 +1196,7 @@ Learn about [tailnet policy file entries](https://tailscale.com/kb/1018).
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/acl/preview?previewFor=user1@example.com&type=user" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   --data-binary '// Example/default ACLs for unrestricted connections.
 {
   // Declare tests to check functionality of ACL rules. User must be a valid user with registered machines.
@@ -1134,6 +1280,7 @@ Learn more about [tailnet policy file tests](https://tailscale.com/kb/1018/#test
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/acl/validate" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   --data-binary '
   [
     {"src": "user1@example.com", "accept": ["example-host-1:22"], "deny": ["example-host-2:100"]}
@@ -1155,6 +1302,7 @@ The `POST` body should be a JSON object with a JSON or HuJSON representation of 
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/acl/validate" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   --data-binary '
   {
     "acls": [
@@ -1415,6 +1563,7 @@ Note the following about required vs. optional values:
 ```jsonc
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/keys" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   --data-binary '
 {
   "capabilities": {
@@ -1626,6 +1775,7 @@ Adding DNS nameservers with the MagicDNS on:
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/dns/nameservers" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   --data-binary '{"dns": ["8.8.8.8"]}'
 ```
 
@@ -1645,6 +1795,7 @@ The response is a JSON object containing the new list of nameservers and the sta
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/dns/nameservers" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   --data-binary '{"dns": []}'
 ```
 
@@ -1731,6 +1882,7 @@ The DNS preferences in JSON. Currently, MagicDNS is the only setting available:
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/dns/preferences" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   --data-binary '{"magicDNS": true}'
 ```
 
@@ -1814,6 +1966,7 @@ Specify a list of search paths in a JSON object:
 ```sh
 curl "https://api.tailscale.com/api/v2/tailnet/example.com/dns/searchpaths" \
   -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
   --data-binary '{"searchPaths": ["user1.example.com", "user2.example.com"]}'
 ```
 
@@ -1824,5 +1977,163 @@ The response is a JSON object containing the new list of search paths.
 ```jsonc
 {
   "searchPaths": ["user1.example.com", "user2.example.com"],
+}
+```
+
+## Get split DNS
+
+```http
+GET /api/v2/tailnet/{tailnet}/dns/split-dns
+```
+
+Retrieves the split DNS settings, which is a map from domains to lists of nameservers, that is currently set for the given tailnet.
+
+### Parameters
+
+#### `tailnet` (required in URL path)
+
+The tailnet organization name.
+
+### Request example
+
+```sh
+curl "https://api.tailscale.com/api/v2/tailnet/example.com/dns/split-dns" \
+  -u "tskey-api-xxxxx:"
+```
+
+### Response
+
+```jsonc
+{
+  "example.com": ["1.1.1.1", "1.2.3.4"],
+  "other.com": ["2.2.2.2"]
+}
+```
+
+## Update split DNS
+
+```http
+PATCH /api/v2/tailnet/{tailnet}/dns/split-dns
+```
+
+Performs partial updates of the split DNS settings for a given tailnet. Only domains specified in the request map will be modified. Setting the value of a mapping to "null" clears the nameservers for that domain.
+
+### Parameters
+
+#### `tailnet` (required in URL path)
+
+The tailnet organization name.
+
+#### `PATCH` body format
+
+Specify mappings from domain name to a list of nameservers in a JSON object:
+
+```jsonc
+{
+  "example.com": ["1.1.1.1", "1.2.3.4"],
+  "other.com": ["2.2.2.2"]
+}
+```
+
+### Request example: updating split DNS settings for multiple domains
+
+```sh
+curl -X PATCH "https://api.tailscale.com/api/v2/tailnet/example.com/dns/split-dns" \
+  -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
+  --data-binary '{"example.com": ["1.1.1.1", "1.2.3.4"], "other.com": ["2.2.2.2"]}'
+```
+
+### Response: updating split DNS settings for multiple domains
+
+The response is a JSON object containing the updated map of split DNS settings.
+
+```jsonc
+{
+  "example.com": ["1.1.1.1", "1.2.3.4"],
+  "other.com": ["2.2.2.2"],
+  <existing unmodified key / value pairs>
+}
+```
+
+### Request example: unsetting nameservers for a domain
+
+```sh
+curl -X PATCH "https://api.tailscale.com/api/v2/tailnet/example.com/dns/split-dns" \
+  -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
+  --data-binary '{"example.com": null}'
+```
+
+### Response: unsetting nameservers for a domain
+
+The response is a JSON object containing the updated map of split DNS settings.
+
+```jsonc
+{
+  <existing unmodified key / value pairs without example.com>
+}
+```
+
+## Set split DNS
+
+```http
+PUT /api/v2/tailnet/{tailnet}/dns/split-dns
+```
+
+Replaces the split DNS settings for a given tailnet. Setting the value of a mapping to "null" clears the nameservers for that domain. Sending an empty object clears nameservers for all domains.
+
+### Parameters
+
+#### `tailnet` (required in URL path)
+
+The tailnet organization name.
+
+#### `PUT` body format
+
+Specify mappings from domain name to a list of nameservers in a JSON object:
+
+```jsonc
+{
+  "example.com": ["1.2.3.4"],
+  "other.com": ["2.2.2.2"]
+}
+```
+
+### Request example: setting multiple domains
+
+```sh
+curl -X PUT "https://api.tailscale.com/api/v2/tailnet/example.com/dns/split-dns" \
+  -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
+  --data-binary '{"example.com": ["1.2.3.4"], "other.com": ["2.2.2.2"]}'
+```
+
+### Response: unsetting nameservers for a domain
+
+The response is a JSON object containing the updated map of split DNS settings.
+
+```jsonc
+{
+  "example.com": ["1.2.3.4"],
+  "other.com": ["2.2.2.2"]
+}
+```
+
+### Request example: unsetting all domains
+
+```sh
+curl -X PUT "https://api.tailscale.com/api/v2/tailnet/example.com/dns/split-dns" \
+  -u "tskey-api-xxxxx:" \
+  -H "Content-Type: application/json" \
+  --data-binary '{}'
+```
+
+### Response: unsetting nameservers for a domain
+
+The response is a JSON object containing the updated map of split DNS settings.
+
+```jsonc
+{
 }
 ```

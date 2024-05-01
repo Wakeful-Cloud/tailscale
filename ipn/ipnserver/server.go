@@ -199,7 +199,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer onDone()
 
 	if strings.HasPrefix(r.URL.Path, "/localapi/") {
-		lah := localapi.NewHandler(lb, s.logf, s.netMon, s.backendLogID)
+		lah := localapi.NewHandler(lb, s.logf, s.backendLogID)
 		lah.PermitRead, lah.PermitWrite = s.localAPIPermissions(ci)
 		lah.PermitCert = s.connCanFetchCerts(ci)
 		lah.ConnIdentity = ci
@@ -342,7 +342,7 @@ func userIDFromString(v string) string {
 }
 
 func isAllDigit(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if b := s[i]; b < '0' || b > '9' {
 			return false
 		}

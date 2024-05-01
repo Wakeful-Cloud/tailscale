@@ -20,7 +20,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/net/dns/resolvconffile"
 	"tailscale.com/types/ptr"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
 )
 
@@ -1350,4 +1352,149 @@ func Test_serviceHandlerForIngress(t *testing.T) {
 	if len(gotReqs) > 0 {
 		t.Errorf("unexpected reconcile request for a Service that does not belong to any Ingress: %#+v\n", gotReqs)
 	}
+}
+
+func Test_clusterDomainFromResolverConf(t *testing.T) {
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		conf      *resolvconffile.Config
+		namespace string
+		want      string
+	}{
+		{
+			name: "success- custom domain",
+			conf: &resolvconffile.Config{
+				SearchDomains: []dnsname.FQDN{toFQDN(t, "foo.svc.department.org.io"), toFQDN(t, "svc.department.org.io"), toFQDN(t, "department.org.io")},
+			},
+			namespace: "foo",
+			want:      "department.org.io",
+		},
+		{
+			name: "success- default domain",
+			conf: &resolvconffile.Config{
+				SearchDomains: []dnsname.FQDN{toFQDN(t, "foo.svc.cluster.local."), toFQDN(t, "svc.cluster.local."), toFQDN(t, "cluster.local.")},
+			},
+			namespace: "foo",
+			want:      "cluster.local",
+		},
+		{
+			name: "only two search domains found",
+			conf: &resolvconffile.Config{
+				SearchDomains: []dnsname.FQDN{toFQDN(t, "svc.department.org.io"), toFQDN(t, "department.org.io")},
+			},
+			namespace: "foo",
+			want:      "cluster.local",
+		},
+		{
+			name: "first search domain does not match the expected structure",
+			conf: &resolvconffile.Config{
+				SearchDomains: []dnsname.FQDN{toFQDN(t, "foo.bar.department.org.io"), toFQDN(t, "svc.department.org.io"), toFQDN(t, "some.other.fqdn")},
+			},
+			namespace: "foo",
+			want:      "cluster.local",
+		},
+		{
+			name: "second search domain does not match the expected structure",
+			conf: &resolvconffile.Config{
+				SearchDomains: []dnsname.FQDN{toFQDN(t, "foo.svc.department.org.io"), toFQDN(t, "foo.department.org.io"), toFQDN(t, "some.other.fqdn")},
+			},
+			namespace: "foo",
+			want:      "cluster.local",
+		},
+		{
+			name: "third search domain does not match the expected structure",
+			conf: &resolvconffile.Config{
+				SearchDomains: []dnsname.FQDN{toFQDN(t, "foo.svc.department.org.io"), toFQDN(t, "svc.department.org.io"), toFQDN(t, "some.other.fqdn")},
+			},
+			namespace: "foo",
+			want:      "cluster.local",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clusterDomainFromResolverConf(tt.conf, tt.namespace, zl.Sugar()); got != tt.want {
+				t.Errorf("clusterDomainFromResolverConf() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_externalNameService(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. A External name Service that should be exposed via Tailscale gets
+	// created.
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
+	}
+
+	// 1. Create an ExternalName Service that we should manage, and check that the initial round
+	// of objects looks right.
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			// The apiserver is supposed to set the UID, but the fake client
+			// doesn't. So, set it explicitly because other code later depends
+			// on it being set.
+			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationExpose: "true",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:         corev1.ServiceTypeExternalName,
+			ExternalName: "foo.com",
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	opts := configOpts{
+		stsName:          shortName,
+		secretName:       fullName,
+		namespace:        "default",
+		parentType:       "svc",
+		hostname:         "default-test",
+		clusterTargetDNS: "foo.com",
+	}
+
+	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
+	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+
+	// 2. Change the ExternalName and verify that changes get propagated.
+	mustUpdate(t, sr, "default", "test", func(s *corev1.Service) {
+		s.Spec.ExternalName = "bar.com"
+	})
+	expectReconciled(t, sr, "default", "test")
+	opts.clusterTargetDNS = "bar.com"
+	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+}
+
+func toFQDN(t *testing.T, s string) dnsname.FQDN {
+	t.Helper()
+	fqdn, err := dnsname.ToFQDN(s)
+	if err != nil {
+		t.Fatalf("error coverting %q to dnsname.FQDN: %v", s, err)
+	}
+	return fqdn
 }

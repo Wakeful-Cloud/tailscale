@@ -44,7 +44,7 @@ import (
 
 var upCmd = &ffcli.Command{
 	Name:       "up",
-	ShortUsage: "up [flags]",
+	ShortUsage: "tailscale up [flags]",
 	ShortHelp:  "Connect to Tailscale, logging in if needed",
 
 	LongHelp: strings.TrimSpace(`
@@ -105,7 +105,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	upf.StringVar(&upArgs.server, "login-server", ipn.DefaultControlURL, "base URL of control server")
 	upf.BoolVar(&upArgs.acceptRoutes, "accept-routes", acceptRouteDefault(goos), "accept routes advertised by other Tailscale nodes")
 	upf.BoolVar(&upArgs.acceptDNS, "accept-dns", true, "accept DNS configuration from the admin panel")
-	upf.BoolVar(&upArgs.singleRoutes, "host-routes", true, "HIDDEN: install host routes to other Tailscale nodes")
+	upf.BoolVar(&upArgs.singleRoutes, "host-routes", true, hidden+"install host routes to other Tailscale nodes")
 	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP or base name) for internet traffic, or empty string to not use an exit node")
 	upf.BoolVar(&upArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "Allow direct access to the local network when routing traffic via an exit node")
 	upf.BoolVar(&upArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
@@ -496,11 +496,23 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 	running := make(chan bool, 1) // gets value once in state ipn.Running
 	pumpErr := make(chan error, 1)
 
-	var printed bool // whether we've yet printed anything to stdout or stderr
-	var loginOnce sync.Once
-	startLoginInteractive := func() { loginOnce.Do(func() { localClient.StartLoginInteractive(ctx) }) }
+	// localAPIMu should be held while doing mutable LocalAPI calls
+	// to the backend. In particular, it prevents StartLoginInteractive from
+	// being called from the watcher goroutine while the Start call from
+	// the other goroutine is in progress.
+	// See https://github.com/tailscale/tailscale/issues/7036#issuecomment-2053771466
+	// TODO(bradfitz): simplify this once #11649 is cleaned up and Start is
+	// hopefully removed.
+	var localAPIMu sync.Mutex
+
+	startLoginInteractive := sync.OnceFunc(func() {
+		localAPIMu.Lock()
+		defer localAPIMu.Unlock()
+		localClient.StartLoginInteractive(ctx)
+	})
 
 	go func() {
+		var printed bool // whether we've yet printed anything to stdout or stderr
 		for {
 			n, err := watcher.Next()
 			if err != nil {
@@ -574,12 +586,14 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 	// Special case: bare "tailscale up" means to just start
 	// running, if there's ever been a login.
 	if simpleUp {
+		localAPIMu.Lock()
 		_, err := localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
 			Prefs: ipn.Prefs{
 				WantRunning: true,
 			},
 			WantRunningSet: true,
 		})
+		localAPIMu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -596,10 +610,13 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		if err != nil {
 			return err
 		}
-		if err := localClient.Start(ctx, ipn.Options{
+		localAPIMu.Lock()
+		err = localClient.Start(ctx, ipn.Options{
 			AuthKey:     authKey,
 			UpdatePrefs: prefs,
-		}); err != nil {
+		})
+		localAPIMu.Unlock()
+		if err != nil {
 			return err
 		}
 		if upArgs.forceReauth {

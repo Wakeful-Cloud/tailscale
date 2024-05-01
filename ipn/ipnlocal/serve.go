@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -25,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/http2"
 	"tailscale.com/ipn"
@@ -62,7 +64,7 @@ type serveHTTPContext struct {
 //
 // This is not used in userspace-networking mode.
 //
-// localListener is used by tailscale serve (TCP only), the built-in web client and tailfs.
+// localListener is used by tailscale serve (TCP only), the built-in web client and Taildrive.
 // Most serve traffic and peer traffic for the web client are intercepted by netstack.
 // This listener exists purely for connections from the machine itself, as that goes via the kernel,
 // so we need to be in the kernel's listening/routing tables.
@@ -717,10 +719,25 @@ func (b *LocalBackend) addTailscaleIdentityHeaders(r *httputil.ProxyRequest) {
 		// Only currently set for nodes with user identities.
 		return
 	}
-	r.Out.Header.Set("Tailscale-User-Login", user.LoginName)
-	r.Out.Header.Set("Tailscale-User-Name", user.DisplayName)
+	r.Out.Header.Set("Tailscale-User-Login", encTailscaleHeaderValue(user.LoginName))
+	r.Out.Header.Set("Tailscale-User-Name", encTailscaleHeaderValue(user.DisplayName))
 	r.Out.Header.Set("Tailscale-User-Profile-Pic", user.ProfilePicURL)
 	r.Out.Header.Set("Tailscale-Headers-Info", "https://tailscale.com/s/serve-headers")
+}
+
+// encTailscaleHeaderValue cleans or encodes as necessary v, to be suitable in
+// an HTTP header value. See
+// https://github.com/tailscale/tailscale/issues/11603.
+//
+// If v is not a valid UTF-8 string, it returns an empty string.
+// If v is a valid ASCII string, it returns v unmodified.
+// If v is a valid UTF-8 string with non-ASCII characters, it returns a
+// RFC 2047 Q-encoded string.
+func encTailscaleHeaderValue(v string) string {
+	if !utf8.ValidString(v) {
+		return ""
+	}
+	return mime.QEncoding.Encode("utf-8", v)
 }
 
 // serveWebHandler is an http.HandlerFunc that maps incoming requests to the
@@ -851,7 +868,7 @@ func expandProxyArg(s string) (targetURL string, insecureSkipVerify bool) {
 }
 
 func allNumeric(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if s[i] < '0' || s[i] > '9' {
 			return false
 		}

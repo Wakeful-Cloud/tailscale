@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os"
 	"strings"
 	"text/tabwriter"
 
@@ -18,13 +17,12 @@ import (
 
 var whoisCmd = &ffcli.Command{
 	Name:       "whois",
-	ShortUsage: "whois [--json] ip[:port]",
+	ShortUsage: "tailscale whois [--json] ip[:port]",
 	ShortHelp:  "Show the machine and user associated with a Tailscale IP (v4 or v6)",
 	LongHelp: strings.TrimSpace(`
 	'tailscale whois' shows the machine and user associated with a Tailscale IP (v4 or v6).
 	`),
-	UsageFunc: usageFunc,
-	Exec:      runWhoIs,
+	Exec: runWhoIs,
 	FlagSet: func() *flag.FlagSet {
 		fs := newFlagSet("whois")
 		fs.BoolVar(&whoIsArgs.json, "json", false, "output in JSON format")
@@ -53,7 +51,7 @@ func runWhoIs(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 10, 5, 5, ' ', 0)
+	w := tabwriter.NewWriter(Stdout, 10, 5, 5, ' ', 0)
 	fmt.Fprintf(w, "Machine:\n")
 	fmt.Fprintf(w, "  Name:\t%s\n", strings.TrimSuffix(who.Node.Name, "."))
 	fmt.Fprintf(w, "  ID:\t%s\n", who.Node.StableID)

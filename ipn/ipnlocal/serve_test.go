@@ -28,6 +28,7 @@ import (
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/mak"
@@ -663,14 +664,21 @@ func mustCreateURL(t *testing.T, u string) url.URL {
 }
 
 func newTestBackend(t *testing.T) *LocalBackend {
+	var logf logger.Logf = logger.Discard
+	const debug = true
+	if debug {
+		logf = logger.WithPrefix(t.Logf, "... ")
+	}
+
 	sys := &tsd.System{}
-	e, err := wgengine.NewUserspaceEngine(t.Logf, wgengine.Config{SetSubsystem: sys.Set})
+	e, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{SetSubsystem: sys.Set})
 	if err != nil {
 		t.Fatal(err)
 	}
 	sys.Set(e)
 	sys.Set(new(mem.Store))
-	b, err := NewLocalBackend(t.Logf, logid.PublicID{}, sys, 0)
+
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,7 +686,7 @@ func newTestBackend(t *testing.T) *LocalBackend {
 	dir := t.TempDir()
 	b.SetVarRoot(dir)
 
-	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
+	pm := must.Get(newProfileManager(new(mem.Store), logf))
 	pm.currentProfile = &ipn.LoginProfile{ID: "id0"}
 	b.pm = pm
 
@@ -820,6 +828,24 @@ func Test_isGRPCContentType(t *testing.T) {
 	for _, tt := range tests {
 		if got := isGRPCContentType(tt.contentType); got != tt.want {
 			t.Errorf("isGRPCContentType(%q) = %v, want %v", tt.contentType, got, tt.want)
+		}
+	}
+}
+
+func TestEncTailscaleHeaderValue(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"Alice Smith", "Alice Smith"},
+		{"Bad\xffUTF-8", ""},
+		{"Krūmiņa", "=?utf-8?q?Kr=C5=ABmi=C5=86a?="},
+	}
+	for _, tt := range tests {
+		got := encTailscaleHeaderValue(tt.in)
+		if got != tt.want {
+			t.Errorf("encTailscaleHeaderValue(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }

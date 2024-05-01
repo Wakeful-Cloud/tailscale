@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
@@ -15,16 +16,19 @@ import (
 	"time"
 
 	"tailscale.com/derp"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/key"
 )
 
 func TestSendRecv(t *testing.T) {
 	serverPrivateKey := key.NewNode()
 
+	netMon := netmon.NewStatic()
+
 	const numClients = 3
 	var clientPrivateKeys []key.NodePrivate
 	var clientKeys []key.NodePublic
-	for i := 0; i < numClients; i++ {
+	for range numClients {
 		priv := key.NewNode()
 		clientPrivateKeys = append(clientPrivateKeys, priv)
 		clientKeys = append(clientKeys, priv.Public())
@@ -65,9 +69,9 @@ func TestSendRecv(t *testing.T) {
 		}
 		wg.Wait()
 	}()
-	for i := 0; i < numClients; i++ {
+	for i := range numClients {
 		key := clientPrivateKeys[i]
-		c, err := NewClient(key, serverURL, t.Logf)
+		c, err := NewClient(key, serverURL, t.Logf, netMon)
 		if err != nil {
 			t.Fatalf("client %d: %v", i, err)
 		}
@@ -182,7 +186,7 @@ func TestPing(t *testing.T) {
 		}
 	}()
 
-	c, err := NewClient(key.NewNode(), serverURL, t.Logf)
+	c, err := NewClient(key.NewNode(), serverURL, t.Logf, netmon.NewStatic())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -235,7 +239,7 @@ func newTestServer(t *testing.T, k key.NodePrivate) (serverURL string, s *derp.S
 }
 
 func newWatcherClient(t *testing.T, watcherPrivateKey key.NodePrivate, serverToWatchURL string) (c *Client) {
-	c, err := NewClient(watcherPrivateKey, serverToWatchURL, t.Logf)
+	c, err := NewClient(watcherPrivateKey, serverToWatchURL, t.Logf, netmon.NewStatic())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +314,7 @@ func TestBreakWatcherConnRecv(t *testing.T) {
 
 	// Wait for the watcher to run, then break the connection and check if it
 	// reconnected and received peer updates.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		select {
 		case peers := <-watcherChan:
 			if peers != 1 {
@@ -383,7 +387,7 @@ func TestBreakWatcherConn(t *testing.T) {
 
 	// Wait for the watcher to run, then break the connection and check if it
 	// reconnected and received peer updates.
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		select {
 		case peers := <-watcherChan:
 			if peers != 1 {
@@ -446,4 +450,17 @@ func TestRunWatchConnectionLoopServeConnect(t *testing.T) {
 		return false
 	}
 	watcher.RunWatchConnectionLoop(ctx, key.NodePublic{}, t.Logf, noopAdd, noopRemove)
+}
+
+// verify that the LocalAddr method doesn't acquire the mutex.
+// See https://github.com/tailscale/tailscale/issues/11519
+func TestLocalAddrNoMutex(t *testing.T) {
+	var c Client
+	c.mu.Lock()
+	defer c.mu.Unlock() // not needed in test but for symmetry
+
+	_, err := c.LocalAddr()
+	if got, want := fmt.Sprint(err), "client not connected"; got != want {
+		t.Errorf("got error %q; want %q", got, want)
+	}
 }

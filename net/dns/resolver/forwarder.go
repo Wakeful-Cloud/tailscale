@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
@@ -28,7 +27,6 @@ import (
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
-	"tailscale.com/net/netns"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/types/dnstype"
@@ -187,7 +185,7 @@ type resolverAndDelay struct {
 // forwarder forwards DNS packets to a number of upstream nameservers.
 type forwarder struct {
 	logf    logger.Logf
-	netMon  *netmon.Monitor
+	netMon  *netmon.Monitor     // always non-nil
 	linkSel ForwardLinkSelector // TODO(bradfitz): remove this when tsdial.Dialer absorbs it
 	dialer  *tsdial.Dialer
 
@@ -215,11 +213,10 @@ type forwarder struct {
 	cloudHostFallback []resolverAndDelay
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
 func newForwarder(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, knobs *controlknobs.Knobs) *forwarder {
+	if netMon == nil {
+		panic("nil netMon")
+	}
 	f := &forwarder{
 		logf:         logger.WithPrefix(logf, "forward: "),
 		netMon:       netMon,
@@ -394,12 +391,23 @@ func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client
 	if err != nil {
 		return nil, false
 	}
-	nsDialer := netns.NewDialer(f.logf, f.netMon)
-	dialer := dnscache.Dialer(nsDialer.DialContext, &dnscache.Resolver{
+	// NOTE: use f.dialer.SystemDial so we close connections on a link
+	// change; on mobile devices when switching between WiFi and cellular,
+	// we need to ensure we don't retain a connection on the old interface
+	// or we can block DNS resolution.
+	//
+	// NOTE: if we ever support arbitrary user-defined DoH providers, this
+	// isn't sufficient; we'd need a dialer that dial a DoH server on the
+	// internet, without going through Tailscale (as SystemDial does), but
+	// also can dial a node on the tailnet (e.g. a PiHole).
+	//
+	// As of the time of writing (2024-02-11), this isn't a problem because
+	// we only support a restricted set of public DoH providers that aren't
+	// on a user's tailnet.
+	dialer := dnscache.Dialer(f.dialer.SystemDial, &dnscache.Resolver{
 		SingleHost:             dohURL.Hostname(),
 		SingleHostStaticResult: allIPs,
 		Logf:                   f.logf,
-		NetMon:                 f.netMon,
 	})
 	c = &http.Client{
 		Transport: &http.Transport{
@@ -573,7 +581,7 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 	}
 
 	// Kick off the race between the UDP and TCP queries.
-	rh := race.New[[]byte](timeout, firstUDP, thenTCP)
+	rh := race.New(timeout, firstUDP, thenTCP)
 	resp, err := rh.Start(ctx)
 	if err == nil {
 		return resp, nil
