@@ -69,10 +69,6 @@ func init() {
 	}
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
 const (
 	perClientSendQueueDepth = 32 // packets buffered for sending
 	writeTimeout            = 2 * time.Second
@@ -333,18 +329,34 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	s.initMetacert()
 	s.packetsRecvDisco = s.packetsRecvByKind.Get("disco")
 	s.packetsRecvOther = s.packetsRecvByKind.Get("other")
-	s.packetsDroppedReasonCounters = []*expvar.Int{
-		s.packetsDroppedReason.Get("unknown_dest"),
-		s.packetsDroppedReason.Get("unknown_dest_on_fwd"),
-		s.packetsDroppedReason.Get("gone_disconnected"),
-		s.packetsDroppedReason.Get("gone_not_here"),
-		s.packetsDroppedReason.Get("queue_head"),
-		s.packetsDroppedReason.Get("queue_tail"),
-		s.packetsDroppedReason.Get("write_error"),
-	}
+
+	s.packetsDroppedReasonCounters = s.genPacketsDroppedReasonCounters()
+
 	s.packetsDroppedTypeDisco = s.packetsDroppedType.Get("disco")
 	s.packetsDroppedTypeOther = s.packetsDroppedType.Get("other")
 	return s
+}
+
+func (s *Server) genPacketsDroppedReasonCounters() []*expvar.Int {
+	getMetric := s.packetsDroppedReason.Get
+	ret := []*expvar.Int{
+		dropReasonUnknownDest:      getMetric("unknown_dest"),
+		dropReasonUnknownDestOnFwd: getMetric("unknown_dest_on_fwd"),
+		dropReasonGoneDisconnected: getMetric("gone_disconnected"),
+		dropReasonQueueHead:        getMetric("queue_head"),
+		dropReasonQueueTail:        getMetric("queue_tail"),
+		dropReasonWriteError:       getMetric("write_error"),
+		dropReasonDupClient:        getMetric("dup_client"),
+	}
+	if len(ret) != int(numDropReasons) {
+		panic("dropReason metrics out of sync")
+	}
+	for i := range numDropReasons {
+		if ret[i] == nil {
+			panic("dropReason metrics out of sync")
+		}
+	}
+	return ret
 }
 
 // SetMesh sets the pre-shared key that regional DERP servers used to mesh
@@ -780,7 +792,6 @@ func (c *sclient) run(ctx context.Context) error {
 	var grp errgroup.Group
 	sendCtx, cancelSender := context.WithCancel(ctx)
 	grp.Go(func() error { return c.sendLoop(sendCtx) })
-	grp.Go(func() error { return c.statsLoop(sendCtx) })
 	defer func() {
 		cancelSender()
 		if err := grp.Wait(); err != nil && !c.s.isClosed() {
@@ -791,6 +802,8 @@ func (c *sclient) run(ctx context.Context) error {
 			}
 		}
 	}()
+
+	c.startStatsLoop(sendCtx)
 
 	for {
 		ft, fl, err := readFrameHeader(c.br)
@@ -1050,6 +1063,7 @@ const (
 	dropReasonQueueTail                          // destination queue is full, dropped packet at queue tail
 	dropReasonWriteError                         // OS write() failed
 	dropReasonDupClient                          // the public key is connected 2+ times (active/active, fighting)
+	numDropReasons                               // unused; keep last
 )
 
 func (s *Server) recordDrop(packetBytes []byte, srcKey, dstKey key.NodePublic, reason dropReason) {

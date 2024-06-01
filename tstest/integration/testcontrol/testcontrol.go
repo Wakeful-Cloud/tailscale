@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -69,6 +70,9 @@ type Server struct {
 	// nodeSubnetRoutes is a list of subnet routes that are served
 	// by the specified node.
 	nodeSubnetRoutes map[key.NodePublic][]netip.Prefix
+
+	// peerIsJailed is the set of peers that are jailed for a node.
+	peerIsJailed map[key.NodePublic]map[key.NodePublic]bool // node => peer => isJailed
 
 	// masquerades is the set of masquerades that should be applied to
 	// MapResponses sent to clients. It is keyed by the requesting nodes
@@ -376,6 +380,20 @@ type MasqueradePair struct {
 	Node              key.NodePublic
 	Peer              key.NodePublic
 	NodeMasqueradesAs netip.Addr
+}
+
+// SetJailed sets b to be jailed when it is a peer of a.
+func (s *Server) SetJailed(a, b key.NodePublic, jailed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peerIsJailed == nil {
+		s.peerIsJailed = map[key.NodePublic]map[key.NodePublic]bool{}
+	}
+	if s.peerIsJailed[a] == nil {
+		s.peerIsJailed[a] = map[key.NodePublic]bool{}
+	}
+	s.peerIsJailed[a][b] = jailed
+	s.updateLocked("SetJailed", s.nodeIDsLocked(0))
 }
 
 // SetMasqueradeAddresses sets the masquerade addresses for the server.
@@ -914,7 +932,12 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		// node key rotated away (once test server supports that)
 		return nil, nil
 	}
-	node.CapMap = s.nodeCapMaps[nk]
+
+	s.mu.Lock()
+	nodeCapMap := maps.Clone(s.nodeCapMaps[nk])
+	s.mu.Unlock()
+
+	node.CapMap = nodeCapMap
 	node.Capabilities = append(node.Capabilities, tailcfg.NodeAttrDisableUPnP)
 
 	user, _ := s.getUser(nk)
@@ -939,6 +962,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 
 	s.mu.Lock()
 	nodeMasqs := s.masquerades[node.Key]
+	jailed := maps.Clone(s.peerIsJailed[node.Key])
 	s.mu.Unlock()
 	for _, p := range s.AllNodes() {
 		if p.StableID == node.StableID {
@@ -951,6 +975,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 				p.SelfNodeV4MasqAddrForThisPeer = ptr.To(masqIP)
 			}
 		}
+		p.IsJailed = jailed[p.Key]
 
 		s.mu.Lock()
 		peerAddress := s.masquerades[p.Key][node.Key]

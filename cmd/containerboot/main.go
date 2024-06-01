@@ -52,8 +52,10 @@
 //     ${TS_CERT_DOMAIN}, it will be replaced with the value of the available FQDN.
 //     It cannot be used in conjunction with TS_DEST_IP. The file is watched for changes,
 //     and will be re-applied when it changes.
-//   - EXPERIMENTAL_TS_CONFIGFILE_PATH: if specified, a path to tailscaled
-//     config. If this is set, TS_HOSTNAME, TS_EXTRA_ARGS, TS_AUTHKEY,
+//   - TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR: if specified, a path to a
+//     directory that containers tailscaled config in file. The config file needs to be
+//     named cap-<current-tailscaled-cap>.hujson. If this is set, TS_HOSTNAME,
+//     TS_EXTRA_ARGS, TS_AUTHKEY,
 //     TS_ROUTES, TS_ACCEPT_DNS env vars must not be set. If this is set,
 //     containerboot only runs `tailscaled --config <path-to-this-configfile>`
 //     and not `tailscale up` or `tailscale set`.
@@ -92,6 +94,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -107,6 +110,7 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/conffile"
+	kubeutils "tailscale.com/k8s-operator"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/ptr"
@@ -145,7 +149,7 @@ func main() {
 		Socket:                                defaultEnv("TS_SOCKET", "/tmp/tailscaled.sock"),
 		AuthOnce:                              defaultBool("TS_AUTH_ONCE", false),
 		Root:                                  defaultEnv("TS_TEST_ONLY_ROOT", "/"),
-		TailscaledConfigFilePath:              defaultEnv("EXPERIMENTAL_TS_CONFIGFILE_PATH", ""),
+		TailscaledConfigFilePath:              tailscaledConfigFilePath(),
 		AllowProxyingClusterTrafficViaIngress: defaultBool("EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS", false),
 		PodIP:                                 defaultEnv("POD_IP", ""),
 	}
@@ -957,15 +961,22 @@ func installIngressForwardingRule(ctx context.Context, dstStr string, tsIPs []ne
 		return err
 	}
 	var local netip.Addr
+	proxyHasIPv4Address := false
 	for _, pfx := range tsIPs {
 		if !pfx.IsSingleIP() {
 			continue
+		}
+		if pfx.Addr().Is4() {
+			proxyHasIPv4Address = true
 		}
 		if pfx.Addr().Is4() != dst.Is4() {
 			continue
 		}
 		local = pfx.Addr()
 		break
+	}
+	if proxyHasIPv4Address && dst.Is6() {
+		log.Printf("Warning: proxy backend ClusterIP is an IPv6 address and the proxy has a IPv4 tailnet address. You might need to disable IPv4 address allocation for the proxy for forwarding to work. See https://github.com/tailscale/tailscale/issues/12156")
 	}
 	if !local.IsValid() {
 		return fmt.Errorf("no tailscale IP matching family of %s found in %v", dstStr, tsIPs)
@@ -1097,6 +1108,13 @@ type settings struct {
 
 func (s *settings) validate() error {
 	if s.TailscaledConfigFilePath != "" {
+		dir, file := path.Split(s.TailscaledConfigFilePath)
+		if _, err := os.Stat(dir); err != nil {
+			return fmt.Errorf("error validating whether directory with tailscaled config file %s exists: %w", dir, err)
+		}
+		if _, err := os.Stat(s.TailscaledConfigFilePath); err != nil {
+			return fmt.Errorf("error validating whether tailscaled config directory %q contains tailscaled config for current capability version %q: %w. If this is a Tailscale Kubernetes operator proxy, please ensure that the version of the operator is not older than the version of the proxy", dir, file, err)
+		}
 		if _, err := conffile.Load(s.TailscaledConfigFilePath); err != nil {
 			return fmt.Errorf("error validating tailscaled configfile contents: %w", err)
 		}
@@ -1120,7 +1138,7 @@ func (s *settings) validate() error {
 		return errors.New("Both TS_TAILNET_TARGET_IP and TS_TAILNET_FQDN cannot be set")
 	}
 	if s.TailscaledConfigFilePath != "" && (s.AcceptDNS != nil || s.AuthKey != "" || s.Routes != nil || s.ExtraArgs != "" || s.Hostname != "") {
-		return errors.New("EXPERIMENTAL_TS_CONFIGFILE_PATH cannot be set in combination with TS_HOSTNAME, TS_EXTRA_ARGS, TS_AUTHKEY, TS_ROUTES, TS_ACCEPT_DNS.")
+		return errors.New("TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR cannot be set in combination with TS_HOSTNAME, TS_EXTRA_ARGS, TS_AUTHKEY, TS_ROUTES, TS_ACCEPT_DNS.")
 	}
 	if s.AllowProxyingClusterTrafficViaIngress && s.UserspaceMode {
 		return errors.New("EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS is not supported in userspace mode")
@@ -1251,4 +1269,43 @@ func isTwoStepConfigAlwaysAuth(cfg *settings) bool {
 // configured in a single step by running 'tailscaled <config opts>'
 func isOneStepConfig(cfg *settings) bool {
 	return cfg.TailscaledConfigFilePath != ""
+}
+
+// tailscaledConfigFilePath returns the path to the tailscaled config file that
+// should be used for the current capability version. It is determined by the
+// TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR environment variable and looks for a
+// file named cap-<capability_version>.hujson in the directory. It searches for
+// the highest capability version that is less than or equal to the current
+// capability version.
+func tailscaledConfigFilePath() string {
+	dir := os.Getenv("TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR")
+	if dir == "" {
+		return ""
+	}
+	fe, err := os.ReadDir(dir)
+	if err != nil {
+		log.Fatalf("error reading tailscaled config directory %q: %v", dir, err)
+	}
+	maxCompatVer := tailcfg.CapabilityVersion(-1)
+	for _, e := range fe {
+		// We don't check if type if file as in most cases this will
+		// come from a mounted kube Secret, where the directory contents
+		// will be various symlinks.
+		if e.Type().IsDir() {
+			continue
+		}
+		cv, err := kubeutils.CapVerFromFileName(e.Name())
+		if err != nil {
+			log.Printf("skipping file %q in tailscaled config directory %q: %v", e.Name(), dir, err)
+			continue
+		}
+		if cv > maxCompatVer && cv <= tailcfg.CurrentCapabilityVersion {
+			maxCompatVer = cv
+		}
+	}
+	if maxCompatVer == -1 {
+		log.Fatalf("no tailscaled config file found in %q for current capability version %q", dir, tailcfg.CurrentCapabilityVersion)
+	}
+	log.Printf("Using tailscaled config file %q for capability version %q", maxCompatVer, tailcfg.CurrentCapabilityVersion)
+	return path.Join(dir, kubeutils.TailscaledConfigFileNameForCap(maxCompatVer))
 }

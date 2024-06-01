@@ -47,6 +47,7 @@ import (
 	"tailscale.com/util/deephash"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
+	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
@@ -244,6 +245,8 @@ func NewFakeUserspaceEngine(logf logger.Logf, opts ...any) (Engine, error) {
 			conf.SetSubsystem = v
 		case *controlknobs.Knobs:
 			conf.ControlKnobs = v
+		case *health.Tracker:
+			conf.HealthTracker = v
 		default:
 			return nil, fmt.Errorf("unknown option type %T", v)
 		}
@@ -257,6 +260,10 @@ func NewFakeUserspaceEngine(logf logger.Logf, opts ...any) (Engine, error) {
 func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) {
 	var closePool closeOnErrorPool
 	defer closePool.closeAllIfError(&reterr)
+
+	if testenv.InTest() && conf.HealthTracker == nil {
+		panic("NewUserspaceEngine called without HealthTracker (being strict in tests)")
+	}
 
 	if conf.Tun == nil {
 		logf("[v1] using fake (no-op) tun device")
@@ -965,8 +972,9 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	if netLogRunning && !e.networkLogger.Running() {
 		nid := cfg.NetworkLogging.NodeID
 		tid := cfg.NetworkLogging.DomainID
+		logExitFlowEnabled := cfg.NetworkLogging.LogExitFlowEnabled
 		e.logf("wgengine: Reconfig: starting up network logger (node:%s tailnet:%s)", nid.Public(), tid.Public())
-		if err := e.networkLogger.Startup(cfg.NodeID, nid, tid, e.tundev, e.magicConn, e.netMon, e.health); err != nil {
+		if err := e.networkLogger.Startup(cfg.NodeID, nid, tid, e.tundev, e.magicConn, e.netMon, e.health, logExitFlowEnabled); err != nil {
 			e.logf("wgengine: Reconfig: error starting up network logger: %v", err)
 		}
 		e.networkLogger.ReconfigRoutes(routerCfg)
@@ -1032,6 +1040,14 @@ func (e *userspaceEngine) GetFilter() *filter.Filter {
 
 func (e *userspaceEngine) SetFilter(filt *filter.Filter) {
 	e.tundev.SetFilter(filt)
+}
+
+func (e *userspaceEngine) GetJailedFilter() *filter.Filter {
+	return e.tundev.GetJailedFilter()
+}
+
+func (e *userspaceEngine) SetJailedFilter(filt *filter.Filter) {
+	e.tundev.SetJailedFilter(filt)
 }
 
 func (e *userspaceEngine) SetStatusCallback(cb StatusCallback) {

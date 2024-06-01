@@ -363,7 +363,7 @@ func TestNodeEqual(t *testing.T) {
 		"UnsignedPeerAPIOnly",
 		"ComputedName", "computedHostIfDifferent", "ComputedNameWithHost",
 		"DataPlaneAuditLogID", "Expired", "SelfNodeV4MasqAddrForThisPeer",
-		"SelfNodeV6MasqAddrForThisPeer", "IsWireGuardOnly", "ExitNodeDNSResolvers",
+		"SelfNodeV6MasqAddrForThisPeer", "IsWireGuardOnly", "IsJailed", "ExitNodeDNSResolvers",
 	}
 	if have := fieldsOf(reflect.TypeFor[Node]()); !reflect.DeepEqual(have, nodeHandles) {
 		t.Errorf("Node.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -605,6 +605,16 @@ func TestNodeEqual(t *testing.T) {
 					"foo": []RawMessage{`"bar"`},
 				},
 			},
+			false,
+		},
+		{
+			&Node{IsJailed: true},
+			&Node{IsJailed: true},
+			true,
+		},
+		{
+			&Node{IsJailed: false},
+			&Node{IsJailed: true},
 			false,
 		},
 	}
@@ -849,8 +859,33 @@ func TestDeps(t *testing.T) {
 		BadDeps: map[string]string{
 			// Make sure we don't again accidentally bring in a dependency on
 			// drive or its transitive dependencies
+			"testing":                        "do not use testing package in production code",
 			"tailscale.com/drive/driveimpl":  "https://github.com/tailscale/tailscale/pull/10631",
 			"github.com/studio-b12/gowebdav": "https://github.com/tailscale/tailscale/pull/10631",
 		},
 	}.Check(t)
+}
+
+func TestCheckTag(t *testing.T) {
+	tests := []struct {
+		name string
+		tag  string
+		want bool
+	}{
+		{"empty", "", false},
+		{"good", "tag:foo", true},
+		{"bad", "tag:", false},
+		{"no_leading_num", "tag:1foo", false},
+		{"no_punctuation", "tag:foa@bar", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckTag(tt.tag)
+			if err == nil && !tt.want {
+				t.Errorf("got nil; want error")
+			} else if err != nil && tt.want {
+				t.Errorf("got %v; want nil", err)
+			}
+		})
+	}
 }

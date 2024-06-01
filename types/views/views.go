@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 
@@ -274,12 +275,15 @@ func (v Slice[T]) IndexFunc(f func(T) bool) int {
 //
 // As it runs in O(n) time, use with care.
 func (v Slice[T]) ContainsFunc(f func(T) bool) bool {
+	return slices.ContainsFunc(v.ж, f)
+}
+
+// AppendStrings appends the string representation of each element in v to dst.
+func AppendStrings[T fmt.Stringer](dst []string, v Slice[T]) []string {
 	for _, x := range v.ж {
-		if f(x) {
-			return true
-		}
+		dst = append(dst, x.String())
 	}
-	return false
+	return dst
 }
 
 // SliceContains reports whether v contains element e.
@@ -287,11 +291,6 @@ func (v Slice[T]) ContainsFunc(f func(T) bool) bool {
 // As it runs in O(n) time, use with care.
 func SliceContains[T comparable](v Slice[T], e T) bool {
 	return slices.Contains(v.ж, e)
-}
-
-// SliceContainsFunc reports whether f reports true for any element in v.
-func SliceContainsFunc[T any](v Slice[T], f func(T) bool) bool {
-	return slices.ContainsFunc(v.ж, f)
 }
 
 // SliceEqual is like the standard library's slices.Equal, but for two views.
@@ -388,8 +387,8 @@ func (m *Map[K, V]) UnmarshalJSON(b []byte) error {
 // AsMap returns a shallow-clone of the underlying map.
 // If V is a pointer type, it is the caller's responsibility to make sure
 // the values are immutable.
-func (m *Map[K, V]) AsMap() map[K]V {
-	if m == nil {
+func (m Map[K, V]) AsMap() map[K]V {
+	if m.ж == nil {
 		return nil
 	}
 	return maps.Clone(m.ж)

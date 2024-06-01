@@ -55,7 +55,7 @@ var (
 	meshPSKFile     = flag.String("mesh-psk-file", defaultMeshPSKFile(), "if non-empty, path to file containing the mesh pre-shared key file. It should contain some hex string; whitespace is trimmed.")
 	meshWith        = flag.String("mesh-with", "", "optional comma-separated list of hostnames to mesh with; the server's own hostname can be in the list")
 	bootstrapDNS    = flag.String("bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns")
-	unpublishedDNS  = flag.String("unpublished-bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns and not publish in the list")
+	unpublishedDNS  = flag.String("unpublished-bootstrap-dns-names", "", "optional comma-separated list of hostnames to make available at /bootstrap-dns and not publish in the list. If an entry contains a slash, the second part names a DNS record to poll for its TXT record with a `0` to `100` value for rollout percentage.")
 	verifyClients   = flag.Bool("verify-clients", false, "verify clients to this DERP server through a local tailscaled instance.")
 	verifyClientURL = flag.String("verify-client-url", "", "if non-empty, an admission controller URL for permitting client connections; see tailcfg.DERPAdmitClientRequest")
 	verifyFailOpen  = flag.Bool("verify-client-url-fail-open", true, "whether we fail open if --verify-client-url is unreachable")
@@ -191,7 +191,12 @@ func main() {
 			http.Error(w, "derp server disabled", http.StatusNotFound)
 		}))
 	}
-	mux.HandleFunc("/derp/probe", probeHandler)
+
+	// These two endpoints are the same. Different versions of the clients
+	// have assumes different paths over time so we support both.
+	mux.HandleFunc("/derp/probe", derphttp.ProbeHandler)
+	mux.HandleFunc("/derp/latency-check", derphttp.ProbeHandler)
+
 	go refreshBootstrapDNSLoop()
 	mux.HandleFunc("/bootstrap-dns", tsweb.BrowserHeaderHandlerFunc(handleBootstrapDNS))
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -368,17 +373,6 @@ func isChallengeChar(c rune) bool {
 	return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') ||
 		('0' <= c && c <= '9') ||
 		c == '.' || c == '-' || c == '_'
-}
-
-// probeHandler is the endpoint that js/wasm clients hit to measure
-// DERP latency, since they can't do UDP STUN queries.
-func probeHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "HEAD", "GET":
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-	default:
-		http.Error(w, "bogus probe method", http.StatusMethodNotAllowed)
-	}
 }
 
 var validProdHostname = regexp.MustCompile(`^derp([^.]*)\.tailscale\.com\.?$`)

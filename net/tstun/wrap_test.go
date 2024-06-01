@@ -551,7 +551,7 @@ func TestPeerAPIBypass(t *testing.T) {
 			tt.w.SetFilter(tt.filter)
 			tt.w.disableTSMPRejected = true
 			tt.w.logf = t.Logf
-			if got := tt.w.filterPacketInboundFromWireGuard(p, nil); got != tt.want {
+			if got := tt.w.filterPacketInboundFromWireGuard(p, nil, nil); got != tt.want {
 				t.Errorf("got = %v; want %v", got, tt.want)
 			}
 		})
@@ -581,7 +581,7 @@ func TestFilterDiscoLoop(t *testing.T) {
 
 	p := new(packet.Parsed)
 	p.Decode(pkt)
-	got := tw.filterPacketInboundFromWireGuard(p, nil)
+	got := tw.filterPacketInboundFromWireGuard(p, nil, nil)
 	if got != filter.DropSilently {
 		t.Errorf("got %v; want DropSilently", got)
 	}
@@ -592,7 +592,7 @@ func TestFilterDiscoLoop(t *testing.T) {
 	memLog.Reset()
 	pp := new(packet.Parsed)
 	pp.Decode(pkt)
-	got = tw.filterPacketOutboundToWireGuard(pp)
+	got = tw.filterPacketOutboundToWireGuard(pp, nil)
 	if got != filter.DropSilently {
 		t.Errorf("got %v; want DropSilently", got)
 	}
@@ -601,7 +601,9 @@ func TestFilterDiscoLoop(t *testing.T) {
 	}
 }
 
-func TestNATCfg(t *testing.T) {
+// TODO(andrew-d): refactor this test to no longer use addrFam, after #11945
+// removed it in peerConfigFromWGConfig
+func TestPeerCfg_NAT(t *testing.T) {
 	node := func(ip, masqIP netip.Addr, otherAllowedIPs ...netip.Prefix) wgcfg.Peer {
 		p := wgcfg.Peer{
 			PublicKey: key.NewNode().Public(),
@@ -651,11 +653,17 @@ func TestNATCfg(t *testing.T) {
 			publicIP = netip.MustParseAddr("2001:4860:4860::8888")
 		}
 
+		type dnatTest struct {
+			src  netip.Addr
+			dst  netip.Addr
+			want netip.Addr // new destination after DNAT
+		}
+
 		tests := []struct {
 			name    string
 			wcfg    *wgcfg.Config
 			snatMap map[netip.Addr]netip.Addr // dst -> src
-			dnatMap map[netip.Addr]netip.Addr
+			dnat    []dnatTest
 		}{
 			{
 				name: "no-cfg",
@@ -665,10 +673,10 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfNativeIP,
 					subnetIP: selfNativeIP,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfEIP1,
-					selfEIP2:     selfEIP2,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfEIP2},
 				},
 			},
 			{
@@ -677,19 +685,19 @@ func TestNATCfg(t *testing.T) {
 					Addresses: selfAddrs,
 					Peers: []wgcfg.Peer{
 						node(peer1IP, noIP),
-						node(peer2IP, selfEIP1),
+						node(peer2IP, selfEIP2),
 					},
 				},
 				snatMap: map[netip.Addr]netip.Addr{
 					peer1IP:  selfNativeIP,
-					peer2IP:  selfEIP1,
+					peer2IP:  selfEIP2,
 					subnetIP: selfNativeIP,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfNativeIP,
-					selfEIP2:     selfEIP2,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfNativeIP}, // NATed
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -706,11 +714,11 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfEIP2,
 					subnetIP: selfNativeIP,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfNativeIP,
-					selfEIP2:     selfNativeIP,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -727,11 +735,11 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfEIP2,
 					subnetIP: selfEIP2,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfNativeIP,
-					selfEIP2:     selfNativeIP,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -748,11 +756,11 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfEIP2,
 					publicIP: selfEIP2,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfNativeIP,
-					selfEIP2:     selfNativeIP,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -769,11 +777,11 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfNativeIP,
 					subnetIP: selfNativeIP,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP1:     selfEIP1,
-					selfEIP2:     selfEIP2,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer1IP, selfEIP1, selfEIP1},
+					{peer2IP, selfEIP2, selfEIP2},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 			{
@@ -790,29 +798,29 @@ func TestNATCfg(t *testing.T) {
 					peer2IP:  selfEIP2,
 					publicIP: selfEIP2,
 				},
-				dnatMap: map[netip.Addr]netip.Addr{
-					selfNativeIP: selfNativeIP,
-					selfEIP2:     selfNativeIP,
-					subnetIP:     subnetIP,
+				dnat: []dnatTest{
+					{selfNativeIP, selfNativeIP, selfNativeIP},
+					{peer2IP, selfEIP2, selfNativeIP},
+					{peer2IP, subnetIP, subnetIP},
 				},
 			},
 		}
 
 		for _, tc := range tests {
 			t.Run(fmt.Sprintf("%v/%v", addrFam, tc.name), func(t *testing.T) {
-				ncfg := natConfigFromWGConfig(tc.wcfg, addrFam)
+				pcfg := peerConfigTableFromWGConfig(tc.wcfg)
 				for peer, want := range tc.snatMap {
-					if got := ncfg.selectSrcIP(selfNativeIP, peer); got != want {
+					if got := pcfg.selectSrcIP(selfNativeIP, peer); got != want {
 						t.Errorf("selectSrcIP[%v]: got %v; want %v", peer, got, want)
 					}
 				}
-				for dstIP, want := range tc.dnatMap {
-					if got := ncfg.mapDstIP(dstIP); got != want {
-						t.Errorf("mapDstIP[%v]: got %v; want %v", dstIP, got, want)
+				for i, dt := range tc.dnat {
+					if got := pcfg.mapDstIP(dt.src, dt.dst); got != dt.want {
+						t.Errorf("dnat[%d]: mapDstIP[%v, %v]: got %v; want %v", i, dt.src, dt.dst, got, dt.want)
 					}
 				}
 				if t.Failed() {
-					t.Logf("%v", ncfg)
+					t.Logf("%v", pcfg)
 				}
 			})
 		}

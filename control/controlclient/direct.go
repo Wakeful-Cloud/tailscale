@@ -80,6 +80,7 @@ type Direct struct {
 	onClientVersion            func(*tailcfg.ClientVersion) // or nil
 	onControlTime              func(time.Time)              // or nil
 	onTailnetDefaultAutoUpdate func(bool)                   // or nil
+	panicOnUse                 bool                         // if true, panic if client is used (for testing)
 
 	dialPlan ControlDialPlanner // can be nil
 
@@ -310,6 +311,9 @@ func NewDirect(opts Options) (*Direct, error) {
 		}
 		c.serverNoiseKey = key.NewMachine().Public() // prevent early error before hitting test client
 	}
+	if strings.Contains(opts.ServerURL, "controlplane.tailscale.com") && envknob.Bool("TS_PANIC_IF_HIT_MAIN_CONTROL") {
+		c.panicOnUse = true
+	}
 	return c, nil
 }
 
@@ -397,9 +401,12 @@ func (c *Direct) TryLogout(ctx context.Context) error {
 	return err
 }
 
-func (c *Direct) TryLogin(ctx context.Context, t *tailcfg.Oauth2Token, flags LoginFlags) (url string, err error) {
-	c.logf("[v1] direct.TryLogin(token=%v, flags=%v)", t != nil, flags)
-	return c.doLoginOrRegen(ctx, loginOpt{Token: t, Flags: flags})
+func (c *Direct) TryLogin(ctx context.Context, flags LoginFlags) (url string, err error) {
+	if strings.Contains(c.serverURL, "controlplane.tailscale.com") && envknob.Bool("TS_PANIC_IF_HIT_MAIN_CONTROL") {
+		panic(fmt.Sprintf("[unexpected] controlclient: TryLogin called on %s; tainted=%v", c.serverURL, c.panicOnUse))
+	}
+	c.logf("[v1] direct.TryLogin(flags=%v)", flags)
+	return c.doLoginOrRegen(ctx, loginOpt{Flags: flags})
 }
 
 // WaitLoginURL sits in a long poll waiting for the user to authenticate at url.
@@ -434,7 +441,6 @@ func (c *Direct) SetExpirySooner(ctx context.Context, expiry time.Time) error {
 }
 
 type loginOpt struct {
-	Token  *tailcfg.Oauth2Token
 	Flags  LoginFlags
 	Regen  bool // generate a new nodekey, can be overridden in doLogin
 	URL    string
@@ -459,6 +465,9 @@ func (c *Direct) hostInfoLocked() *tailcfg.Hostinfo {
 }
 
 func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, newURL string, nks tkatype.MarshaledSignature, err error) {
+	if c.panicOnUse {
+		panic("tainted client")
+	}
 	c.mu.Lock()
 	persist := c.persist.AsStruct()
 	tryingNewKey := c.tryingNewKey
@@ -600,10 +609,9 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	c.logf("RegisterReq: onode=%v node=%v fup=%v nks=%v",
 		request.OldNodeKey.ShortString(),
 		request.NodeKey.ShortString(), opt.URL != "", len(nodeKeySignature) > 0)
-	if opt.Token != nil || authKey != "" {
+	if authKey != "" {
 		request.Auth = &tailcfg.RegisterResponseAuth{
-			Oauth2Token: opt.Token,
-			AuthKey:     authKey,
+			AuthKey: authKey,
 		}
 	}
 	err = signRegisterRequest(&request, c.serverURL, c.serverLegacyKey, machinePrivKey.Public())
@@ -832,6 +840,9 @@ const watchdogTimeout = 120 * time.Second
 //
 // If nu is nil, OmitPeers will be set to true.
 func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu NetmapUpdater) error {
+	if c.panicOnUse {
+		panic("tainted client")
+	}
 	if isStreaming && nu == nil {
 		panic("cb must be non-nil if isStreaming is true")
 	}
@@ -1528,6 +1539,9 @@ func (c *Direct) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) (err er
 }
 
 func (c *Direct) DoNoiseRequest(req *http.Request) (*http.Response, error) {
+	if c.panicOnUse {
+		panic("tainted client")
+	}
 	nc, err := c.getNoiseClient()
 	if err != nil {
 		return nil, err
@@ -1623,6 +1637,9 @@ func (c *Direct) ReportHealthChange(sys health.Subsystem, sysErr error) {
 	nodeKey, ok := c.GetPersist().PublicNodeKeyOK()
 	if !ok {
 		return
+	}
+	if c.panicOnUse {
+		panic("tainted client")
 	}
 	req := &tailcfg.HealthChangeRequest{
 		Subsys:  string(sys),

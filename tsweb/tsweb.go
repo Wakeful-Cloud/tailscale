@@ -299,7 +299,7 @@ type retHandler struct {
 // ServeHTTP implements the http.Handler interface.
 func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	msg := AccessLogRecord{
-		When:       h.opts.Now(),
+		Time:       h.opts.Now(),
 		RemoteAddr: r.RemoteAddr,
 		Proto:      r.Proto,
 		TLS:        r.TLS != nil,
@@ -312,19 +312,18 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var bucket string
-	bumpStartIfNeeded := func() {}
+	var startRecorded bool
 	if bs := h.opts.BucketedStats; bs != nil {
 		bucket = bs.bucketForRequest(r)
 		if bs.Started != nil {
 			switch v := bs.Started.Map.Get(bucket).(type) {
 			case *expvar.Int:
 				// If we've already seen this bucket for, count it immediately.
-				v.Add(1)
-			case nil:
 				// Otherwise, for newly seen paths, only count retroactively
 				// (so started-finished doesn't go negative) so we don't fill
 				// this LabelMap up with internet scanning spam.
-				bumpStartIfNeeded = func() { bs.Started.Add(bucket, 1) }
+				v.Add(1)
+				startRecorded = true
 			}
 		}
 	}
@@ -372,7 +371,7 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lw.code = 200
 	}
 
-	msg.Seconds = h.opts.Now().Sub(msg.When).Seconds()
+	msg.Seconds = h.opts.Now().Sub(msg.Time).Seconds()
 	msg.Code = lw.code
 	msg.Bytes = lw.bytes
 
@@ -437,13 +436,18 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if bs := h.opts.BucketedStats; bs != nil && bs.Finished != nil {
-		// Only increment metrics for buckets that result in good HTTP statuses.
+		// Only increment metrics for buckets that result in good HTTP statuses
+		// or when we know the start was already counted.
 		// Otherwise they get full of internet scanning noise. Only filtering 404
 		// gets most of the way there but there are also plenty of URLs that are
 		// almost right but result in 400s too. Seem easier to just only ignore
 		// all 4xx and 5xx.
-		if msg.Code < 400 {
-			bumpStartIfNeeded()
+		if startRecorded {
+			bs.Finished.Add(bucket, 1)
+		} else if msg.Code < 400 {
+			// This is the first non-error request for this bucket,
+			// so count it now retroactively.
+			bs.Started.Add(bucket, 1)
 			bs.Finished.Add(bucket, 1)
 		}
 	}

@@ -27,10 +27,10 @@ import (
 type Child struct {
 	*dirfs.Child
 
-	// BaseURL is the base URL of the WebDAV service to which we'll proxy
+	// BaseURL returns the base URL of the WebDAV service to which we'll proxy
 	// requests for this Child. We will append the filename from the original
 	// URL to this.
-	BaseURL string
+	BaseURL func() (string, error)
 
 	// Transport (if specified) is the http transport to use when communicating
 	// with this Child's WebDAV service.
@@ -81,23 +81,38 @@ type Handler struct {
 	staticRoot string
 }
 
+var cacheInvalidatingMethods = map[string]bool{
+	"PUT":       true,
+	"POST":      true,
+	"COPY":      true,
+	"MKCOL":     true,
+	"MOVE":      true,
+	"PROPPATCH": true,
+	"DELETE":    true,
+}
+
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "PROPFIND" {
-		h.handlePROPFIND(w, r)
+	pathComponents := shared.CleanAndSplit(r.URL.Path)
+	mpl := h.maxPathLength(r)
+
+	switch r.Method {
+	case "PROPFIND":
+		h.handlePROPFIND(w, r, pathComponents, mpl)
+		return
+	case "LOCK":
+		h.handleLOCK(w, r, pathComponents, mpl)
 		return
 	}
 
-	if r.Method != "GET" {
-		// If the user is performing a modification (e.g. PUT, MKDIR, etc),
+	_, shouldInvalidate := cacheInvalidatingMethods[r.Method]
+	if shouldInvalidate {
+		// If the user is performing a modification (e.g. PUT, MKDIR, etc.),
 		// we need to invalidate the StatCache to make sure we're not knowingly
 		// showing stale stats.
-		// TODO(oxtoacart): maybe be more selective about invalidating cache
+		// TODO(oxtoacart): maybe only invalidate specific paths
 		h.StatCache.invalidate()
 	}
-
-	mpl := h.maxPathLength(r)
-	pathComponents := shared.CleanAndSplit(r.URL.Path)
 
 	if len(pathComponents) >= mpl {
 		h.delegate(mpl, pathComponents[mpl-1:], w, r)
@@ -130,6 +145,8 @@ func (h *Handler) handle(w http.ResponseWriter, r *http.Request) {
 
 // delegate sends the request to the Child WebDAV server.
 func (h *Handler) delegate(mpl int, pathComponents []string, w http.ResponseWriter, r *http.Request) {
+	rewriteIfHeader(r, pathComponents, mpl)
+
 	dest := r.Header.Get("Destination")
 	if dest != "" {
 		// Rewrite destination header
@@ -154,9 +171,15 @@ func (h *Handler) delegate(mpl int, pathComponents []string, w http.ResponseWrit
 		return
 	}
 
-	u, err := url.Parse(child.BaseURL)
+	baseURL, err := child.BaseURL()
 	if err != nil {
-		h.logf("warning: parse base URL %s failed: %s", child.BaseURL, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		h.logf("warning: parse base URL %s failed: %s", baseURL, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

@@ -41,6 +41,12 @@ const (
 
 	messageNameserverCreationFailed  = "Failed creating nameserver resources: %v"
 	messageMultipleDNSConfigsPresent = "Multiple DNSConfig resources found in cluster. Please ensure no more than one is present."
+
+	defaultNameserverImageRepo = "tailscale/k8s-nameserver"
+	// TODO (irbekrm): once we start publishing nameserver images for stable
+	// track, replace 'unstable' here with the version of this operator
+	// instance.
+	defaultNameserverImageTag = "unstable"
 )
 
 // NameserverReconciler knows how to create nameserver resources in cluster in
@@ -141,7 +147,7 @@ func (a *NameserverReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 		return res, fmt.Errorf("error getting Service: %w", err)
 	}
 	if ip := svc.Spec.ClusterIP; ip != "" && ip != "None" {
-		dnsCfg.Status.NameserverStatus = &tsapi.NameserverStatus{
+		dnsCfg.Status.Nameserver = &tsapi.NameserverStatus{
 			IP: ip,
 		}
 		return setStatus(&dnsCfg, tsapi.NameserverReady, metav1.ConditionTrue, reasonNameserverCreated, reasonNameserverCreated)
@@ -163,11 +169,13 @@ func (a *NameserverReconciler) maybeProvision(ctx context.Context, tsDNSCfg *tsa
 		ownerRefs: []metav1.OwnerReference{*metav1.NewControllerRef(tsDNSCfg, tsapi.SchemeGroupVersion.WithKind("DNSConfig"))},
 		namespace: a.tsNamespace,
 		labels:    labels,
+		imageRepo: defaultNameserverImageRepo,
+		imageTag:  defaultNameserverImageTag,
 	}
-	if tsDNSCfg.Spec.Nameserver.Image.Repo != "" {
+	if tsDNSCfg.Spec.Nameserver.Image != nil && tsDNSCfg.Spec.Nameserver.Image.Repo != "" {
 		dCfg.imageRepo = tsDNSCfg.Spec.Nameserver.Image.Repo
 	}
-	if tsDNSCfg.Spec.Nameserver.Image.Tag != "" {
+	if tsDNSCfg.Spec.Nameserver.Image != nil && tsDNSCfg.Spec.Nameserver.Image.Tag != "" {
 		dCfg.imageTag = tsDNSCfg.Spec.Nameserver.Image.Tag
 	}
 	for _, deployable := range []deployable{saDeployable, deployDeployable, svcDeployable, cmDeployable} {

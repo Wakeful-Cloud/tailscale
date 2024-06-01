@@ -427,7 +427,7 @@ ConnectorCondition contains condition information for a Connector.
         </td>
         <td>false</td>
       </tr><tr>
-        <td><b><a href="#dnsconfigstatusnameserverstatus">nameserverStatus</a></b></td>
+        <td><b><a href="#dnsconfigstatusnameserver">nameserver</a></b></td>
         <td>object</td>
         <td>
           <br/>
@@ -503,7 +503,7 @@ ConnectorCondition contains condition information for a Connector.
 </table>
 
 
-### DNSConfig.status.nameserverStatus
+### DNSConfig.status.nameserver
 <sup><sup>[↩ Parent](#dnsconfigstatus)</sup></sup>
 
 
@@ -603,7 +603,7 @@ Specification of the desired state of the ProxyClass resource. https://git.k8s.i
         <td><b><a href="#proxyclassspecmetrics">metrics</a></b></td>
         <td>object</td>
         <td>
-          Configuration for proxy metrics. Metrics are currently not supported for egress proxies and for Ingress proxies that have been configured with tailscale.com/experimental-forward-cluster-traffic-via-ingress annotation.<br/>
+          Configuration for proxy metrics. Metrics are currently not supported for egress proxies and for Ingress proxies that have been configured with tailscale.com/experimental-forward-cluster-traffic-via-ingress annotation. Note that the metrics are currently considered unstable and will likely change in breaking ways in the future - we only recommend that you use those for debugging purposes.<br/>
         </td>
         <td>false</td>
       </tr><tr>
@@ -622,7 +622,7 @@ Specification of the desired state of the ProxyClass resource. https://git.k8s.i
 
 
 
-Configuration for proxy metrics. Metrics are currently not supported for egress proxies and for Ingress proxies that have been configured with tailscale.com/experimental-forward-cluster-traffic-via-ingress annotation.
+Configuration for proxy metrics. Metrics are currently not supported for egress proxies and for Ingress proxies that have been configured with tailscale.com/experimental-forward-cluster-traffic-via-ingress annotation. Note that the metrics are currently considered unstable and will likely change in breaking ways in the future - we only recommend that you use those for debugging purposes.
 
 <table>
     <thead>
