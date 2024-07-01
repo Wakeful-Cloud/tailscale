@@ -5,10 +5,10 @@ package ipnlocal
 
 import (
 	"cmp"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"runtime"
 	"slices"
 	"strings"
@@ -448,7 +448,7 @@ func (pm *profileManager) updateHealth() {
 	if !pm.prefs.Valid() {
 		return
 	}
-	pm.health.SetCheckForUpdates(pm.prefs.AutoUpdate().Check)
+	pm.health.SetAutoUpdatePrefs(pm.prefs.AutoUpdate().Check, pm.prefs.AutoUpdate().Apply)
 }
 
 // NewProfile creates and switches to a new unnamed profile. The new profile is
