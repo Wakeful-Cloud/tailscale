@@ -26,7 +26,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -176,7 +175,7 @@ type Impl struct {
 	ProcessSubnets bool
 
 	ipstack       *stack.Stack
-	linkEP        *channel.Endpoint
+	linkEP        *linkEndpoint
 	tundev        *tstun.Wrapper
 	e             wgengine.Engine
 	pm            *proxymap.Mapper
@@ -285,7 +284,11 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 			return nil, fmt.Errorf("could not disable TCP RACK: %v", tcpipErr)
 		}
 	}
-	linkEP := channel.New(512, uint32(tstun.DefaultTUNMTU()), "")
+	linkEP := newLinkEndpoint(512, uint32(tstun.DefaultTUNMTU()), "")
+	if runtime.GOOS == "linux" {
+		// TODO(jwhited): add Windows support https://github.com/tailscale/corp/issues/21874
+		linkEP.SupportedGSOKind = stack.HostGSOSupported
+	}
 	if tcpipProblem := ipstack.CreateNIC(nicID, linkEP); tcpipProblem != nil {
 		return nil, fmt.Errorf("could not create netstack NIC: %v", tcpipProblem)
 	}
@@ -1116,11 +1119,9 @@ func (ns *Impl) shouldHandlePing(p *packet.Parsed) (_ netip.Addr, ok bool) {
 func netaddrIPFromNetstackIP(s tcpip.Address) netip.Addr {
 	switch s.Len() {
 	case 4:
-		s := s.As4()
-		return netaddr.IPv4(s[0], s[1], s[2], s[3])
+		return netip.AddrFrom4(s.As4())
 	case 16:
-		s := s.As16()
-		return netip.AddrFrom16(s).Unmap()
+		return netip.AddrFrom16(s.As16()).Unmap()
 	}
 	return netip.Addr{}
 }
