@@ -23,7 +23,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"runtime"
 	"slices"
@@ -60,9 +59,10 @@ import (
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/osdiag"
-	"tailscale.com/util/osuser"
 	"tailscale.com/util/progresstracking"
 	"tailscale.com/util/rands"
+	"tailscale.com/util/testenv"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/magicsock"
 )
@@ -141,6 +141,7 @@ var handler = map[string]localAPIHandler{
 	"update/install":              (*Handler).serveUpdateInstall,
 	"update/progress":             (*Handler).serveUpdateProgress,
 	"upload-client-metrics":       (*Handler).serveUploadClientMetrics,
+	"usermetrics":                 (*Handler).serveUserMetrics,
 	"watch-ipn-bus":               (*Handler).serveWatchIPNBus,
 	"whois":                       (*Handler).serveWhoIs,
 }
@@ -180,12 +181,8 @@ type Handler struct {
 	// cert fetching access.
 	PermitCert bool
 
-	// ConnIdentity is the identity of the client connected to the Handler.
-	ConnIdentity *ipnauth.ConnIdentity
-
-	// Test-only override for connIsLocalAdmin method. If non-nil,
-	// connIsLocalAdmin returns this value.
-	testConnIsLocalAdmin *bool
+	// Actor is the identity of the client connected to the Handler.
+	Actor ipnauth.Actor
 
 	b            *ipnlocal.LocalBackend
 	logf         logger.Logf
@@ -569,6 +566,18 @@ func (h *Handler) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	clientmetric.WritePrometheusExpositionFormat(w)
+}
+
+// TODO(kradalby): Remove this once we have landed on a final set of
+// metrics to export to clients and consider the metrics stable.
+var debugUsermetricsEndpoint = envknob.RegisterBool("TS_DEBUG_USER_METRICS")
+
+func (h *Handler) serveUserMetrics(w http.ResponseWriter, r *http.Request) {
+	if !testenv.InTest() && !debugUsermetricsEndpoint() {
+		http.Error(w, "usermetrics debug flag not enabled", http.StatusForbidden)
+		return
+	}
+	usermetric.Handler(w, r)
 }
 
 func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
@@ -1050,7 +1059,7 @@ func authorizeServeConfigForGOOSAndUserContext(goos string, configIn *ipn.ServeC
 	if !configIn.HasPathHandler() {
 		return nil
 	}
-	if h.connIsLocalAdmin() {
+	if h.Actor.IsLocalAdmin(h.b.OperatorUserID()) {
 		return nil
 	}
 	switch goos {
@@ -1064,104 +1073,6 @@ func authorizeServeConfigForGOOSAndUserContext(goos string, configIn *ipn.ServeC
 		panic("unreachable")
 	}
 
-}
-
-// connIsLocalAdmin reports whether the connected client has administrative
-// access to the local machine, for whatever that means with respect to the
-// current OS.
-//
-// This is useful because tailscaled itself always runs with elevated rights:
-// we want to avoid privilege escalation for certain mutative operations.
-func (h *Handler) connIsLocalAdmin() bool {
-	if h.testConnIsLocalAdmin != nil {
-		return *h.testConnIsLocalAdmin
-	}
-	if h.ConnIdentity == nil {
-		h.logf("[unexpected] missing ConnIdentity in LocalAPI Handler")
-		return false
-	}
-	switch runtime.GOOS {
-	case "windows":
-		tok, err := h.ConnIdentity.WindowsToken()
-		if err != nil {
-			if !errors.Is(err, ipnauth.ErrNotImplemented) {
-				h.logf("ipnauth.ConnIdentity.WindowsToken() error: %v", err)
-			}
-			return false
-		}
-		defer tok.Close()
-
-		return tok.IsElevated()
-
-	case "darwin":
-		// Unknown, or at least unchecked on sandboxed macOS variants. Err on
-		// the side of less permissions.
-		//
-		// authorizeServeConfigForGOOSAndUserContext should not call
-		// connIsLocalAdmin on sandboxed variants anyway.
-		if version.IsSandboxedMacOS() {
-			return false
-		}
-		// This is a standalone tailscaled setup, use the same logic as on
-		// Linux.
-		fallthrough
-	case "linux":
-		uid, ok := h.ConnIdentity.Creds().UserID()
-		if !ok {
-			return false
-		}
-		// root is always admin.
-		if uid == "0" {
-			return true
-		}
-		// if non-root, must be operator AND able to execute "sudo tailscale".
-		operatorUID := h.b.OperatorUserID()
-		if operatorUID != "" && uid != operatorUID {
-			return false
-		}
-		u, err := osuser.LookupByUID(uid)
-		if err != nil {
-			return false
-		}
-		// Short timeout just in case sudo hangs for some reason.
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		if err := exec.CommandContext(ctx, "sudo", "--other-user="+u.Name, "--list", "tailscale").Run(); err != nil {
-			return false
-		}
-		return true
-
-	default:
-		return false
-	}
-}
-
-func (h *Handler) getUsername() (string, error) {
-	if h.ConnIdentity == nil {
-		h.logf("[unexpected] missing ConnIdentity in LocalAPI Handler")
-		return "", errors.New("missing ConnIdentity")
-	}
-	switch runtime.GOOS {
-	case "windows":
-		tok, err := h.ConnIdentity.WindowsToken()
-		if err != nil {
-			return "", fmt.Errorf("get windows token: %w", err)
-		}
-		defer tok.Close()
-		return tok.Username()
-	case "darwin", "linux":
-		uid, ok := h.ConnIdentity.Creds().UserID()
-		if !ok {
-			return "", errors.New("missing user ID")
-		}
-		u, err := osuser.LookupByUID(uid)
-		if err != nil {
-			return "", fmt.Errorf("lookup user: %w", err)
-		}
-		return u.Username, nil
-	default:
-		return "", errors.New("unsupported OS")
-	}
 }
 
 func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request) {
@@ -1752,10 +1663,17 @@ func (ww *multiFilePostResponseWriter) Write(p []byte) (int, error) {
 }
 
 func (ww *multiFilePostResponseWriter) Flush(w http.ResponseWriter) error {
-	maps.Copy(w.Header(), ww.Header())
-	w.WriteHeader(ww.statusCode)
-	_, err := io.Copy(w, ww.body)
-	return err
+	if ww.header != nil {
+		maps.Copy(w.Header(), ww.header)
+	}
+	if ww.statusCode > 0 {
+		w.WriteHeader(ww.statusCode)
+	}
+	if ww.body != nil {
+		_, err := io.Copy(w, ww.body)
+		return err
+	}
+	return nil
 }
 
 func (h *Handler) singleFilePut(
@@ -2837,7 +2755,7 @@ func (h *Handler) serveShares(w http.ResponseWriter, r *http.Request) {
 		}
 		if drive.AllowShareAs() {
 			// share as the connected user
-			username, err := h.getUsername()
+			username, err := h.Actor.Username()
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return

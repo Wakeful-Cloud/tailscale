@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"syscall"
 	"time"
 
 	"github.com/mdlayher/socket"
@@ -56,7 +57,7 @@ func parseTimestampFromCmsgs(oob []byte) (time.Time, error) {
 	return time.Time{}, errors.New("failed to parse timestamp from cmsgs")
 }
 
-func measureSTUNRTTKernel(conn io.ReadWriteCloser, dst netip.AddrPort) (rtt time.Duration, err error) {
+func measureSTUNRTTKernel(conn io.ReadWriteCloser, hostname string, dst netip.AddrPort) (rtt time.Duration, err error) {
 	sconn, ok := conn.(*socket.Conn)
 	if !ok {
 		return 0, fmt.Errorf("conn of unexpected type: %T", conn)
@@ -137,10 +138,32 @@ func measureSTUNRTTKernel(conn io.ReadWriteCloser, dst netip.AddrPort) (rtt time
 
 }
 
-func protocolSupportsKernelTS(p protocol) bool {
-	if p == protocolSTUN {
-		return true
+func getProtocolSupportInfo(p protocol) protocolSupportInfo {
+	switch p {
+	case protocolSTUN:
+		return protocolSupportInfo{
+			kernelTS:    true,
+			userspaceTS: true,
+			stableConn:  true,
+		}
+	case protocolHTTPS:
+		return protocolSupportInfo{
+			kernelTS:    false,
+			userspaceTS: true,
+			stableConn:  true,
+		}
+	case protocolTCP:
+		return protocolSupportInfo{
+			kernelTS:    true,
+			userspaceTS: false,
+			stableConn:  true,
+		}
+		// TODO(jwhited): add ICMP
 	}
-	// TODO: jwhited support ICMP
-	return false
+	return protocolSupportInfo{}
+}
+
+func setSOReuseAddr(fd uintptr) error {
+	// we may restart faster than TIME_WAIT can clear
+	return syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
 }
