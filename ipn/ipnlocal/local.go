@@ -38,6 +38,7 @@ import (
 	"go4.org/mem"
 	"go4.org/netipx"
 	xmaps "golang.org/x/exp/maps"
+	"golang.org/x/net/dns/dnsmessage"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"tailscale.com/appc"
 	"tailscale.com/client/tailscale/apitype"
@@ -118,9 +119,6 @@ import (
 	"tailscale.com/wgengine/wgcfg/nmcfg"
 )
 
-var metricAdvertisedRoutes = usermetric.NewGauge(
-	"tailscaled_advertised_routes", "Number of advertised network routes (e.g. by a subnet router)")
-
 var controlDebugFlags = getControlDebugFlags()
 
 func getControlDebugFlags() []string {
@@ -183,6 +181,7 @@ type LocalBackend struct {
 	statsLogf             logger.Logf        // for printing peers stats on change
 	sys                   *tsd.System
 	health                *health.Tracker // always non-nil
+	metrics               metrics
 	e                     wgengine.Engine // non-nil; TODO(bradfitz): remove; use sys
 	store                 ipn.StateStore  // non-nil; TODO(bradfitz): remove; use sys
 	dialer                *tsdial.Dialer  // non-nil; TODO(bradfitz): remove; use sys
@@ -268,6 +267,7 @@ type LocalBackend struct {
 	keyExpired       bool
 	authURL          string    // non-empty if not Running
 	authURLTime      time.Time // when the authURL was received from the control server
+	interact         bool      // indicates whether a user requested interactive login
 	egg              bool
 	prevIfState      *netmon.State
 	peerAPIServer    *peerAPIServer // or nil
@@ -375,6 +375,11 @@ func (b *LocalBackend) HealthTracker() *health.Tracker {
 	return b.health
 }
 
+// UserMetricsRegistry returns the usermetrics registry for the backend
+func (b *LocalBackend) UserMetricsRegistry() *usermetric.Registry {
+	return b.sys.UserMetricsRegistry()
+}
+
 // NetMon returns the network monitor for the backend.
 func (b *LocalBackend) NetMon() *netmon.Monitor {
 	return b.sys.NetMon.Get()
@@ -382,6 +387,21 @@ func (b *LocalBackend) NetMon() *netmon.Monitor {
 
 type updateStatus struct {
 	started bool
+}
+
+type metrics struct {
+	// advertisedRoutes is a metric that reports the number of network routes that are advertised by the local node.
+	// This informs the user of how many routes are being advertised by the local node, excluding exit routes.
+	advertisedRoutes *usermetric.Gauge
+
+	// approvedRoutes is a metric that reports the number of network routes served by the local node and approved
+	// by the control server.
+	approvedRoutes *usermetric.Gauge
+
+	// primaryRoutes is a metric that reports the number of primary network routes served by the local node.
+	// A route being a primary route implies that the route is currently served by this node, and not by another
+	// subnet router in a high availability configuration.
+	primaryRoutes *usermetric.Gauge
 }
 
 // clientGen is a func that creates a control plane client.
@@ -427,6 +447,15 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	captiveCtx, captiveCancel := context.WithCancel(ctx)
 	captiveCancel()
 
+	m := metrics{
+		advertisedRoutes: sys.UserMetricsRegistry().NewGauge(
+			"tailscaled_advertised_routes", "Number of advertised network routes (e.g. by a subnet router)"),
+		approvedRoutes: sys.UserMetricsRegistry().NewGauge(
+			"tailscaled_approved_routes", "Number of approved network routes (e.g. by a subnet router)"),
+		primaryRoutes: sys.UserMetricsRegistry().NewGauge(
+			"tailscaled_primary_routes", "Number of network routes for which this node is a primary router (in high availability configuration)"),
+	}
+
 	b := &LocalBackend{
 		ctx:                   ctx,
 		ctxCancel:             cancel,
@@ -435,6 +464,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		statsLogf:             logger.LogOnChange(logf, 5*time.Minute, clock.Now),
 		sys:                   sys,
 		health:                sys.HealthTracker(),
+		metrics:               m,
 		e:                     e,
 		dialer:                dialer,
 		store:                 store,
@@ -510,8 +540,8 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		currentShares := b.pm.prefs.DriveShares()
 		if currentShares.Len() > 0 {
 			var shares []*drive.Share
-			for i := range currentShares.Len() {
-				shares = append(shares, currentShares.At(i).AsStruct())
+			for _, share := range currentShares.All() {
+				shares = append(shares, share.AsStruct())
 			}
 			fs.SetShares(shares)
 		}
@@ -594,6 +624,59 @@ func (b *LocalBackend) SetComponentDebugLogging(component string, until time.Tim
 	}
 	mak.Set(&b.componentLogUntil, component, newSt)
 	return nil
+}
+
+// GetDNSOSConfig returns the base OS DNS configuration, as seen by the DNS manager.
+func (b *LocalBackend) GetDNSOSConfig() (dns.OSConfig, error) {
+	manager, ok := b.sys.DNSManager.GetOK()
+	if !ok {
+		return dns.OSConfig{}, errors.New("DNS manager not available")
+	}
+	return manager.GetBaseConfig()
+}
+
+// QueryDNS performs a DNS query for name and queryType using the built-in DNS resolver, and returns
+// the raw DNS response and the resolvers that are were able to handle the query (the internal forwarder
+// may race multiple resolvers).
+func (b *LocalBackend) QueryDNS(name string, queryType dnsmessage.Type) (res []byte, resolvers []*dnstype.Resolver, err error) {
+	manager, ok := b.sys.DNSManager.GetOK()
+	if !ok {
+		return nil, nil, errors.New("DNS manager not available")
+	}
+	fqdn, err := dnsname.ToFQDN(name)
+	if err != nil {
+		b.logf("DNSQuery: failed to parse FQDN %q: %v", name, err)
+		return nil, nil, err
+	}
+	n, err := dnsmessage.NewName(fqdn.WithTrailingDot())
+	if err != nil {
+		b.logf("DNSQuery: failed to parse name %q: %v", name, err)
+		return nil, nil, err
+	}
+	from := netip.MustParseAddrPort("127.0.0.1:0")
+	db := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		OpCode:           0,
+		RecursionDesired: true,
+		ID:               1,
+	})
+	db.StartQuestions()
+	db.Question(dnsmessage.Question{
+		Name:  n,
+		Type:  queryType,
+		Class: dnsmessage.ClassINET,
+	})
+	q, err := db.Finish()
+	if err != nil {
+		b.logf("DNSQuery: failed to build query: %v", err)
+		return nil, nil, err
+	}
+	res, err = manager.Query(b.ctx, q, "tcp", from)
+	if err != nil {
+		b.logf("DNSQuery: failed to query %q: %v", name, err)
+		return nil, nil, err
+	}
+	rr := manager.Resolver().GetUpstreamResolvers(fqdn)
+	return res, rr, nil
 }
 
 // GetComponentDebugLogging gets the time that component's debug logging is
@@ -1129,6 +1212,8 @@ func (b *LocalBackend) WhoIsNodeKey(k key.NodePublic) (n tailcfg.NodeView, u tai
 	return n, u, false
 }
 
+var debugWhoIs = envknob.RegisterBool("TS_DEBUG_WHOIS")
+
 // WhoIs reports the node and user who owns the node with the given IP:port.
 // If the IP address is a Tailscale IP, the provided port may be 0.
 //
@@ -1143,6 +1228,14 @@ func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeVi
 	var zero tailcfg.NodeView
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	failf := func(format string, args ...any) (tailcfg.NodeView, tailcfg.UserProfile, bool) {
+		if debugWhoIs() {
+			args = append([]any{proto, ipp}, args...)
+			b.logf("whois(%q, %v) :"+format, args...)
+		}
+		return zero, u, false
+	}
 
 	nid, ok := b.nodeByAddr[ipp.Addr()]
 	if !ok {
@@ -1164,15 +1257,15 @@ func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeVi
 			}
 		}
 		if !ok {
-			return zero, u, false
+			return failf("no IP found in ProxyMapper for %v", ipp)
 		}
 		nid, ok = b.nodeByAddr[ip]
 		if !ok {
-			return zero, u, false
+			return failf("no node for proxymapped IP %v", ip)
 		}
 	}
 	if b.netMap == nil {
-		return zero, u, false
+		return failf("no netmap")
 	}
 	n, ok = b.peers[nid]
 	if !ok {
@@ -1184,7 +1277,7 @@ func (b *LocalBackend) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeVi
 	}
 	u, ok = b.netMap.UserProfiles[n.User()]
 	if !ok {
-		return zero, u, false
+		return failf("no userprofile for node %v", n.Key())
 	}
 	return n, u, true
 }
@@ -1359,10 +1452,6 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 			prefsChanged = true
 		}
 	}
-	if st.URL != "" {
-		b.authURL = st.URL
-		b.authURLTime = b.clock.Now()
-	}
 	if shouldAutoExitNode() {
 		// Re-evaluate exit node suggestion in case circumstances have changed.
 		_, err := b.suggestExitNodeLocked(curNetMap)
@@ -1478,7 +1567,7 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 	}
 	if st.URL != "" {
 		b.logf("Received auth URL: %.20v...", st.URL)
-		b.popBrowserAuthNow()
+		b.setAuthURL(st.URL)
 	}
 	b.stateMachine()
 	// This is currently (2020-07-28) necessary; conditionally disabling it is fragile!
@@ -2682,27 +2771,11 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 	// TODO(marwan-at-work): streaming background logs?
 	defer b.DeleteForegroundSession(sessionID)
 
-	var lastURLPop string // to dup suppress URL popups
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case n := <-ch:
-			// URLs flow into Notify.BrowseToURL via two means:
-			//    1. From MapResponse.PopBrowserURL, which already says they're dup
-			//       suppressed if identical, and that's done by the controlclient,
-			//       so this added later adds nothing.
-			//
-			//    2. From the controlclient auth routes, on register. This makes sure
-			//       we don't tell clients (mac, windows, android) to pop the same URL
-			//       multiple times.
-			if n != nil && n.BrowseToURL != nil {
-				if v := *n.BrowseToURL; v == lastURLPop {
-					n.BrowseToURL = nil
-				} else {
-					lastURLPop = v
-				}
-			}
 			if !fn(n) {
 				return
 			}
@@ -2833,20 +2906,52 @@ func (b *LocalBackend) sendFileNotify() {
 	b.send(n)
 }
 
-// popBrowserAuthNow shuts down the data plane and sends an auth URL
-// to the connected frontend, if any.
-func (b *LocalBackend) popBrowserAuthNow() {
+// setAuthURL sets the authURL and triggers [LocalBackend.popBrowserAuthNow] if the URL has changed.
+// This method is called when a new authURL is received from the control plane, meaning that either a user
+// has started a new interactive login (e.g., by running `tailscale login` or clicking Login in the GUI),
+// or the control plane was unable to authenticate this node non-interactively (e.g., due to key expiration).
+// b.interact indicates whether an interactive login is in progress.
+// If url is "", it is equivalent to calling [LocalBackend.resetAuthURLLocked] with b.mu held.
+func (b *LocalBackend) setAuthURL(url string) {
+	var popBrowser, keyExpired bool
+
 	b.mu.Lock()
-	url := b.authURL
-	expired := b.keyExpired
+	switch {
+	case url == "":
+		b.resetAuthURLLocked()
+	case b.authURL != url:
+		b.authURL = url
+		b.authURLTime = b.clock.Now()
+		// Always open the browser if the URL has changed.
+		// This includes the transition from no URL -> some URL.
+		popBrowser = true
+	default:
+		// Otherwise, only open it if the user explicitly requests interactive login.
+		popBrowser = b.interact
+	}
+	keyExpired = b.keyExpired
+	// Consume the StartLoginInteractive call, if any, that caused the control
+	// plane to send us this URL.
+	b.interact = false
 	b.mu.Unlock()
 
-	b.logf("popBrowserAuthNow: url=%v, key-expired=%v, seamless-key-renewal=%v", url != "", expired, b.seamlessRenewalEnabled())
+	if popBrowser {
+		b.popBrowserAuthNow(url, keyExpired)
+	}
+}
+
+// popBrowserAuthNow shuts down the data plane and sends an auth URL
+// to the connected frontend, if any.
+// keyExpired is the value of b.keyExpired upon entry and indicates
+// whether the node's key has expired.
+// It must not be called with b.mu held.
+func (b *LocalBackend) popBrowserAuthNow(url string, keyExpired bool) {
+	b.logf("popBrowserAuthNow: url=%v, key-expired=%v, seamless-key-renewal=%v", url != "", keyExpired, b.seamlessRenewalEnabled())
 
 	// Deconfigure the local network data plane if:
 	// - seamless key renewal is not enabled;
 	// - key is expired (in which case tailnet connectivity is down anyway).
-	if !b.seamlessRenewalEnabled() || expired {
+	if !b.seamlessRenewalEnabled() || keyExpired {
 		b.blockEngineUpdates(true)
 		b.stopEngineAndWait()
 	}
@@ -3169,16 +3274,25 @@ func (b *LocalBackend) StartLoginInteractive(ctx context.Context) error {
 		panic("LocalBackend.assertClient: b.cc == nil")
 	}
 	url := b.authURL
+	keyExpired := b.keyExpired
 	timeSinceAuthURLCreated := b.clock.Since(b.authURLTime)
-	cc := b.cc
-	b.mu.Unlock()
-	b.logf("StartLoginInteractive: url=%v", url != "")
-
 	// Only use an authURL if it was sent down from control in the last
 	// 6 days and 23 hours. Avoids using a stale URL that is no longer valid
 	// server-side. Server-side URLs expire after 7 days.
-	if url != "" && timeSinceAuthURLCreated < ((7*24*time.Hour)-(1*time.Hour)) {
-		b.popBrowserAuthNow()
+	hasValidURL := url != "" && timeSinceAuthURLCreated < ((7*24*time.Hour)-(1*time.Hour))
+	if !hasValidURL {
+		// A user wants to log in interactively, but we don't have a valid authURL.
+		// Set a flag to indicate that interactive login is in progress, forcing
+		// a BrowseToURL notification once the authURL becomes available.
+		b.interact = true
+	}
+	cc := b.cc
+	b.mu.Unlock()
+
+	b.logf("StartLoginInteractive: url=%v", hasValidURL)
+
+	if hasValidURL {
+		b.popBrowserAuthNow(url, keyExpired)
 	} else {
 		cc.Login(b.loginFlags | controlclient.LoginInteractive)
 	}
@@ -3995,7 +4109,7 @@ func (b *LocalBackend) authReconfig() {
 	disableSubnetsIfPAC := nm.HasCap(tailcfg.NodeAttrDisableSubnetsIfPAC)
 	userDialUseRoutes := nm.HasCap(tailcfg.NodeAttrUserDialUseRoutes)
 	dohURL, dohURLOK := exitNodeCanProxyDNS(nm, b.peers, prefs.ExitNodeID())
-	dcfg := dnsConfigForNetmap(nm, b.peers, prefs, b.logf, version.OS())
+	dcfg := dnsConfigForNetmap(nm, b.peers, prefs, b.keyExpired, b.logf, version.OS())
 	// If the current node is an app connector, ensure the app connector machine is started
 	b.reconfigAppConnectorLocked(nm, prefs)
 	b.mu.Unlock()
@@ -4095,10 +4209,23 @@ func shouldUseOneCGNATRoute(logf logger.Logf, controlKnobs *controlknobs.Knobs, 
 //
 // The versionOS is a Tailscale-style version ("iOS", "macOS") and not
 // a runtime.GOOS.
-func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.NodeView, prefs ipn.PrefsView, logf logger.Logf, versionOS string) *dns.Config {
+func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.NodeView, prefs ipn.PrefsView, selfExpired bool, logf logger.Logf, versionOS string) *dns.Config {
 	if nm == nil {
 		return nil
 	}
+
+	// If the current node's key is expired, then we don't program any DNS
+	// configuration into the operating system. This ensures that if the
+	// DNS configuration specifies a DNS server that is only reachable over
+	// Tailscale, we don't break connectivity for the user.
+	//
+	// TODO(andrew-d): this also stops returning anything from quad-100; we
+	// could do the same thing as having "CorpDNS: false" and keep that but
+	// not program the OS?
+	if selfExpired {
+		return &dns.Config{}
+	}
+
 	dcfg := &dns.Config{
 		Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
 		Hosts:  map[dnsname.FQDN][]netip.Addr{},
@@ -4479,11 +4606,6 @@ func magicDNSRootDomains(nm *netmap.NetworkMap) []dnsname.FQDN {
 	return nil
 }
 
-var (
-	ipv4Default = netip.MustParsePrefix("0.0.0.0/0")
-	ipv6Default = netip.MustParsePrefix("::/0")
-)
-
 // peerRoutes returns the routerConfig.Routes to access peers.
 // If there are over cgnatThreshold CGNAT routes, one big CGNAT route
 // is used instead.
@@ -4584,9 +4706,9 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 		var default4, default6 bool
 		for _, route := range rs.Routes {
 			switch route {
-			case ipv4Default:
+			case tsaddr.AllIPv4():
 				default4 = true
-			case ipv6Default:
+			case tsaddr.AllIPv6():
 				default6 = true
 			}
 			if default4 && default6 {
@@ -4594,10 +4716,10 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 			}
 		}
 		if !default4 {
-			rs.Routes = append(rs.Routes, ipv4Default)
+			rs.Routes = append(rs.Routes, tsaddr.AllIPv4())
 		}
 		if !default6 {
-			rs.Routes = append(rs.Routes, ipv6Default)
+			rs.Routes = append(rs.Routes, tsaddr.AllIPv6())
 		}
 		internalIPs, externalIPs, err := internalAndExternalInterfaces()
 		if err != nil {
@@ -4654,14 +4776,7 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 	hi.ShieldsUp = prefs.ShieldsUp()
 	hi.AllowsUpdate = envknob.AllowsRemoteUpdate() || prefs.AutoUpdate().Apply.EqualBool(true)
 
-	// count routes without exit node routes
-	var routes int64
-	for _, route := range hi.RoutableIPs {
-		if route.Bits() != 0 {
-			routes++
-		}
-	}
-	metricAdvertisedRoutes.Set(float64(routes))
+	b.metrics.advertisedRoutes.Set(float64(tsaddr.WithoutExitRoute(prefs.AdvertiseRoutes()).Len()))
 
 	var sshHostKeys []string
 	if prefs.RunSSH() && envknob.CanSSHD() {
@@ -5019,9 +5134,11 @@ func (b *LocalBackend) resetControlClientLocked() controlclient.Client {
 	return prev
 }
 
+// resetAuthURLLocked resets authURL, canceling any pending interactive login.
 func (b *LocalBackend) resetAuthURLLocked() {
 	b.authURL = ""
 	b.authURLTime = time.Time{}
+	b.interact = false
 }
 
 // ResetForClientDisconnect resets the backend for GUI clients running
@@ -5284,6 +5401,11 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(b.pm.CurrentPrefs())
 	if nm == nil {
 		b.nodeByAddr = nil
+
+		// If there is no netmap, the client is going into a "turned off"
+		// state so reset the metrics.
+		b.metrics.approvedRoutes.Set(0)
+		b.metrics.primaryRoutes.Set(0)
 		return
 	}
 
@@ -5304,6 +5426,15 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	}
 	if nm.SelfNode.Valid() {
 		addNode(nm.SelfNode)
+
+		var approved float64
+		for _, route := range nm.SelfNode.AllowedIPs().All() {
+			if !views.SliceContains(nm.SelfNode.Addresses(), route) && !tsaddr.IsExitRoute(route) {
+				approved++
+			}
+		}
+		b.metrics.approvedRoutes.Set(approved)
+		b.metrics.primaryRoutes.Set(float64(tsaddr.WithoutExitRoute(nm.SelfNode.PrimaryRoutes()).Len()))
 	}
 	for _, p := range nm.Peers {
 		addNode(p)
@@ -6128,8 +6259,8 @@ func wireguardExitNodeDNSResolvers(nm *netmap.NetworkMap, peers map[tailcfg.Node
 				resolvers := p.ExitNodeDNSResolvers()
 				if !resolvers.IsNil() && resolvers.Len() > 0 {
 					copies := make([]*dnstype.Resolver, resolvers.Len())
-					for i := range resolvers.Len() {
-						copies[i] = resolvers.At(i).AsStruct()
+					for i, r := range resolvers.All() {
+						copies[i] = r.AsStruct()
 					}
 					return copies, true
 				}

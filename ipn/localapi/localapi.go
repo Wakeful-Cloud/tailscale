@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/clientupdate"
 	"tailscale.com/drive"
@@ -49,6 +50,7 @@ import (
 	"tailscale.com/taildrop"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
@@ -62,7 +64,6 @@ import (
 	"tailscale.com/util/progresstracking"
 	"tailscale.com/util/rands"
 	"tailscale.com/util/testenv"
-	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/magicsock"
 )
@@ -98,6 +99,8 @@ var handler = map[string]localAPIHandler{
 	"derpmap":                     (*Handler).serveDERPMap,
 	"dev-set-state-store":         (*Handler).serveDevSetStateStore,
 	"dial":                        (*Handler).serveDial,
+	"dns-osconfig":                (*Handler).serveDNSOSConfig,
+	"dns-query":                   (*Handler).serveDNSQuery,
 	"drive/fileserver-address":    (*Handler).serveDriveServerAddr,
 	"drive/shares":                (*Handler).serveShares,
 	"file-targets":                (*Handler).serveFileTargets,
@@ -577,7 +580,7 @@ func (h *Handler) serveUserMetrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "usermetrics debug flag not enabled", http.StatusForbidden)
 		return
 	}
-	usermetric.Handler(w, r)
+	h.b.UserMetricsRegistry().Handler(w, r)
 }
 
 func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
@@ -2705,6 +2708,87 @@ func (h *Handler) serveUpdateProgress(w http.ResponseWriter, r *http.Request) {
 	ups := h.b.GetSelfUpdateProgress()
 
 	json.NewEncoder(w).Encode(ups)
+}
+
+// serveDNSOSConfig serves the current system DNS configuration as a JSON object, if
+// supported by the OS.
+func (h *Handler) serveDNSOSConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != httpm.GET {
+		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Require write access for privacy reasons.
+	if !h.PermitWrite {
+		http.Error(w, "dns-osconfig dump access denied", http.StatusForbidden)
+		return
+	}
+	bCfg, err := h.b.GetDNSOSConfig()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	nameservers := make([]string, 0, len(bCfg.Nameservers))
+	for _, ns := range bCfg.Nameservers {
+		nameservers = append(nameservers, ns.String())
+	}
+	searchDomains := make([]string, 0, len(bCfg.SearchDomains))
+	for _, sd := range bCfg.SearchDomains {
+		searchDomains = append(searchDomains, sd.WithoutTrailingDot())
+	}
+	matchDomains := make([]string, 0, len(bCfg.MatchDomains))
+	for _, md := range bCfg.MatchDomains {
+		matchDomains = append(matchDomains, md.WithoutTrailingDot())
+	}
+	response := apitype.DNSOSConfig{
+		Nameservers:   nameservers,
+		SearchDomains: searchDomains,
+		MatchDomains:  matchDomains,
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+// serveDNSQuery provides the ability to perform DNS queries using the internal
+// DNS forwarder. This is useful for debugging and testing purposes.
+// URL parameters:
+//   - name: the domain name to query
+//   - type: the DNS record type to query as a number (default if empty: A = '1')
+//
+// The response if successful is a DNSQueryResponse JSON object.
+func (h *Handler) serveDNSQuery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Require write access for privacy reasons.
+	if !h.PermitWrite {
+		http.Error(w, "dns-query access denied", http.StatusForbidden)
+		return
+	}
+	q := r.URL.Query()
+	name := q.Get("name")
+	queryType := q.Get("type")
+	qt := dnsmessage.TypeA
+	if queryType != "" {
+		t, err := dnstype.DNSMessageTypeForString(queryType)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		qt = t
+	}
+
+	res, rrs, err := h.b.QueryDNS(name, qt)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&apitype.DNSQueryResponse{
+		Bytes:     res,
+		Resolvers: rrs,
+	})
 }
 
 // serveDriveServerAddr handles updates of the Taildrive file server address.

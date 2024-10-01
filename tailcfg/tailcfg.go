@@ -148,7 +148,8 @@ type CapabilityVersion int
 //   - 103: 2024-07-24: Client supports NodeAttrDisableCaptivePortalDetection
 //   - 104: 2024-08-03: SelfNodeV6MasqAddrForThisPeer now works
 //   - 105: 2024-08-05: Fixed SSH behavior on systems that use busybox (issue #12849)
-const CurrentCapabilityVersion CapabilityVersion = 105
+//   - 106: 2024-09-03: fix panic regression from cryptokey routing change (65fe0ba7b5)
+const CurrentCapabilityVersion CapabilityVersion = 106
 
 type StableID string
 
@@ -2341,6 +2342,10 @@ const (
 	// NodeAttrDisableCaptivePortalDetection instructs the client to not perform captive portal detection
 	// automatically when the network state changes.
 	NodeAttrDisableCaptivePortalDetection NodeCapability = "disable-captive-portal-detection"
+
+	// NodeAttrSSHEnvironmentVariables enables logic for handling environment variables sent
+	// via SendEnv in the SSH server and applying them to the SSH session.
+	NodeAttrSSHEnvironmentVariables NodeCapability = "ssh-env-vars"
 )
 
 // SetDNSRequest is a request to add a DNS record.
@@ -2446,6 +2451,13 @@ type SSHRule struct {
 	// Action is the outcome to task.
 	// A nil or invalid action means to deny.
 	Action *SSHAction `json:"action"`
+
+	// AcceptEnv is a slice of environment variable names that are allowlisted
+	// for the SSH rule in the policy file.
+	//
+	// AcceptEnv values may contain * and ? wildcard characters which match against
+	// an arbitrary number of characters or a single character respectively.
+	AcceptEnv []string `json:"acceptEnv,omitempty"`
 }
 
 // SSHPrincipal is either a particular node or a user on any node.

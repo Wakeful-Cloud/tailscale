@@ -417,6 +417,10 @@ func run() (err error) {
 
 	sys.Set(driveimpl.NewFileSystemForRemote(logf))
 
+	if app := envknob.App(); app != "" {
+		hostinfo.SetApp(app)
+	}
+
 	return startIPNServer(context.Background(), logf, pol.PublicID, sys)
 }
 
@@ -676,11 +680,14 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 		ListenPort:    args.port,
 		NetMon:        sys.NetMon.Get(),
 		HealthTracker: sys.HealthTracker(),
+		Metrics:       sys.UserMetricsRegistry(),
 		Dialer:        sys.Dialer.Get(),
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		DriveForLocal: driveimpl.NewFileSystemForLocal(logf),
 	}
+
+	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
 
 	onlyNetstack = name == "userspace-networking"
 	netstackSubnetRouter := onlyNetstack // but mutated later on some platforms

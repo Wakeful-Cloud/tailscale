@@ -31,6 +31,7 @@ import (
 	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/opt"
@@ -342,7 +343,7 @@ func (a *tailscaleSTSReconciler) createOrGetSecret(ctx context.Context, logger *
 		if len(tags) == 0 {
 			tags = a.defaultTags
 		}
-		authKey, err = a.newAuthKey(ctx, tags)
+		authKey, err = newAuthKey(ctx, a.tsClient, tags)
 		if err != nil {
 			return "", "", nil, err
 		}
@@ -418,6 +419,11 @@ func (a *tailscaleSTSReconciler) DeviceInfo(ctx context.Context, childLabels map
 	if sec == nil {
 		return "", "", nil, nil
 	}
+
+	return deviceInfo(sec)
+}
+
+func deviceInfo(sec *corev1.Secret) (id tailcfg.StableNodeID, hostname string, ips []string, err error) {
 	id = tailcfg.StableNodeID(sec.Data["device_id"])
 	if id == "" {
 		return "", "", nil, nil
@@ -441,7 +447,7 @@ func (a *tailscaleSTSReconciler) DeviceInfo(ctx context.Context, childLabels map
 	return id, hostname, ips, nil
 }
 
-func (a *tailscaleSTSReconciler) newAuthKey(ctx context.Context, tags []string) (string, error) {
+func newAuthKey(ctx context.Context, tsClient tsClient, tags []string) (string, error) {
 	caps := tailscale.KeyCapabilities{
 		Devices: tailscale.KeyDeviceCapabilities{
 			Create: tailscale.KeyDeviceCreateCapabilities{
@@ -452,7 +458,7 @@ func (a *tailscaleSTSReconciler) newAuthKey(ctx context.Context, tags []string) 
 		},
 	}
 
-	key, _, err := a.tsClient.CreateKey(ctx, caps)
+	key, _, err := tsClient.CreateKey(ctx, caps)
 	if err != nil {
 		return "", err
 	}
@@ -598,6 +604,18 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 			},
 		})
 	}
+	app, err := appInfoForProxy(sts)
+	if err != nil {
+		// No need to error out if now or in future we end up in a
+		// situation where app info cannot be determined for one of the
+		// many proxy configurations that the operator can produce.
+		logger.Error("[unexpected] unable to determine proxy type")
+	} else {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "TS_INTERNAL_APP",
+			Value: app,
+		})
+	}
 	logger.Debugf("reconciling statefulset %s/%s", ss.GetNamespace(), ss.GetName())
 	if sts.ProxyClassName != "" {
 		logger.Debugf("configuring proxy resources with ProxyClass %s", sts.ProxyClassName)
@@ -609,6 +627,22 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		s.ObjectMeta.Annotations = ss.Annotations
 	}
 	return createOrUpdate(ctx, a.Client, a.operatorNamespace, ss, updateSS)
+}
+
+func appInfoForProxy(cfg *tailscaleSTSConfig) (string, error) {
+	if cfg.ClusterTargetDNSName != "" || cfg.ClusterTargetIP != "" {
+		return kubetypes.AppIngressProxy, nil
+	}
+	if cfg.TailnetTargetFQDN != "" || cfg.TailnetTargetIP != "" {
+		return kubetypes.AppEgressProxy, nil
+	}
+	if cfg.ServeConfig != nil {
+		return kubetypes.AppIngressResource, nil
+	}
+	if cfg.Connector != nil {
+		return kubetypes.AppConnector, nil
+	}
+	return "", errors.New("unable to determine proxy type")
 }
 
 // mergeStatefulSetLabelsOrAnnots returns a map that contains all keys/values
@@ -787,33 +821,12 @@ func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *co
 
 	if newAuthkey != "" {
 		conf.AuthKey = &newAuthkey
-	} else if oldSecret != nil {
-		var err error
-		latest := tailcfg.CapabilityVersion(-1)
-		latestStr := ""
-		for k, data := range oldSecret.Data {
-			// write to StringData, read from Data as StringData is write-only
-			if len(data) == 0 {
-				continue
-			}
-			v, err := tsoperator.CapVerFromFileName(k)
-			if err != nil {
-				continue
-			}
-			if v > latest {
-				latestStr = k
-				latest = v
-			}
+	} else if shouldRetainAuthKey(oldSecret) {
+		key, err := authKeyFromSecret(oldSecret)
+		if err != nil {
+			return nil, fmt.Errorf("error retrieving auth key from Secret: %w", err)
 		}
-		// Allow for configs that don't contain an auth key. Perhaps
-		// users have some mechanisms to delete them. Auth key is
-		// normally not needed after the initial login.
-		if latestStr != "" {
-			conf.AuthKey, err = readAuthKey(oldSecret, latestStr)
-			if err != nil {
-				return nil, err
-			}
-		}
+		conf.AuthKey = key
 	}
 	capVerConfigs := make(map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha)
 	capVerConfigs[95] = *conf
@@ -821,6 +834,41 @@ func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *co
 	conf.NoStatefulFiltering.Clear()
 	capVerConfigs[94] = *conf
 	return capVerConfigs, nil
+}
+
+func authKeyFromSecret(s *corev1.Secret) (key *string, err error) {
+	latest := tailcfg.CapabilityVersion(-1)
+	latestStr := ""
+	for k, data := range s.Data {
+		// write to StringData, read from Data as StringData is write-only
+		if len(data) == 0 {
+			continue
+		}
+		v, err := tsoperator.CapVerFromFileName(k)
+		if err != nil {
+			continue
+		}
+		if v > latest {
+			latestStr = k
+			latest = v
+		}
+	}
+	// Allow for configs that don't contain an auth key. Perhaps
+	// users have some mechanisms to delete them. Auth key is
+	// normally not needed after the initial login.
+	if latestStr != "" {
+		return readAuthKey(s, latestStr)
+	}
+	return key, nil
+}
+
+// shouldRetainAuthKey returns true if the state stored in a proxy's state Secret suggests that auth key should be
+// retained (because the proxy has not yet successfully authenticated).
+func shouldRetainAuthKey(s *corev1.Secret) bool {
+	if s == nil {
+		return false // nothing to retain here
+	}
+	return len(s.Data["device_id"]) == 0 // proxy has not authed yet
 }
 
 func shouldAcceptRoutes(pc *tsapi.ProxyClass) bool {

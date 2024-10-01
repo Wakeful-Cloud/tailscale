@@ -97,6 +97,7 @@ type KeyValue[T comparable] struct {
 }
 
 func (v *MultiLabelMap[T]) String() string {
+	// NOTE: This has to be valid JSON because it's used by expvar.
 	return `"MultiLabelMap"`
 }
 
@@ -280,4 +281,17 @@ func (v *MultiLabelMap[T]) Do(f func(KeyValue[T])) {
 	for _, e := range v.sorted {
 		f(KeyValue[T]{e.key, e.val})
 	}
+}
+
+// ResetAllForTest resets all values for metrics to zero.
+// Should only be used in tests.
+func (v *MultiLabelMap[T]) ResetAllForTest() {
+	v.Do(func(kv KeyValue[T]) {
+		switch v := kv.Value.(type) {
+		case *expvar.Int:
+			v.Set(0)
+		case *expvar.Float:
+			v.Set(0)
+		}
+	})
 }

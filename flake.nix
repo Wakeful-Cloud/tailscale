@@ -120,10 +120,14 @@
           perl
           go_1_23
           yarn
+
+          # qemu and e2fsprogs are needed for natlab
+          qemu
+          e2fsprogs
         ];
       };
     };
   in
     flake-utils.lib.eachDefaultSystem (system: flakeForSystem nixpkgs system);
 }
-# nix-direnv cache busting line: sha256-dlzNJtzHhsPM02mDZhTFpEsNwwHHL1eqF8MWSU4Mhew=
+# nix-direnv cache busting line: sha256-xO1DuLWi6/lpA9ubA2ZYVJM+CkVNA5IaVGZxX9my0j0=
