@@ -200,8 +200,13 @@ func SetFirewallMode(v string) { firewallMode.Store(v) }
 
 // SetPackage sets the packaging type for the app.
 //
-// As of 2022-03-25, this is used by Android ("nogoogle" for the
-// F-Droid build) and tsnet (set to "tsnet").
+// For Android, the possible values are:
+// - "googleplay": installed from Google Play Store.
+// - "fdroid": installed from the F-Droid repository.
+// - "amazon": installed from the Amazon Appstore.
+// - "unknown": when the installer package name is null.
+// - "unknown$installerPackageName": for unrecognized installer package names, prefixed by "unknown".
+// Additionally, tsnet sets this value to "tsnet".
 func SetPackage(v string) { packagingType.Store(v) }
 
 // SetApp sets the app type for the app.
@@ -275,13 +280,22 @@ func getEnvType() EnvType {
 	return ""
 }
 
-// inContainer reports whether we're running in a container.
+// inContainer reports whether we're running in a container. Best-effort only,
+// there's no foolproof way to detect this, but the build tag should catch all
+// official builds from 1.78.0.
 func inContainer() opt.Bool {
 	if runtime.GOOS != "linux" {
 		return ""
 	}
 	var ret opt.Bool
 	ret.Set(false)
+	if packageType != nil && packageType() == "container" {
+		// Go build tag ts_package_container was set during build.
+		ret.Set(true)
+		return ret
+	}
+	// Only set if using docker's container runtime. Not guaranteed by
+	// documentation, but it's been in place for a long time.
 	if _, err := os.Stat("/.dockerenv"); err == nil {
 		ret.Set(true)
 		return ret
@@ -357,7 +371,7 @@ func inFlyDotIo() bool {
 }
 
 func inReplit() bool {
-	// https://docs.replit.com/programming-ide/getting-repl-metadata
+	// https://docs.replit.com/replit-workspace/configuring-repl#environment-variables
 	if os.Getenv("REPL_OWNER") != "" && os.Getenv("REPL_SLUG") != "" {
 		return true
 	}

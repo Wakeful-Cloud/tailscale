@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/kube/kubeclient"
@@ -62,9 +63,65 @@ type settings struct {
 	// PodIP is the IP of the Pod if running in Kubernetes. This is used
 	// when setting up rules to proxy cluster traffic to cluster ingress
 	// target.
+	// Deprecated: use PodIPv4, PodIPv6 instead to support dual stack clusters
 	PodIP               string
+	PodIPv4             string
+	PodIPv6             string
 	HealthCheckAddrPort string
 	EgressSvcsCfgPath   string
+}
+
+func configFromEnv() (*settings, error) {
+	cfg := &settings{
+		AuthKey:                               defaultEnvs([]string{"TS_AUTHKEY", "TS_AUTH_KEY"}, ""),
+		Hostname:                              defaultEnv("TS_HOSTNAME", ""),
+		Routes:                                defaultEnvStringPointer("TS_ROUTES"),
+		ServeConfigPath:                       defaultEnv("TS_SERVE_CONFIG", ""),
+		ProxyTargetIP:                         defaultEnv("TS_DEST_IP", ""),
+		ProxyTargetDNSName:                    defaultEnv("TS_EXPERIMENTAL_DEST_DNS_NAME", ""),
+		TailnetTargetIP:                       defaultEnv("TS_TAILNET_TARGET_IP", ""),
+		TailnetTargetFQDN:                     defaultEnv("TS_TAILNET_TARGET_FQDN", ""),
+		DaemonExtraArgs:                       defaultEnv("TS_TAILSCALED_EXTRA_ARGS", ""),
+		ExtraArgs:                             defaultEnv("TS_EXTRA_ARGS", ""),
+		InKubernetes:                          os.Getenv("KUBERNETES_SERVICE_HOST") != "",
+		UserspaceMode:                         defaultBool("TS_USERSPACE", true),
+		StateDir:                              defaultEnv("TS_STATE_DIR", ""),
+		AcceptDNS:                             defaultEnvBoolPointer("TS_ACCEPT_DNS"),
+		KubeSecret:                            defaultEnv("TS_KUBE_SECRET", "tailscale"),
+		SOCKSProxyAddr:                        defaultEnv("TS_SOCKS5_SERVER", ""),
+		HTTPProxyAddr:                         defaultEnv("TS_OUTBOUND_HTTP_PROXY_LISTEN", ""),
+		Socket:                                defaultEnv("TS_SOCKET", "/tmp/tailscaled.sock"),
+		AuthOnce:                              defaultBool("TS_AUTH_ONCE", false),
+		Root:                                  defaultEnv("TS_TEST_ONLY_ROOT", "/"),
+		TailscaledConfigFilePath:              tailscaledConfigFilePath(),
+		AllowProxyingClusterTrafficViaIngress: defaultBool("EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS", false),
+		PodIP:                                 defaultEnv("POD_IP", ""),
+		EnableForwardingOptimizations:         defaultBool("TS_EXPERIMENTAL_ENABLE_FORWARDING_OPTIMIZATIONS", false),
+		HealthCheckAddrPort:                   defaultEnv("TS_HEALTHCHECK_ADDR_PORT", ""),
+		EgressSvcsCfgPath:                     defaultEnv("TS_EGRESS_SERVICES_CONFIG_PATH", ""),
+	}
+	podIPs, ok := os.LookupEnv("POD_IPS")
+	if ok {
+		ips := strings.Split(podIPs, ",")
+		if len(ips) > 2 {
+			return nil, fmt.Errorf("POD_IPs can contain at most 2 IPs, got %d (%v)", len(ips), ips)
+		}
+		for _, ip := range ips {
+			parsed, err := netip.ParseAddr(ip)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing IP address %s: %w", ip, err)
+			}
+			if parsed.Is4() {
+				cfg.PodIPv4 = parsed.String()
+				continue
+			}
+			cfg.PodIPv6 = parsed.String()
+		}
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %v", err)
+	}
+	return cfg, nil
 }
 
 func (s *settings) validate() error {
@@ -130,44 +187,51 @@ func (cfg *settings) setupKube(ctx context.Context) error {
 	}
 	canPatch, canCreate, err := kc.CheckSecretPermissions(ctx, cfg.KubeSecret)
 	if err != nil {
-		return fmt.Errorf("Some Kubernetes permissions are missing, please check your RBAC configuration: %v", err)
+		return fmt.Errorf("some Kubernetes permissions are missing, please check your RBAC configuration: %v", err)
 	}
 	cfg.KubernetesCanPatch = canPatch
 
 	s, err := kc.GetSecret(ctx, cfg.KubeSecret)
-	if err != nil && kubeclient.IsNotFoundErr(err) && !canCreate {
-		return fmt.Errorf("Tailscale state Secret %s does not exist and we don't have permissions to create it. "+
-			"If you intend to store tailscale state elsewhere than a Kubernetes Secret, "+
-			"you can explicitly set TS_KUBE_SECRET env var to an empty string. "+
-			"Else ensure that RBAC is set up that allows the service account associated with this installation to create Secrets.", cfg.KubeSecret)
-	} else if err != nil && !kubeclient.IsNotFoundErr(err) {
-		return fmt.Errorf("Getting Tailscale state Secret %s: %v", cfg.KubeSecret, err)
-	}
-
-	if cfg.AuthKey == "" && !isOneStepConfig(cfg) {
-		if s == nil {
-			log.Print("TS_AUTHKEY not provided and kube secret does not exist, login will be interactive if needed.")
-			return nil
+	if err != nil {
+		if !kubeclient.IsNotFoundErr(err) {
+			return fmt.Errorf("getting Tailscale state Secret %s: %v", cfg.KubeSecret, err)
 		}
-		keyBytes, _ := s.Data["authkey"]
-		key := string(keyBytes)
 
-		if key != "" {
-			// This behavior of pulling authkeys from kube secrets was added
-			// at the same time as the patch permission, so we can enforce
-			// that we must be able to patch out the authkey after
-			// authenticating if you want to use this feature. This avoids
-			// us having to deal with the case where we might leave behind
-			// an unnecessary reusable authkey in a secret, like a rake in
-			// the grass.
-			if !cfg.KubernetesCanPatch {
-				return errors.New("authkey found in TS_KUBE_SECRET, but the pod doesn't have patch permissions on the secret to manage the authkey.")
-			}
-			cfg.AuthKey = key
-		} else {
-			log.Print("No authkey found in kube secret and TS_AUTHKEY not provided, login will be interactive if needed.")
+		if !canCreate {
+			return fmt.Errorf("tailscale state Secret %s does not exist and we don't have permissions to create it. "+
+				"If you intend to store tailscale state elsewhere than a Kubernetes Secret, "+
+				"you can explicitly set TS_KUBE_SECRET env var to an empty string. "+
+				"Else ensure that RBAC is set up that allows the service account associated with this installation to create Secrets.", cfg.KubeSecret)
 		}
 	}
+
+	// Return early if we already have an auth key.
+	if cfg.AuthKey != "" || isOneStepConfig(cfg) {
+		return nil
+	}
+
+	if s == nil {
+		log.Print("TS_AUTHKEY not provided and state Secret does not exist, login will be interactive if needed.")
+		return nil
+	}
+
+	keyBytes, _ := s.Data["authkey"]
+	key := string(keyBytes)
+
+	if key != "" {
+		// Enforce that we must be able to patch out the authkey after
+		// authenticating if you want to use this feature. This avoids
+		// us having to deal with the case where we might leave behind
+		// an unnecessary reusable authkey in a secret, like a rake in
+		// the grass.
+		if !cfg.KubernetesCanPatch {
+			return errors.New("authkey found in TS_KUBE_SECRET, but the pod doesn't have patch permissions on the Secret to manage the authkey.")
+		}
+		cfg.AuthKey = key
+	}
+
+	log.Print("No authkey found in state Secret and TS_AUTHKEY not provided, login will be interactive if needed.")
+
 	return nil
 }
 

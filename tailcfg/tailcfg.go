@@ -149,7 +149,8 @@ type CapabilityVersion int
 //   - 104: 2024-08-03: SelfNodeV6MasqAddrForThisPeer now works
 //   - 105: 2024-08-05: Fixed SSH behavior on systems that use busybox (issue #12849)
 //   - 106: 2024-09-03: fix panic regression from cryptokey routing change (65fe0ba7b5)
-const CurrentCapabilityVersion CapabilityVersion = 106
+//   - 107: 2024-10-30: add App Connector to conffile (PR #13942)
+const CurrentCapabilityVersion CapabilityVersion = 107
 
 type StableID string
 
@@ -651,6 +652,21 @@ func CheckTag(tag string) error {
 	return nil
 }
 
+// CheckServiceName validates svc for use as a service name.
+// We only allow valid DNS labels, since the expectation is that these will be
+// used as parts of domain names.
+func CheckServiceName(svc string) error {
+	var ok bool
+	svc, ok = strings.CutPrefix(svc, "svc:")
+	if !ok {
+		return errors.New("services must start with 'svc:'")
+	}
+	if svc == "" {
+		return errors.New("service names must not be empty")
+	}
+	return dnsname.ValidLabel(svc)
+}
+
 // CheckRequestTags checks that all of h.RequestTags are valid.
 func (h *Hostinfo) CheckRequestTags() error {
 	if h == nil {
@@ -676,6 +692,16 @@ const (
 	PeerAPI6   = ServiceProto("peerapi6")
 	PeerAPIDNS = ServiceProto("peerapi-dns-proxy")
 )
+
+// IsKnownServiceProto checks whether sp represents a known-valid value of
+// ServiceProto.
+func IsKnownServiceProto(sp ServiceProto) bool {
+	switch sp {
+	case TCP, UDP, PeerAPI4, PeerAPI6, PeerAPIDNS, ServiceProto("egg"):
+		return true
+	}
+	return false
+}
 
 // Service represents a service running on a node.
 type Service struct {
@@ -761,7 +787,7 @@ type Hostinfo struct {
 	// "5.10.0-17-amd64".
 	OSVersion string `json:",omitempty"`
 
-	Container      opt.Bool `json:",omitempty"` // whether the client is running in a container
+	Container      opt.Bool `json:",omitempty"` // best-effort whether the client is running in a container
 	Env            string   `json:",omitempty"` // a hostinfo.EnvType in string form
 	Distro         string   `json:",omitempty"` // "debian", "ubuntu", "nixos", ...
 	DistroVersion  string   `json:",omitempty"` // "20.04", ...

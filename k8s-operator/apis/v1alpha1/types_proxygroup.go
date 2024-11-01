@@ -37,10 +37,8 @@ type ProxyGroupList struct {
 }
 
 type ProxyGroupSpec struct {
-	// Type of the ProxyGroup, either ingress or egress. Each set of proxies
-	// managed by a single ProxyGroup definition operate as only ingress or
-	// only egress proxies.
-	Type ProxyClassType `json:"type"`
+	// Type of the ProxyGroup proxies. Currently the only supported type is egress.
+	Type ProxyGroupType `json:"type"`
 
 	// Tags that the Tailscale devices will be tagged with. Defaults to [tag:k8s].
 	// If you specify custom tags here, make sure you also make the operator
@@ -54,7 +52,7 @@ type ProxyGroupSpec struct {
 	// Replicas specifies how many replicas to create the StatefulSet with.
 	// Defaults to 2.
 	// +optional
-	Replicas *int `json:"replicas,omitempty"`
+	Replicas *int32 `json:"replicas,omitempty"`
 
 	// HostnamePrefix is the hostname prefix to use for tailnet devices created
 	// by the ProxyGroup. Each device will have the integer number from its
@@ -66,8 +64,9 @@ type ProxyGroupSpec struct {
 
 	// ProxyClass is the name of the ProxyClass custom resource that contains
 	// configuration options that should be applied to the resources created
-	// for this ProxyGroup. If unset, and no default ProxyClass is set, the
-	// operator will create resources with the default configuration.
+	// for this ProxyGroup. If unset, and there is no default ProxyClass
+	// configured, the operator will create resources with the default
+	// configuration.
 	// +optional
 	ProxyClass string `json:"proxyClass,omitempty"`
 }
@@ -101,10 +100,10 @@ type TailnetDevice struct {
 
 // +kubebuilder:validation:Type=string
 // +kubebuilder:validation:Enum=egress
-type ProxyClassType string
+type ProxyGroupType string
 
 const (
-	ProxyClassTypeEgress ProxyClassType = "egress"
+	ProxyGroupTypeEgress ProxyGroupType = "egress"
 )
 
 // +kubebuilder:validation:Type=string

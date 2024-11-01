@@ -31,7 +31,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/clientupdate"
@@ -63,7 +62,8 @@ import (
 	"tailscale.com/util/osdiag"
 	"tailscale.com/util/progresstracking"
 	"tailscale.com/util/rands"
-	"tailscale.com/util/testenv"
+	"tailscale.com/util/syspolicy/rsop"
+	"tailscale.com/util/syspolicy/setting"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/magicsock"
 )
@@ -78,6 +78,7 @@ var handler = map[string]localAPIHandler{
 	"cert/":     (*Handler).serveCert,
 	"file-put/": (*Handler).serveFilePut,
 	"files/":    (*Handler).serveFiles,
+	"policy/":   (*Handler).servePolicy,
 	"profiles/": (*Handler).serveProfiles,
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
@@ -571,15 +572,9 @@ func (h *Handler) serveMetrics(w http.ResponseWriter, r *http.Request) {
 	clientmetric.WritePrometheusExpositionFormat(w)
 }
 
-// TODO(kradalby): Remove this once we have landed on a final set of
-// metrics to export to clients and consider the metrics stable.
-var debugUsermetricsEndpoint = envknob.RegisterBool("TS_DEBUG_USER_METRICS")
-
+// serveUserMetrics returns user-facing metrics in Prometheus text
+// exposition format.
 func (h *Handler) serveUserMetrics(w http.ResponseWriter, r *http.Request) {
-	if !testenv.InTest() && !debugUsermetricsEndpoint() {
-		http.Error(w, "usermetrics debug flag not enabled", http.StatusForbidden)
-		return
-	}
 	h.b.UserMetricsRegistry().Handler(w, r)
 }
 
@@ -1232,7 +1227,7 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	ctx := r.Context()
 	enc := json.NewEncoder(w)
-	h.b.WatchNotifications(ctx, mask, f.Flush, func(roNotify *ipn.Notify) (keepGoing bool) {
+	h.b.WatchNotificationsAs(ctx, h.Actor, mask, f.Flush, func(roNotify *ipn.Notify) (keepGoing bool) {
 		err := enc.Encode(roNotify)
 		if err != nil {
 			h.logf("json.Encode: %v", err)
@@ -1252,7 +1247,7 @@ func (h *Handler) serveLoginInteractive(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "want POST", http.StatusBadRequest)
 		return
 	}
-	h.b.StartLoginInteractive(r.Context())
+	h.b.StartLoginInteractiveAs(r.Context(), h.Actor)
 	w.WriteHeader(http.StatusNoContent)
 	return
 }
@@ -1338,6 +1333,53 @@ func (h *Handler) servePrefs(w http.ResponseWriter, r *http.Request) {
 	e := json.NewEncoder(w)
 	e.SetIndent("", "\t")
 	e.Encode(prefs)
+}
+
+func (h *Handler) servePolicy(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitRead {
+		http.Error(w, "policy access denied", http.StatusForbidden)
+		return
+	}
+
+	suffix, ok := strings.CutPrefix(r.URL.EscapedPath(), "/localapi/v0/policy/")
+	if !ok {
+		http.Error(w, "misconfigured", http.StatusInternalServerError)
+		return
+	}
+
+	var scope setting.PolicyScope
+	if suffix == "" {
+		scope = setting.DefaultScope()
+	} else if err := scope.UnmarshalText([]byte(suffix)); err != nil {
+		http.Error(w, fmt.Sprintf("%q is not a valid scope", suffix), http.StatusBadRequest)
+		return
+	}
+
+	policy, err := rsop.PolicyFor(scope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var effectivePolicy *setting.Snapshot
+	switch r.Method {
+	case "GET":
+		effectivePolicy = policy.Get()
+	case "POST":
+		effectivePolicy, err = policy.Reload()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	default:
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(effectivePolicy)
 }
 
 type resJSON struct {
@@ -1563,7 +1605,7 @@ func (h *Handler) serveFilePut(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "PUT":
 		file := ipn.OutgoingFile{
-			ID:           uuid.Must(uuid.NewRandom()).String(),
+			ID:           rands.HexString(30),
 			PeerID:       peerID,
 			Name:         filenameEscaped,
 			DeclaredSize: r.ContentLength,

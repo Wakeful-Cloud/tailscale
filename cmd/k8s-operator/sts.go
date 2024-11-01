@@ -47,11 +47,11 @@ const (
 	LabelParentType      = "tailscale.com/parent-resource-type"
 	LabelParentName      = "tailscale.com/parent-resource"
 	LabelParentNamespace = "tailscale.com/parent-resource-ns"
+	labelSecretType      = "tailscale.com/secret-type" // "config" or "state".
 
-	// LabelProxyClass can be set by users on Connectors, tailscale
-	// Ingresses and Services that define cluster ingress or cluster egress,
-	// to specify that configuration in this ProxyClass should be applied to
-	// resources created for the Connector, Ingress or Service.
+	// LabelProxyClass can be set by users on tailscale Ingresses and Services that define cluster ingress or
+	// cluster egress, to specify that configuration in this ProxyClass should be applied to resources created for
+	// the Ingress or Service.
 	LabelProxyClass = "tailscale.com/proxy-class"
 
 	FinalizerName = "tailscale.com/finalizer"
@@ -64,6 +64,8 @@ const (
 	AnnotationTailnetTargetIP    = "tailscale.com/tailnet-ip"
 	//MagicDNS name of tailnet node.
 	AnnotationTailnetTargetFQDN = "tailscale.com/tailnet-fqdn"
+
+	AnnotationProxyGroup = "tailscale.com/proxy-group"
 
 	// Annotations settable by users on ingresses.
 	AnnotationFunnel = "tailscale.com/funnel"
@@ -302,7 +304,7 @@ func (a *tailscaleSTSReconciler) reconcileHeadlessService(ctx context.Context, l
 	return createOrUpdate(ctx, a.Client, a.operatorNamespace, hsvc, func(svc *corev1.Service) { svc.Spec = hsvc.Spec })
 }
 
-func (a *tailscaleSTSReconciler) createOrGetSecret(ctx context.Context, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, hsvc *corev1.Service) (secretName, hash string, configs tailscaleConfigs, _ error) {
+func (a *tailscaleSTSReconciler) createOrGetSecret(ctx context.Context, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, hsvc *corev1.Service) (secretName, hash string, configs tailscaledConfigs, _ error) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			// Hardcode a -0 suffix so that in future, if we support
@@ -360,7 +362,7 @@ func (a *tailscaleSTSReconciler) createOrGetSecret(ctx context.Context, logger *
 	latest := tailcfg.CapabilityVersion(-1)
 	var latestConfig ipn.ConfigVAlpha
 	for key, val := range configs {
-		fn := tsoperator.TailscaledConfigFileNameForCap(key)
+		fn := tsoperator.TailscaledConfigFileName(key)
 		b, err := json.Marshal(val)
 		if err != nil {
 			return "", "", nil, fmt.Errorf("error marshalling tailscaled config: %w", err)
@@ -670,7 +672,7 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, 
 	if pc == nil || ss == nil {
 		return ss
 	}
-	if pc.Spec.Metrics != nil && pc.Spec.Metrics.Enable {
+	if stsCfg != nil && pc.Spec.Metrics != nil && pc.Spec.Metrics.Enable {
 		if stsCfg.TailnetTargetFQDN == "" && stsCfg.TailnetTargetIP == "" && !stsCfg.ForwardClusterTrafficViaL7IngressProxy {
 			enableMetrics(ss, pc)
 		} else if stsCfg.ForwardClusterTrafficViaL7IngressProxy {
@@ -716,6 +718,7 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, 
 	ss.Spec.Template.Spec.NodeSelector = wantsPod.NodeSelector
 	ss.Spec.Template.Spec.Affinity = wantsPod.Affinity
 	ss.Spec.Template.Spec.Tolerations = wantsPod.Tolerations
+	ss.Spec.Template.Spec.TopologySpreadConstraints = wantsPod.TopologySpreadConstraints
 
 	// Update containers.
 	updateContainer := func(overlay *tsapi.Container, base corev1.Container) corev1.Container {
@@ -792,7 +795,7 @@ func readAuthKey(secret *corev1.Secret, key string) (*string, error) {
 // TODO (irbekrm): remove the legacy config once we no longer need to support
 // versions older than cap94,
 // https://tailscale.com/kb/1236/kubernetes-operator#operator-and-proxies
-func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *corev1.Secret) (tailscaleConfigs, error) {
+func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *corev1.Secret) (tailscaledConfigs, error) {
 	conf := &ipn.ConfigVAlpha{
 		Version:             "alpha0",
 		AcceptDNS:           "false",
@@ -882,7 +885,7 @@ type ptrObject[T any] interface {
 	*T
 }
 
-type tailscaleConfigs map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha
+type tailscaledConfigs map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha
 
 // hashBytes produces a hash for the provided tailscaled config that is the same across
 // different invocations of this code. We do not use the
@@ -893,7 +896,7 @@ type tailscaleConfigs map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha
 // thing that changed is operator version (the hash is also exposed to users via
 // an annotation and might be confusing if it changes without the config having
 // changed).
-func tailscaledConfigHash(c tailscaleConfigs) (string, error) {
+func tailscaledConfigHash(c tailscaledConfigs) (string, error) {
 	b, err := json.Marshal(c)
 	if err != nil {
 		return "", fmt.Errorf("error marshalling tailscaled configs: %w", err)

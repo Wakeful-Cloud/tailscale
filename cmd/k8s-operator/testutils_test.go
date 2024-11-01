@@ -604,7 +604,7 @@ func (c *fakeTSClient) CreateKey(ctx context.Context, caps tailscale.KeyCapabili
 func (c *fakeTSClient) Device(ctx context.Context, deviceID string, fields *tailscale.DeviceFieldsOpts) (*tailscale.Device, error) {
 	return &tailscale.Device{
 		DeviceID: deviceID,
-		Hostname: "test-device",
+		Hostname: "hostname-" + deviceID,
 		Addresses: []string{
 			"1.2.3.4",
 			"::1",
@@ -637,6 +637,14 @@ func (c *fakeTSClient) Deleted() []string {
 // change to the configfile contents).
 func removeHashAnnotation(sts *appsv1.StatefulSet) {
 	delete(sts.Spec.Template.Annotations, podAnnotationLastSetConfigFileHash)
+}
+
+func removeTargetPortsFromSvc(svc *corev1.Service) {
+	newPorts := make([]corev1.ServicePort, 0)
+	for _, p := range svc.Spec.Ports {
+		newPorts = append(newPorts, corev1.ServicePort{Protocol: p.Protocol, Port: p.Port})
+	}
+	svc.Spec.Ports = newPorts
 }
 
 func removeAuthKeyIfExistsModifier(t *testing.T) func(s *corev1.Secret) {

@@ -230,6 +230,9 @@ func LogsDir(logf logger.Logf) string {
 			logf("logpolicy: using $STATE_DIRECTORY, %q", systemdStateDir)
 			return systemdStateDir
 		}
+	case "js":
+		logf("logpolicy: no logs directory in the browser")
+		return ""
 	}
 
 	// Default to e.g. /var/lib/tailscale or /var/db/tailscale on Unix.
@@ -813,6 +816,8 @@ func NewLogtailTransport(host string, netMon *netmon.Monitor, health *health.Tra
 	}
 
 	tr.TLSClientConfig = tlsdial.Config(host, health, tr.TLSClientConfig)
+	// Force TLS 1.3 since we know log.tailscale.io supports it.
+	tr.TLSClientConfig.MinVersion = tls.VersionTLS13
 
 	return tr
 }

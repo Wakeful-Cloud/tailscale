@@ -56,11 +56,33 @@ func SetServiceCondition(svc *corev1.Service, conditionType tsapi.ConditionType,
 	svc.Status.Conditions = conds
 }
 
+// GetServiceCondition returns Service condition with the specified type, if it exists on the Service.
+func GetServiceCondition(svc *corev1.Service, conditionType tsapi.ConditionType) *metav1.Condition {
+	idx := xslices.IndexFunc(svc.Status.Conditions, func(cond metav1.Condition) bool {
+		return cond.Type == string(conditionType)
+	})
+
+	if idx == -1 {
+		return nil
+	}
+	return &svc.Status.Conditions[idx]
+}
+
 // RemoveServiceCondition will remove condition of the given type if it exists.
 func RemoveServiceCondition(svc *corev1.Service, conditionType tsapi.ConditionType) {
 	svc.Status.Conditions = slices.DeleteFunc(svc.Status.Conditions, func(cond metav1.Condition) bool {
 		return cond.Type == string(conditionType)
 	})
+}
+
+func EgressServiceIsValidAndConfigured(svc *corev1.Service) bool {
+	for _, typ := range []tsapi.ConditionType{tsapi.EgressSvcValid, tsapi.EgressSvcConfigured} {
+		cond := GetServiceCondition(svc, typ)
+		if cond == nil || cond.Status != metav1.ConditionTrue {
+			return false
+		}
+	}
+	return true
 }
 
 // SetRecorderCondition ensures that Recorder status has a condition with the
@@ -69,6 +91,14 @@ func RemoveServiceCondition(svc *corev1.Service, conditionType tsapi.ConditionTy
 func SetRecorderCondition(tsr *tsapi.Recorder, conditionType tsapi.ConditionType, status metav1.ConditionStatus, reason, message string, gen int64, clock tstime.Clock, logger *zap.SugaredLogger) {
 	conds := updateCondition(tsr.Status.Conditions, conditionType, status, reason, message, gen, clock, logger)
 	tsr.Status.Conditions = conds
+}
+
+// SetProxyGroupCondition ensures that ProxyGroup status has a condition with the
+// given attributes. LastTransitionTime gets set every time condition's status
+// changes.
+func SetProxyGroupCondition(pg *tsapi.ProxyGroup, conditionType tsapi.ConditionType, status metav1.ConditionStatus, reason, message string, gen int64, clock tstime.Clock, logger *zap.SugaredLogger) {
+	conds := updateCondition(pg.Status.Conditions, conditionType, status, reason, message, gen, clock, logger)
+	pg.Status.Conditions = conds
 }
 
 func updateCondition(conds []metav1.Condition, conditionType tsapi.ConditionType, status metav1.ConditionStatus, reason, message string, gen int64, clock tstime.Clock, logger *zap.SugaredLogger) []metav1.Condition {
@@ -107,13 +137,24 @@ func updateCondition(conds []metav1.Condition, conditionType tsapi.ConditionType
 
 func ProxyClassIsReady(pc *tsapi.ProxyClass) bool {
 	idx := xslices.IndexFunc(pc.Status.Conditions, func(cond metav1.Condition) bool {
-		return cond.Type == string(tsapi.ProxyClassready)
+		return cond.Type == string(tsapi.ProxyClassReady)
 	})
 	if idx == -1 {
 		return false
 	}
 	cond := pc.Status.Conditions[idx]
 	return cond.Status == metav1.ConditionTrue && cond.ObservedGeneration == pc.Generation
+}
+
+func ProxyGroupIsReady(pg *tsapi.ProxyGroup) bool {
+	idx := xslices.IndexFunc(pg.Status.Conditions, func(cond metav1.Condition) bool {
+		return cond.Type == string(tsapi.ProxyGroupReady)
+	})
+	if idx == -1 {
+		return false
+	}
+	cond := pg.Status.Conditions[idx]
+	return cond.Status == metav1.ConditionTrue && cond.ObservedGeneration == pg.Generation
 }
 
 func DNSCfgIsReady(cfg *tsapi.DNSConfig) bool {

@@ -21,4 +21,6 @@ const (
 	MetricConnectorWithExitNodeCount     = "k8s_connector_exitnode_resources"
 	MetricNameserverCount                = "k8s_nameserver_resources"
 	MetricRecorderCount                  = "k8s_recorder_resources"
+	MetricEgressServiceCount             = "k8s_egress_service_resources"
+	MetricProxyGroupCount                = "k8s_proxygroup_resources"
 )

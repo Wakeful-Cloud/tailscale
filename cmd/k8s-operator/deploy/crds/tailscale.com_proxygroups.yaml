@@ -63,14 +63,16 @@ spec:
                   description: |-
                     ProxyClass is the name of the ProxyClass custom resource that contains
                     configuration options that should be applied to the resources created
-                    for this ProxyGroup. If unset, and no default ProxyClass is set, the
-                    operator will create resources with the default configuration.
+                    for this ProxyGroup. If unset, and there is no default ProxyClass
+                    configured, the operator will create resources with the default
+                    configuration.
                   type: string
                 replicas:
                   description: |-
                     Replicas specifies how many replicas to create the StatefulSet with.
                     Defaults to 2.
                   type: integer
+                  format: int32
                 tags:
                   description: |-
                     Tags that the Tailscale devices will be tagged with. Defaults to [tag:k8s].
@@ -84,10 +86,7 @@ spec:
                     type: string
                     pattern: ^tag:[a-zA-Z][a-zA-Z0-9-]*$
                 type:
-                  description: |-
-                    Type of the ProxyGroup, either ingress or egress. Each set of proxies
-                    managed by a single ProxyGroup definition operate as only ingress or
-                    only egress proxies.
+                  description: Type of the ProxyGroup proxies. Currently the only supported type is egress.
                   type: string
                   enum:
                     - egress
