@@ -100,6 +100,7 @@ var handler = map[string]localAPIHandler{
 	"derpmap":                     (*Handler).serveDERPMap,
 	"dev-set-state-store":         (*Handler).serveDevSetStateStore,
 	"dial":                        (*Handler).serveDial,
+	"disconnect-control":          (*Handler).disconnectControl,
 	"dns-osconfig":                (*Handler).serveDNSOSConfig,
 	"dns-query":                   (*Handler).serveDNSQuery,
 	"drive/fileserver-address":    (*Handler).serveDriveServerAddr,
@@ -562,6 +563,7 @@ func (h *Handler) serveLogTap(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	metricDebugMetricsCalls.Add(1)
 	// Require write access out of paranoia that the metrics
 	// might contain something sensitive.
 	if !h.PermitWrite {
@@ -575,6 +577,7 @@ func (h *Handler) serveMetrics(w http.ResponseWriter, r *http.Request) {
 // serveUserMetrics returns user-facing metrics in Prometheus text
 // exposition format.
 func (h *Handler) serveUserMetrics(w http.ResponseWriter, r *http.Request) {
+	metricUserMetricsCalls.Add(1)
 	h.b.UserMetricsRegistry().Handler(w, r)
 }
 
@@ -950,6 +953,22 @@ func (h *Handler) servePprof(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	servePprofFunc(w, r)
+}
+
+// disconnectControl is the handler for local API /disconnect-control endpoint that shuts down control client, so that
+// node no longer communicates with control. Doing this makes control consider this node inactive. This can be used
+// before shutting down a replica of HA subnet  router or app connector deployments to ensure that control tells the
+// peers to switch over to another replica whilst still maintaining th existing peer connections.
+func (h *Handler) disconnectControl(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != httpm.POST {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	h.b.DisconnectControl()
 }
 
 func (h *Handler) reloadConfig(w http.ResponseWriter, r *http.Request) {
@@ -2955,7 +2974,9 @@ var (
 	metricInvalidRequests = clientmetric.NewCounter("localapi_invalid_requests")
 
 	// User-visible LocalAPI endpoints.
-	metricFilePutCalls = clientmetric.NewCounter("localapi_file_put")
+	metricFilePutCalls      = clientmetric.NewCounter("localapi_file_put")
+	metricDebugMetricsCalls = clientmetric.NewCounter("localapi_debugmetric_requests")
+	metricUserMetricsCalls  = clientmetric.NewCounter("localapi_usermetric_requests")
 )
 
 // serveSuggestExitNode serves a POST endpoint for returning a suggested exit node.

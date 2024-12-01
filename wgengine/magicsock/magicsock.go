@@ -1120,8 +1120,8 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	// re-run.
 	eps = c.endpointTracker.update(time.Now(), eps)
 
-	for i := range c.staticEndpoints.Len() {
-		addAddr(c.staticEndpoints.At(i), tailcfg.EndpointExplicitConf)
+	for _, ep := range c.staticEndpoints.All() {
+		addAddr(ep, tailcfg.EndpointExplicitConf)
 	}
 
 	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
@@ -1267,7 +1267,7 @@ func (c *Conn) sendUDPBatch(addr netip.AddrPort, buffs [][]byte) (sent bool, err
 
 // sendUDP sends UDP packet b to ipp.
 // See sendAddr's docs on the return value meanings.
-func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
+func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool) (sent bool, err error) {
 	if runtime.GOOS == "js" {
 		return false, errNoUDP
 	}
@@ -1276,7 +1276,7 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
 		metricSendUDPError.Add(1)
 		_ = c.maybeRebindOnError(runtime.GOOS, err)
 	} else {
-		if sent {
+		if sent && !isDisco {
 			switch {
 			case ipp.Addr().Is4():
 				c.metrics.outboundPacketsIPv4Total.Add(1)
@@ -1371,7 +1371,7 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 // returns (false, nil); it's not an error, but nothing was sent.
 func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, isDisco bool) (sent bool, err error) {
 	if addr.Addr() != tailcfg.DerpMagicIPAddr {
-		return c.sendUDP(addr, b)
+		return c.sendUDP(addr, b, isDisco)
 	}
 
 	regionID := int(addr.Port())
@@ -2360,16 +2360,14 @@ func (c *Conn) logEndpointCreated(n tailcfg.NodeView) {
 			fmt.Fprintf(w, "derp=%v%s ", regionID, code)
 		}
 
-		for i := range n.AllowedIPs().Len() {
-			a := n.AllowedIPs().At(i)
+		for _, a := range n.AllowedIPs().All() {
 			if a.IsSingleIP() {
 				fmt.Fprintf(w, "aip=%v ", a.Addr())
 			} else {
 				fmt.Fprintf(w, "aip=%v ", a)
 			}
 		}
-		for i := range n.Endpoints().Len() {
-			ep := n.Endpoints().At(i)
+		for _, ep := range n.Endpoints().All() {
 			fmt.Fprintf(w, "ep=%v ", ep)
 		}
 	}))
