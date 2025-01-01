@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -45,6 +46,9 @@ const (
 	reasonProxyGroupReady          = "ProxyGroupReady"
 	reasonProxyGroupCreating       = "ProxyGroupCreating"
 	reasonProxyGroupInvalid        = "ProxyGroupInvalid"
+
+	// Copied from k8s.io/apiserver/pkg/registry/generic/registry/store.go@cccad306d649184bf2a0e319ba830c53f65c445c
+	optimisticLockErrorMsg = "the object has been modified; please apply your changes to the latest version and try again"
 )
 
 var gaugeProxyGroupResources = clientmetric.NewGauge(kubetypes.MetricProxyGroupEgressCount)
@@ -110,7 +114,7 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	oldPGStatus := pg.Status.DeepCopy()
 	setStatusReady := func(pg *tsapi.ProxyGroup, status metav1.ConditionStatus, reason, message string) (reconcile.Result, error) {
 		tsoperator.SetProxyGroupCondition(pg, tsapi.ProxyGroupReady, status, reason, message, pg.Generation, r.clock, logger)
-		if !apiequality.Semantic.DeepEqual(oldPGStatus, pg.Status) {
+		if !apiequality.Semantic.DeepEqual(oldPGStatus, &pg.Status) {
 			// An error encountered here should get returned by the Reconcile function.
 			if updateErr := r.Client.Status().Update(ctx, pg); updateErr != nil {
 				err = errors.Wrap(err, updateErr.Error())
@@ -166,9 +170,17 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	}
 
 	if err = r.maybeProvision(ctx, pg, proxyClass); err != nil {
-		err = fmt.Errorf("error provisioning ProxyGroup resources: %w", err)
-		r.recorder.Eventf(pg, corev1.EventTypeWarning, reasonProxyGroupCreationFailed, err.Error())
-		return setStatusReady(pg, metav1.ConditionFalse, reasonProxyGroupCreationFailed, err.Error())
+		reason := reasonProxyGroupCreationFailed
+		msg := fmt.Sprintf("error provisioning ProxyGroup resources: %s", err)
+		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
+			reason = reasonProxyGroupCreating
+			msg = fmt.Sprintf("optimistic lock error, retrying: %s", err)
+			err = nil
+			logger.Info(msg)
+		} else {
+			r.recorder.Eventf(pg, corev1.EventTypeWarning, reason, msg)
+		}
+		return setStatusReady(pg, metav1.ConditionFalse, reason, msg)
 	}
 
 	desiredReplicas := int(pgReplicas(pg))
@@ -259,6 +271,15 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 	}); err != nil {
 		return fmt.Errorf("error provisioning StatefulSet: %w", err)
 	}
+	mo := &metricsOpts{
+		tsNamespace:  r.tsNamespace,
+		proxyStsName: pg.Name,
+		proxyLabels:  pgLabels(pg.Name, nil),
+		proxyType:    "proxygroup",
+	}
+	if err := reconcileMetricsResources(ctx, logger, mo, proxyClass, r.Client); err != nil {
+		return fmt.Errorf("error reconciling metrics resources: %w", err)
+	}
 
 	if err := r.cleanupDanglingResources(ctx, pg); err != nil {
 		return fmt.Errorf("error cleaning up dangling resources: %w", err)
@@ -325,6 +346,14 @@ func (r *ProxyGroupReconciler) maybeCleanup(ctx context.Context, pg *tsapi.Proxy
 		if err := r.deleteTailnetDevice(ctx, m.tsID, logger); err != nil {
 			return false, err
 		}
+	}
+
+	mo := &metricsOpts{
+		proxyLabels: pgLabels(pg.Name, nil),
+		tsNamespace: r.tsNamespace,
+		proxyType:   "proxygroup"}
+	if err := maybeCleanupMetricsResources(ctx, mo, r.Client); err != nil {
+		return false, fmt.Errorf("error cleaning up metrics resources: %w", err)
 	}
 
 	logger.Infof("cleaned up ProxyGroup resources")
@@ -450,7 +479,7 @@ func pgTailscaledConfig(pg *tsapi.ProxyGroup, class *tsapi.ProxyClass, idx int32
 	}
 
 	if pg.Spec.HostnamePrefix != "" {
-		conf.Hostname = ptr.To(fmt.Sprintf("%s%d", pg.Spec.HostnamePrefix, idx))
+		conf.Hostname = ptr.To(fmt.Sprintf("%s-%d", pg.Spec.HostnamePrefix, idx))
 	}
 
 	if shouldAcceptRoutes(class) {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 
 const (
 	reasonConnectorCreationFailed = "ConnectorCreationFailed"
+	reasonConnectorCreating       = "ConnectorCreating"
 	reasonConnectorCreated        = "ConnectorCreated"
 	reasonConnectorInvalid        = "ConnectorInvalid"
 
@@ -113,7 +115,7 @@ func (a *ConnectorReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	setStatus := func(cn *tsapi.Connector, _ tsapi.ConditionType, status metav1.ConditionStatus, reason, message string) (reconcile.Result, error) {
 		tsoperator.SetConnectorCondition(cn, tsapi.ConnectorReady, status, reason, message, cn.Generation, a.clock, logger)
 		var updateErr error
-		if !apiequality.Semantic.DeepEqual(oldCnStatus, cn.Status) {
+		if !apiequality.Semantic.DeepEqual(oldCnStatus, &cn.Status) {
 			// An error encountered here should get returned by the Reconcile function.
 			updateErr = a.Client.Status().Update(ctx, cn)
 		}
@@ -134,17 +136,24 @@ func (a *ConnectorReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	}
 
 	if err := a.validate(cn); err != nil {
-		logger.Errorf("error validating Connector spec: %w", err)
 		message := fmt.Sprintf(messageConnectorInvalid, err)
 		a.recorder.Eventf(cn, corev1.EventTypeWarning, reasonConnectorInvalid, message)
 		return setStatus(cn, tsapi.ConnectorReady, metav1.ConditionFalse, reasonConnectorInvalid, message)
 	}
 
 	if err = a.maybeProvisionConnector(ctx, logger, cn); err != nil {
-		logger.Errorf("error creating Connector resources: %w", err)
+		reason := reasonConnectorCreationFailed
 		message := fmt.Sprintf(messageConnectorCreationFailed, err)
-		a.recorder.Eventf(cn, corev1.EventTypeWarning, reasonConnectorCreationFailed, message)
-		return setStatus(cn, tsapi.ConnectorReady, metav1.ConditionFalse, reasonConnectorCreationFailed, message)
+		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
+			reason = reasonConnectorCreating
+			message = fmt.Sprintf("optimistic lock error, retrying: %s", err)
+			err = nil
+			logger.Info(message)
+		} else {
+			a.recorder.Eventf(cn, corev1.EventTypeWarning, reason, message)
+		}
+
+		return setStatus(cn, tsapi.ConnectorReady, metav1.ConditionFalse, reason, message)
 	}
 
 	logger.Info("Connector resources synced")
@@ -189,6 +198,7 @@ func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logge
 			isExitNode: cn.Spec.ExitNode,
 		},
 		ProxyClassName: proxyClass,
+		proxyType:      proxyTypeConnector,
 	}
 
 	if cn.Spec.SubnetRouter != nil && len(cn.Spec.SubnetRouter.AdvertiseRoutes) > 0 {
@@ -233,27 +243,27 @@ func (a *ConnectorReconciler) maybeProvisionConnector(ctx context.Context, logge
 		return err
 	}
 
-	_, tsHost, ips, err := a.ssr.DeviceInfo(ctx, crl)
+	dev, err := a.ssr.DeviceInfo(ctx, crl, logger)
 	if err != nil {
 		return err
 	}
 
-	if tsHost == "" {
-		logger.Debugf("no Tailscale hostname known yet, waiting for connector pod to finish auth")
+	if dev == nil || dev.hostname == "" {
+		logger.Debugf("no Tailscale hostname known yet, waiting for Connector Pod to finish auth")
 		// No hostname yet. Wait for the connector pod to auth.
 		cn.Status.TailnetIPs = nil
 		cn.Status.Hostname = ""
 		return nil
 	}
 
-	cn.Status.TailnetIPs = ips
-	cn.Status.Hostname = tsHost
+	cn.Status.TailnetIPs = dev.ips
+	cn.Status.Hostname = dev.hostname
 
 	return nil
 }
 
 func (a *ConnectorReconciler) maybeCleanupConnector(ctx context.Context, logger *zap.SugaredLogger, cn *tsapi.Connector) (bool, error) {
-	if done, err := a.ssr.Cleanup(ctx, logger, childResourceLabels(cn.Name, a.tsnamespace, "connector")); err != nil {
+	if done, err := a.ssr.Cleanup(ctx, logger, childResourceLabels(cn.Name, a.tsnamespace, "connector"), proxyTypeConnector); err != nil {
 		return false, fmt.Errorf("failed to cleanup Connector resources: %w", err)
 	} else if !done {
 		logger.Debugf("Connector cleanup not done yet, waiting for next reconcile")

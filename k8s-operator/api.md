@@ -145,7 +145,7 @@ _Appears in:_
 | `image` _string_ | Container image name. By default images are pulled from<br />docker.io/tailscale/tailscale, but the official images are also<br />available at ghcr.io/tailscale/tailscale. Specifying image name here<br />will override any proxy image values specified via the Kubernetes<br />operator's Helm chart values or PROXY_IMAGE env var in the operator<br />Deployment.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#image |  |  |
 | `imagePullPolicy` _[PullPolicy](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#pullpolicy-v1-core)_ | Image pull policy. One of Always, Never, IfNotPresent. Defaults to Always.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#image |  | Enum: [Always Never IfNotPresent] <br /> |
 | `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#resourcerequirements-v1-core)_ | Container resource requirements.<br />By default Tailscale Kubernetes operator does not apply any resource<br />requirements. The amount of resources required wil depend on the<br />amount of resources the operator needs to parse, usage patterns and<br />cluster size.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#resources |  |  |
-| `securityContext` _[SecurityContext](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#securitycontext-v1-core)_ | Container security context.<br />Security context specified here will override the security context by the operator.<br />By default the operator:<br />- sets 'privileged: true' for the init container<br />- set NET_ADMIN capability for tailscale container for proxies that<br />are created for Services or Connector.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#security-context |  |  |
+| `securityContext` _[SecurityContext](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#securitycontext-v1-core)_ | Container security context.<br />Security context specified here will override the security context set by the operator.<br />By default the operator sets the Tailscale container and the Tailscale init container to privileged<br />for proxies created for Tailscale ingress and egress Service, Connector and ProxyGroup.<br />You can reduce the permissions of the Tailscale container to cap NET_ADMIN by<br />installing device plugin in your cluster and configuring the proxies tun device to be created<br />by the device plugin, see  https://github.com/tailscale/tailscale/issues/10814#issuecomment-2479977752<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#security-context |  |  |
 | `debug` _[Debug](#debug)_ | Configuration for enabling extra debug information in the container.<br />Not recommended for production use. |  |  |
 
 
@@ -326,7 +326,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `enable` _boolean_ | Setting enable to true will make the proxy serve Tailscale metrics<br />at <pod-ip>:9002/metrics.<br />In 1.78.x and 1.80.x, this field also serves as the default value for<br />.spec.statefulSet.pod.tailscaleContainer.debug.enable. From 1.82.0, both<br />fields will independently default to false.<br />Defaults to false. |  |  |
+| `enable` _boolean_ | Setting enable to true will make the proxy serve Tailscale metrics<br />at <pod-ip>:9002/metrics.<br />A metrics Service named <proxy-statefulset>-metrics will also be created in the operator's namespace and will<br />serve the metrics at <service-ip>:9002/metrics.<br />In 1.78.x and 1.80.x, this field also serves as the default value for<br />.spec.statefulSet.pod.tailscaleContainer.debug.enable. From 1.82.0, both<br />fields will independently default to false.<br />Defaults to false. |  |  |
+| `serviceMonitor` _[ServiceMonitor](#servicemonitor)_ | Enable to create a Prometheus ServiceMonitor for scraping the proxy's Tailscale metrics.<br />The ServiceMonitor will select the metrics Service that gets created when metrics are enabled.<br />The ingested metrics for each Service monitor will have labels to identify the proxy:<br />ts_proxy_type: ingress_service\|ingress_resource\|connector\|proxygroup<br />ts_proxy_parent_name: name of the parent resource (i.e name of the Connector, Tailscale Ingress, Tailscale Service or ProxyGroup)<br />ts_proxy_parent_namespace: namespace of the parent resource (if the parent resource is not cluster scoped)<br />job: ts_<proxy type>_[<parent namespace>]_<parent_name> |  |  |
 
 
 #### Name
@@ -507,7 +508,16 @@ _Appears in:_
 
 
 
+ProxyGroup defines a set of Tailscale devices that will act as proxies.
+Currently only egress ProxyGroups are supported.
 
+Use the tailscale.com/proxy-group annotation on a Service to specify that
+the egress proxy should be implemented by a ProxyGroup instead of a single
+dedicated proxy. In addition to running a highly available set of proxies,
+ProxyGroup also allows for serving many annotated Services from a single
+set of proxies to minimise resource consumption.
+
+More info: https://tailscale.com/kb/1438/kubernetes-operator-cluster-egress
 
 
 
@@ -601,7 +611,11 @@ _Appears in:_
 
 
 
+Recorder defines a tsrecorder device for recording SSH sessions. By default,
+it will store recordings in a local ephemeral volume. If you want to persist
+recordings, you can configure an S3-compatible API for storage.
 
+More info: https://tailscale.com/kb/1484/kubernetes-operator-deploying-tsrecorder
 
 
 
@@ -834,6 +848,22 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `name` _string_ | The name of a Kubernetes Secret in the operator's namespace that contains<br />credentials for writing to the configured bucket. Each key-value pair<br />from the secret's data will be mounted as an environment variable. It<br />should include keys for AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY if<br />using a static access key. |  |  |
+
+
+#### ServiceMonitor
+
+
+
+
+
+
+
+_Appears in:_
+- [Metrics](#metrics)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enable` _boolean_ | If Enable is set to true, a Prometheus ServiceMonitor will be created. Enable can only be set to true if metrics are enabled. |  |  |
 
 
 #### StatefulSet

@@ -83,6 +83,7 @@ var handler = map[string]localAPIHandler{
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
 	// without a trailing slash:
+	"alpha-set-device-attrs":      (*Handler).serveSetDeviceAttrs, // see tailscale/corp#24690
 	"bugreport":                   (*Handler).serveBugReport,
 	"check-ip-forwarding":         (*Handler).serveCheckIPForwarding,
 	"check-prefs":                 (*Handler).serveCheckPrefs,
@@ -446,6 +447,33 @@ func (h *Handler) serveWhoIs(w http.ResponseWriter, r *http.Request) {
 	h.serveWhoIsWithBackend(w, r, h.b)
 }
 
+// serveSetDeviceAttrs is (as of 2024-12-30) an experimental LocalAPI handler to
+// set device attributes via the control plane.
+//
+// See tailscale/corp#24690.
+func (h *Handler) serveSetDeviceAttrs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if !h.PermitWrite {
+		http.Error(w, "set-device-attrs access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "PATCH" {
+		http.Error(w, "only PATCH allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.b.SetDeviceAttrs(ctx, req); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	io.WriteString(w, "{}\n")
+}
+
 // localBackendWhoIsMethods is the subset of ipn.LocalBackend as needed
 // by the localapi WhoIs method.
 type localBackendWhoIsMethods interface {
@@ -634,6 +662,13 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 		}
 	case "pick-new-derp":
 		err = h.b.DebugPickNewDERP()
+	case "force-prefer-derp":
+		var n int
+		err = json.NewDecoder(r.Body).Decode(&n)
+		if err != nil {
+			break
+		}
+		h.b.DebugForcePreferDERP(n)
 	case "":
 		err = fmt.Errorf("missing parameter 'action'")
 	default:

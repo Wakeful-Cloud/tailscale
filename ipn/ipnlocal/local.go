@@ -2920,6 +2920,12 @@ func (b *LocalBackend) DebugPickNewDERP() error {
 	return b.sys.MagicSock.Get().DebugPickNewDERP()
 }
 
+// DebugForcePreferDERP forwards to netcheck.DebugForcePreferDERP.
+// See its docs.
+func (b *LocalBackend) DebugForcePreferDERP(n int) {
+	b.sys.MagicSock.Get().DebugForcePreferDERP(n)
+}
+
 // send delivers n to the connected frontend and any API watchers from
 // LocalBackend.WatchNotifications (via the LocalAPI).
 //
@@ -6400,6 +6406,20 @@ func (b *LocalBackend) SetExpirySooner(ctx context.Context, expiry time.Time) er
 		return errors.New("not running")
 	}
 	return cc.SetExpirySooner(ctx, expiry)
+}
+
+// SetDeviceAttrs does a synchronous call to the control plane to update
+// the node's attributes.
+//
+// See docs on [tailcfg.SetDeviceAttributesRequest] for background.
+func (b *LocalBackend) SetDeviceAttrs(ctx context.Context, attrs tailcfg.AttrUpdate) error {
+	b.mu.Lock()
+	cc := b.ccAuto
+	b.mu.Unlock()
+	if cc == nil {
+		return errors.New("not running")
+	}
+	return cc.SetDeviceAttrs(ctx, attrs)
 }
 
 // exitNodeCanProxyDNS reports the DoH base URL ("http://foo/dns-query") without query parameters

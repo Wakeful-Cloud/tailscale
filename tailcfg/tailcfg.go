@@ -152,7 +152,8 @@ type CapabilityVersion int
 //   - 107: 2024-10-30: add App Connector to conffile (PR #13942)
 //   - 108: 2024-11-08: Client sends ServicesHash in Hostinfo, understands c2n GET /vip-services.
 //   - 109: 2024-11-18: Client supports filtertype.Match.SrcCaps (issue #12542)
-const CurrentCapabilityVersion CapabilityVersion = 109
+//   - 110: 2024-12-12: removed never-before-used Tailscale SSH public key support (#14373)
+const CurrentCapabilityVersion CapabilityVersion = 110
 
 type StableID string
 
@@ -1452,11 +1453,6 @@ const (
 	// user groups as Kubernetes user groups. This capability is read by
 	// peers that are Tailscale Kubernetes operator instances.
 	PeerCapabilityKubernetes PeerCapability = "tailscale.com/cap/kubernetes"
-
-	// PeerCapabilityServicesDestination grants a peer the ability to serve as
-	// a destination for a set of given VIP services, which is provided as the
-	// value of this key in NodeCapMap.
-	PeerCapabilityServicesDestination PeerCapability = "tailscale.com/cap/services-destination"
 )
 
 // NodeCapMap is a map of capabilities to their optional values. It is valid for
@@ -2400,6 +2396,15 @@ const (
 	// NodeAttrSSHEnvironmentVariables enables logic for handling environment variables sent
 	// via SendEnv in the SSH server and applying them to the SSH session.
 	NodeAttrSSHEnvironmentVariables NodeCapability = "ssh-env-vars"
+
+	// NodeAttrServiceHost indicates the VIP Services for which the client is
+	// approved to act as a service host, and which IP addresses are assigned
+	// to those VIP Services. Any VIP Services that the client is not
+	// advertising can be ignored.
+	// Each value of this key in [NodeCapMap] is of type [ServiceIPMappings].
+	// If multiple values of this key exist, they should be merged in sequence
+	// (replace conflicting keys).
+	NodeAttrServiceHost NodeCapability = "service-host"
 )
 
 // SetDNSRequest is a request to add a DNS record.
@@ -2449,6 +2454,34 @@ type HealthChangeRequest struct {
 	// In clients <= 1.62.0 it was always the zero value.
 	NodeKey key.NodePublic
 }
+
+// SetDeviceAttributesRequest is a request to update the
+// current node's device posture attributes.
+//
+// As of 2024-12-30, this is an experimental dev feature
+// for internal testing. See tailscale/corp#24690.
+type SetDeviceAttributesRequest struct {
+	// Version is the current binary's [CurrentCapabilityVersion].
+	Version CapabilityVersion
+
+	// NodeKey identifies the node to modify. It should be the currently active
+	// node and is an error if not.
+	NodeKey key.NodePublic
+
+	// Update is a map of device posture attributes to update.
+	// Attributes not in the map are left unchanged.
+	Update AttrUpdate
+}
+
+// AttrUpdate is a map of attributes to update.
+// Attributes not in the map are left unchanged.
+// The value can be a string, float64, bool, or nil to delete.
+//
+// See https://tailscale.com/s/api-device-posture-attrs.
+//
+// TODO(bradfitz): add struct type for specifying optional associated data
+// for each attribute value, like an expiry time?
+type AttrUpdate map[string]any
 
 // SSHPolicy is the policy for how to handle incoming SSH connections
 // over Tailscale.
@@ -2525,16 +2558,13 @@ type SSHPrincipal struct {
 	Any       bool         `json:"any,omitempty"`       // if true, match any connection
 	// TODO(bradfitz): add StableUserID, once that exists
 
-	// PubKeys, if non-empty, means that this SSHPrincipal only
-	// matches if one of these public keys is presented by the user.
+	// UnusedPubKeys was public key support. It never became an official product
+	// feature and so as of 2024-12-12 is being removed.
+	// This stub exists to remind us not to re-use the JSON field name "pubKeys"
+	// in the future if we bring it back with different semantics.
 	//
-	// As a special case, if len(PubKeys) == 1 and PubKeys[0] starts
-	// with "https://", then it's fetched (like https://github.com/username.keys).
-	// In that case, the following variable expansions are also supported
-	// in the URL:
-	//   * $LOGINNAME_EMAIL ("foo@bar.com" or "foo@github")
-	//   * $LOGINNAME_LOCALPART (the "foo" from either of the above)
-	PubKeys []string `json:"pubKeys,omitempty"`
+	// Deprecated: do not use. It does nothing.
+	UnusedPubKeys []string `json:"pubKeys,omitempty"`
 }
 
 // SSHAction is how to handle an incoming connection.
@@ -2885,3 +2915,21 @@ type EarlyNoise struct {
 // For some request types, the header may have multiple values. (e.g. OldNodeKey
 // vs NodeKey)
 const LBHeader = "Ts-Lb"
+
+// ServiceIPMappings maps service names (strings that conform to
+// [CheckServiceName]) to lists of IP addresses. This is used as the value of
+// the [NodeAttrServiceHost] capability, to inform service hosts what IP
+// addresses they need to listen on for each service that they are advertising.
+//
+// This is of the form:
+//
+//	{
+//	  "svc:samba": ["100.65.32.1", "fd7a:115c:a1e0::1234"],
+//	  "svc:web": ["100.102.42.3", "fd7a:115c:a1e0::abcd"],
+//	}
+//
+// where the IP addresses are the IPs of the VIP services. These IPs are also
+// provided in AllowedIPs, but this lets the client know which services
+// correspond to those IPs. Any services that don't correspond to a service
+// this client is hosting can be ignored.
+type ServiceIPMappings map[string][]netip.Addr
