@@ -38,7 +38,6 @@ import (
 
 	"go4.org/mem"
 	"go4.org/netipx"
-	xmaps "golang.org/x/exp/maps"
 	"golang.org/x/net/dns/dnsmessage"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"tailscale.com/appc"
@@ -104,6 +103,7 @@ import (
 	"tailscale.com/util/osuser"
 	"tailscale.com/util/rands"
 	"tailscale.com/util/set"
+	"tailscale.com/util/slicesx"
 	"tailscale.com/util/syspolicy"
 	"tailscale.com/util/syspolicy/rsop"
 	"tailscale.com/util/systemd"
@@ -163,7 +163,7 @@ type watchSession struct {
 	ch        chan *ipn.Notify
 	owner     ipnauth.Actor // or nil
 	sessionID string
-	cancel    func() // call to signal that the session must be terminated
+	cancel    context.CancelFunc // to shut down the session
 }
 
 // LocalBackend is the glue between the major pieces of the Tailscale
@@ -1126,11 +1126,10 @@ func (b *LocalBackend) UpdateStatus(sb *ipnstate.StatusBuilder) {
 					ss.Capabilities = make([]tailcfg.NodeCapability, 1, cm.Len()+1)
 					ss.Capabilities[0] = "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508"
 					ss.CapMap = make(tailcfg.NodeCapMap, sn.CapMap().Len())
-					cm.Range(func(k tailcfg.NodeCapability, v views.Slice[tailcfg.RawMessage]) bool {
+					for k, v := range cm.All() {
 						ss.CapMap[k] = v.AsSlice()
 						ss.Capabilities = append(ss.Capabilities, k)
-						return true
-					})
+					}
 					slices.Sort(ss.Capabilities[1:])
 				}
 			}
@@ -1192,10 +1191,9 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 		}
 		if cm := p.CapMap(); cm.Len() > 0 {
 			ps.CapMap = make(tailcfg.NodeCapMap, cm.Len())
-			cm.Range(func(k tailcfg.NodeCapability, v views.Slice[tailcfg.RawMessage]) bool {
+			for k, v := range cm.All() {
 				ps.CapMap[k] = v.AsSlice()
-				return true
-			})
+			}
 		}
 		peerStatusFromNode(ps, p)
 
@@ -2022,7 +2020,7 @@ func (b *LocalBackend) DisablePortMapperForTest() {
 func (b *LocalBackend) PeersForTest() []tailcfg.NodeView {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	ret := xmaps.Values(b.peers)
+	ret := slicesx.MapValues(b.peers)
 	slices.SortFunc(ret, func(a, b tailcfg.NodeView) int {
 		return cmp.Compare(a.ID(), b.ID())
 	})
@@ -5884,12 +5882,11 @@ func (b *LocalBackend) setTCPPortsInterceptedFromNetmapAndPrefsLocked(prefs ipn.
 	b.reloadServeConfigLocked(prefs)
 	if b.serveConfig.Valid() {
 		servePorts := make([]uint16, 0, 3)
-		b.serveConfig.RangeOverTCPs(func(port uint16, _ ipn.TCPPortHandlerView) bool {
+		for port := range b.serveConfig.TCPs() {
 			if port > 0 {
 				servePorts = append(servePorts, uint16(port))
 			}
-			return true
-		})
+		}
 		handlePorts = append(handlePorts, servePorts...)
 
 		b.setServeProxyHandlersLocked()
@@ -5917,16 +5914,16 @@ func (b *LocalBackend) setServeProxyHandlersLocked() {
 		return
 	}
 	var backends map[string]bool
-	b.serveConfig.RangeOverWebs(func(_ ipn.HostPort, conf ipn.WebServerConfigView) (cont bool) {
-		conf.Handlers().Range(func(_ string, h ipn.HTTPHandlerView) (cont bool) {
+	for _, conf := range b.serveConfig.Webs() {
+		for _, h := range conf.Handlers().All() {
 			backend := h.Proxy()
 			if backend == "" {
 				// Only create proxy handlers for servers with a proxy backend.
-				return true
+				continue
 			}
 			mak.Set(&backends, backend, true)
 			if _, ok := b.serveProxyHandlers.Load(backend); ok {
-				return true
+				continue
 			}
 
 			b.logf("serve: creating a new proxy handler for %s", backend)
@@ -5935,13 +5932,11 @@ func (b *LocalBackend) setServeProxyHandlersLocked() {
 				// The backend endpoint (h.Proxy) should have been validated by expandProxyTarget
 				// in the CLI, so just log the error here.
 				b.logf("[unexpected] could not create proxy for %v: %s", backend, err)
-				return true
+				continue
 			}
 			b.serveProxyHandlers.Store(backend, p)
-			return true
-		})
-		return true
-	})
+		}
+	}
 
 	// Clean up handlers for proxy backends that are no longer present
 	// in configuration.
@@ -7375,9 +7370,9 @@ func suggestExitNode(report *netcheck.Report, netMap *netmap.NetworkMap, prevSug
 	// First, try to select an exit node that has the closest DERP home, based on lastReport's DERP latency.
 	// If there are no latency values, it returns an arbitrary region
 	if len(candidatesByRegion) > 0 {
-		minRegion := minLatencyDERPRegion(xmaps.Keys(candidatesByRegion), report)
+		minRegion := minLatencyDERPRegion(slicesx.MapKeys(candidatesByRegion), report)
 		if minRegion == 0 {
-			minRegion = selectRegion(views.SliceOf(xmaps.Keys(candidatesByRegion)))
+			minRegion = selectRegion(views.SliceOf(slicesx.MapKeys(candidatesByRegion)))
 		}
 		regionCandidates, ok := candidatesByRegion[minRegion]
 		if !ok {
@@ -7636,5 +7631,5 @@ func vipServicesFromPrefs(prefs ipn.PrefsView) []*tailcfg.VIPService {
 		services[s].Active = true
 	}
 
-	return slices.Collect(maps.Values(services))
+	return slicesx.MapValues(services)
 }

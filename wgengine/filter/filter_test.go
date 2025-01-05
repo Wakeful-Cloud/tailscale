@@ -18,7 +18,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"go4.org/netipx"
-	xmaps "golang.org/x/exp/maps"
 	"tailscale.com/net/flowtrack"
 	"tailscale.com/net/ipset"
 	"tailscale.com/net/packet"
@@ -30,6 +29,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
 	"tailscale.com/util/must"
+	"tailscale.com/util/slicesx"
 	"tailscale.com/wgengine/filter/filtertype"
 )
 
@@ -768,7 +768,7 @@ func ports(s string) PortRange {
 	if err != nil {
 		panic(fmt.Sprintf("invalid NetPortRange %q", s))
 	}
-	return PortRange{uint16(first), uint16(last)}
+	return PortRange{First: uint16(first), Last: uint16(last)}
 }
 
 func netports(netPorts ...string) (ret []NetPortRange) {
@@ -814,11 +814,11 @@ func TestMatchesFromFilterRules(t *testing.T) {
 					Dsts: []NetPortRange{
 						{
 							Net:   netip.MustParsePrefix("0.0.0.0/0"),
-							Ports: PortRange{22, 22},
+							Ports: PortRange{First: 22, Last: 22},
 						},
 						{
 							Net:   netip.MustParsePrefix("::0/0"),
-							Ports: PortRange{22, 22},
+							Ports: PortRange{First: 22, Last: 22},
 						},
 					},
 					Srcs: []netip.Prefix{
@@ -848,7 +848,7 @@ func TestMatchesFromFilterRules(t *testing.T) {
 					Dsts: []NetPortRange{
 						{
 							Net:   netip.MustParsePrefix("1.2.0.0/16"),
-							Ports: PortRange{22, 22},
+							Ports: PortRange{First: 22, Last: 22},
 						},
 					},
 					Srcs: []netip.Prefix{
@@ -997,7 +997,7 @@ func TestPeerCaps(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := xmaps.Keys(filt.CapsWithValues(netip.MustParseAddr(tt.src), netip.MustParseAddr(tt.dst)))
+			got := slicesx.MapKeys(filt.CapsWithValues(netip.MustParseAddr(tt.src), netip.MustParseAddr(tt.dst)))
 			slices.Sort(got)
 			slices.Sort(tt.want)
 			if !slices.Equal(got, tt.want) {
