@@ -103,9 +103,9 @@ func TestTailscaleIngress(t *testing.T) {
 	}
 	opts.serveConfig = serveConfig
 
-	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
-	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"), nil)
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSecret(t, fc, opts))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
 
 	// 2. Ingress status gets updated with ingress proxy's MagicDNS name
 	// once that becomes available.
@@ -120,7 +120,7 @@ func TestTailscaleIngress(t *testing.T) {
 			{Hostname: "foo.tailnetxyz.ts.net", Ports: []networkingv1.IngressPortStatus{{Port: 443, Protocol: "TCP"}}},
 		},
 	}
-	expectEqual(t, fc, ing, nil)
+	expectEqual(t, fc, ing)
 
 	// 3. Resources get created for Ingress that should allow forwarding
 	// cluster traffic
@@ -129,7 +129,7 @@ func TestTailscaleIngress(t *testing.T) {
 	})
 	opts.shouldEnableForwardingClusterTrafficViaIngress = true
 	expectReconciled(t, ingR, "default", "test")
-	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation, removeResourceReqs)
 
 	// 4. Resources get cleaned up when Ingress class is unset
 	mustUpdate(t, fc, "default", "test", func(ing *networkingv1.Ingress) {
@@ -229,9 +229,9 @@ func TestTailscaleIngressHostname(t *testing.T) {
 	}
 	opts.serveConfig = serveConfig
 
-	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
-	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"), nil)
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSecret(t, fc, opts))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
 
 	// 2. Ingress proxy with capability version >= 110 does not have an HTTPS endpoint set
 	mustUpdate(t, fc, "operator-ns", opts.secretName, func(secret *corev1.Secret) {
@@ -243,7 +243,7 @@ func TestTailscaleIngressHostname(t *testing.T) {
 	expectReconciled(t, ingR, "default", "test")
 	ing.Finalizers = append(ing.Finalizers, "tailscale.com/finalizer")
 
-	expectEqual(t, fc, ing, nil)
+	expectEqual(t, fc, ing)
 
 	// 3. Ingress proxy with capability version >= 110 advertises HTTPS endpoint
 	mustUpdate(t, fc, "operator-ns", opts.secretName, func(secret *corev1.Secret) {
@@ -259,7 +259,7 @@ func TestTailscaleIngressHostname(t *testing.T) {
 			{Hostname: "foo.tailnetxyz.ts.net", Ports: []networkingv1.IngressPortStatus{{Port: 443, Protocol: "TCP"}}},
 		},
 	}
-	expectEqual(t, fc, ing, nil)
+	expectEqual(t, fc, ing)
 
 	// 4. Ingress proxy with capability version >= 110 does not have an HTTPS endpoint ready
 	mustUpdate(t, fc, "operator-ns", opts.secretName, func(secret *corev1.Secret) {
@@ -271,7 +271,7 @@ func TestTailscaleIngressHostname(t *testing.T) {
 	})
 	expectReconciled(t, ingR, "default", "test")
 	ing.Status.LoadBalancer.Ingress = nil
-	expectEqual(t, fc, ing, nil)
+	expectEqual(t, fc, ing)
 
 	// 5. Ingress proxy's state has https_endpoints set, but its capver is not matching Pod UID (downgrade)
 	mustUpdate(t, fc, "operator-ns", opts.secretName, func(secret *corev1.Secret) {
@@ -287,7 +287,7 @@ func TestTailscaleIngressHostname(t *testing.T) {
 		},
 	}
 	expectReconciled(t, ingR, "default", "test")
-	expectEqual(t, fc, ing, nil)
+	expectEqual(t, fc, ing)
 }
 
 func TestTailscaleIngressWithProxyClass(t *testing.T) {
@@ -295,7 +295,7 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 	pc := &tsapi.ProxyClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "custom-metadata"},
 		Spec: tsapi.ProxyClassSpec{StatefulSet: &tsapi.StatefulSet{
-			Labels:      map[string]string{"foo": "bar"},
+			Labels:      tsapi.Labels{"foo": "bar"},
 			Annotations: map[string]string{"bar.io/foo": "some-val"},
 			Pod:         &tsapi.Pod{Annotations: map[string]string{"foo.io/bar": "some-val"}}}},
 	}
@@ -383,9 +383,9 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 	}
 	opts.serveConfig = serveConfig
 
-	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
-	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"), nil)
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSecret(t, fc, opts))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
 
 	// 2. Ingress is updated to specify a ProxyClass, ProxyClass is not yet
 	// ready, so proxy resource configuration does not change.
@@ -393,7 +393,7 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 		mak.Set(&ing.ObjectMeta.Labels, LabelProxyClass, "custom-metadata")
 	})
 	expectReconciled(t, ingR, "default", "test")
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
 
 	// 3. ProxyClass is set to Ready by proxy-class reconciler. Ingress get
 	// reconciled and configuration from the ProxyClass is applied to the
@@ -408,7 +408,7 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 	})
 	expectReconciled(t, ingR, "default", "test")
 	opts.proxyClass = pc.Name
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
 
 	// 4. tailscale.com/proxy-class label is removed from the Ingress, the
 	// Ingress gets reconciled and the custom ProxyClass configuration is
@@ -418,18 +418,13 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 	})
 	expectReconciled(t, ingR, "default", "test")
 	opts.proxyClass = ""
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation, removeResourceReqs)
 }
 
 func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 	pc := &tsapi.ProxyClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "metrics", Generation: 1},
-		Spec: tsapi.ProxyClassSpec{
-			Metrics: &tsapi.Metrics{
-				Enable:         true,
-				ServiceMonitor: &tsapi.ServiceMonitor{Enable: true},
-			},
-		},
+		Spec:       tsapi.ProxyClassSpec{},
 		Status: tsapi.ProxyClassStatus{
 			Conditions: []metav1.Condition{{
 				Status:             metav1.ConditionTrue,
@@ -437,32 +432,6 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 				ObservedGeneration: 1,
 			}}},
 	}
-	crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: serviceMonitorCRD}}
-	tsIngressClass := &networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Name: "tailscale"}, Spec: networkingv1.IngressClassSpec{Controller: "tailscale.com/ts-ingress"}}
-	fc := fake.NewClientBuilder().
-		WithScheme(tsapi.GlobalScheme).
-		WithObjects(pc, tsIngressClass).
-		WithStatusSubresource(pc).
-		Build()
-	ft := &fakeTSClient{}
-	fakeTsnetServer := &fakeTSNetServer{certDomains: []string{"foo.com"}}
-	zl, err := zap.NewDevelopment()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ingR := &IngressReconciler{
-		Client: fc,
-		ssr: &tailscaleSTSReconciler{
-			Client:            fc,
-			tsClient:          ft,
-			tsnetServer:       fakeTsnetServer,
-			defaultTags:       []string{"tag:k8s"},
-			operatorNamespace: "operator-ns",
-			proxyImage:        "tailscale/tailscale",
-		},
-		logger: zl.Sugar(),
-	}
-	// 1. Enable metrics- expect metrics Service to be created
 	ing := &networkingv1.Ingress{
 		TypeMeta: metav1.TypeMeta{Kind: "Ingress", APIVersion: "networking.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -491,8 +460,7 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 			},
 		},
 	}
-	mustCreate(t, fc, ing)
-	mustCreate(t, fc, &corev1.Service{
+	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "default",
@@ -504,11 +472,38 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 				Name: "http"},
 			},
 		},
-	})
-
+	}
+	crd := &apiextensionsv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: serviceMonitorCRD}}
+	tsIngressClass := &networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Name: "tailscale"}, Spec: networkingv1.IngressClassSpec{Controller: "tailscale.com/ts-ingress"}}
+	fc := fake.NewClientBuilder().
+		WithScheme(tsapi.GlobalScheme).
+		WithObjects(pc, tsIngressClass, ing, svc).
+		WithStatusSubresource(pc).
+		Build()
+	ft := &fakeTSClient{}
+	fakeTsnetServer := &fakeTSNetServer{certDomains: []string{"foo.com"}}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingR := &IngressReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			tsnetServer:       fakeTsnetServer,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
+	}
 	expectReconciled(t, ingR, "default", "test")
-
 	fullName, shortName := findGenName(t, fc, "default", "test", "ingress")
+	serveConfig := &ipn.ServeConfig{
+		TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: "http://1.2.3.4:8080/"}}}},
+	}
 	opts := configOpts{
 		stsName:            shortName,
 		secretName:         fullName,
@@ -517,27 +512,51 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 		parentType:         "ingress",
 		hostname:           "default-test",
 		app:                kubetypes.AppIngressResource,
-		enableMetrics:      true,
 		namespaced:         true,
 		proxyType:          proxyTypeIngressResource,
+		serveConfig:        serveConfig,
+		resourceVersion:    "1",
 	}
-	serveConfig := &ipn.ServeConfig{
-		TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
-		Web: map[ipn.HostPort]*ipn.WebServerConfig{"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: "http://1.2.3.4:8080/"}}}},
-	}
-	opts.serveConfig = serveConfig
 
-	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
-	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"), nil)
-	expectEqual(t, fc, expectedMetricsService(opts), nil)
-	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeHashAnnotation)
+	// 1. Enable metrics- expect metrics Service to be created
+	mustUpdate(t, fc, "", "metrics", func(proxyClass *tsapi.ProxyClass) {
+		proxyClass.Spec.Metrics = &tsapi.Metrics{Enable: true}
+	})
+	opts.enableMetrics = true
+
+	expectReconciled(t, ingR, "default", "test")
+
+	expectEqual(t, fc, expectedMetricsService(opts))
+
 	// 2. Enable ServiceMonitor - should not error when there is no ServiceMonitor CRD in cluster
 	mustUpdate(t, fc, "", "metrics", func(pc *tsapi.ProxyClass) {
-		pc.Spec.Metrics.ServiceMonitor = &tsapi.ServiceMonitor{Enable: true}
+		pc.Spec.Metrics.ServiceMonitor = &tsapi.ServiceMonitor{Enable: true, Labels: tsapi.Labels{"foo": "bar"}}
 	})
 	expectReconciled(t, ingR, "default", "test")
+	expectEqual(t, fc, expectedMetricsService(opts))
+
 	// 3. Create ServiceMonitor CRD and reconcile- ServiceMonitor should get created
 	mustCreate(t, fc, crd)
 	expectReconciled(t, ingR, "default", "test")
+	opts.serviceMonitorLabels = tsapi.Labels{"foo": "bar"}
+	expectEqual(t, fc, expectedMetricsService(opts))
 	expectEqualUnstructured(t, fc, expectedServiceMonitor(t, opts))
+
+	// 4. Update ServiceMonitor CRD and reconcile- ServiceMonitor should get updated
+	mustUpdate(t, fc, pc.Namespace, pc.Name, func(proxyClass *tsapi.ProxyClass) {
+		proxyClass.Spec.Metrics.ServiceMonitor.Labels = nil
+	})
+	expectReconciled(t, ingR, "default", "test")
+	opts.serviceMonitorLabels = nil
+	opts.resourceVersion = "2"
+	expectEqual(t, fc, expectedMetricsService(opts))
+	expectEqualUnstructured(t, fc, expectedServiceMonitor(t, opts))
+
+	// 5. Disable metrics - metrics resources should get deleted.
+	mustUpdate(t, fc, pc.Namespace, pc.Name, func(proxyClass *tsapi.ProxyClass) {
+		proxyClass.Spec.Metrics = nil
+	})
+	expectReconciled(t, ingR, "default", "test")
+	expectMissing[corev1.Service](t, fc, "operator-ns", metricsResourceName(shortName))
+	// ServiceMonitor gets garbage collected when the Service is deleted - we cannot test that here.
 }

@@ -17,6 +17,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/ctxkey"
 	"tailscale.com/util/osuser"
+	"tailscale.com/util/syspolicy"
 	"tailscale.com/version"
 )
 
@@ -58,6 +59,24 @@ func newActor(logf logger.Logf, c net.Conn) (*actor, error) {
 	return &actor{logf: logf, ci: ci, clientID: clientID, isLocalSystem: connIsLocalSystem(ci)}, nil
 }
 
+// CheckProfileAccess implements [ipnauth.Actor].
+func (a *actor) CheckProfileAccess(profile ipn.LoginProfileView, requestedAccess ipnauth.ProfileAccess) error {
+	if profile.LocalUserID() != a.UserID() {
+		return errors.New("the target profile does not belong to the user")
+	}
+	switch requestedAccess {
+	case ipnauth.Disconnect:
+		if alwaysOn, _ := syspolicy.GetBoolean(syspolicy.AlwaysOn, false); alwaysOn {
+			// TODO(nickkhyl): check if disconnecting with justifications is allowed
+			// and whether a justification is included in the request.
+			return errors.New("profile access denied: always-on mode is enabled")
+		}
+		return nil
+	default:
+		return errors.New("the requested operation is not allowed")
+	}
+}
+
 // IsLocalSystem implements [ipnauth.Actor].
 func (a *actor) IsLocalSystem() bool {
 	return a.isLocalSystem
@@ -96,7 +115,7 @@ func (a *actor) Username() (string, error) {
 		}
 		defer tok.Close()
 		return tok.Username()
-	case "darwin", "linux":
+	case "darwin", "linux", "illumos", "solaris":
 		uid, ok := a.ci.Creds().UserID()
 		if !ok {
 			return "", errors.New("missing user ID")
@@ -112,11 +131,11 @@ func (a *actor) Username() (string, error) {
 }
 
 type actorOrError struct {
-	actor *actor
+	actor ipnauth.Actor
 	err   error
 }
 
-func (a actorOrError) unwrap() (*actor, error) {
+func (a actorOrError) unwrap() (ipnauth.Actor, error) {
 	return a.actor, a.err
 }
 
@@ -131,9 +150,9 @@ func contextWithActor(ctx context.Context, logf logger.Logf, c net.Conn) context
 	return actorKey.WithValue(ctx, actorOrError{actor: actor, err: err})
 }
 
-// actorFromContext returns an [actor] associated with ctx,
+// actorFromContext returns an [ipnauth.Actor] associated with ctx,
 // or an error if the context does not carry an actor's identity.
-func actorFromContext(ctx context.Context) (*actor, error) {
+func actorFromContext(ctx context.Context) (ipnauth.Actor, error) {
 	return actorKey.Value(ctx).unwrap()
 }
 

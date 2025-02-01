@@ -26,6 +26,16 @@ const (
 	ControlURL Key = "LoginURL"  // default ""; if blank, ipn uses ipn.DefaultControlURL.
 	LogTarget  Key = "LogTarget" // default ""; if blank logging uses logtail.DefaultHost.
 	Tailnet    Key = "Tailnet"   // default ""; if blank, no tailnet name is sent to the server.
+
+	// AlwaysOn is a boolean key that controls whether Tailscale
+	// should always remain in a connected state, and the user should
+	// not be able to disconnect at their discretion.
+	//
+	// Warning: This policy setting is experimental and may change or be removed in the future.
+	// It may also not be fully supported by all Tailscale clients until it is out of experimental status.
+	// See tailscale/corp#26247, tailscale/corp#26248 and tailscale/corp#26249 for more information.
+	AlwaysOn Key = "AlwaysOn"
+
 	// ExitNodeID is the exit node's node id. default ""; if blank, no exit node is forced.
 	// Exit node ID takes precedence over exit node IP.
 	// To find the node ID, go to /api.md#device.
@@ -123,6 +133,11 @@ const (
 	// Example: "CN=Tailscale Inc Test Root CA,OU=Tailscale Inc Test Certificate Authority,O=Tailscale Inc,ST=ON,C=CA"
 	MachineCertificateSubject Key = "MachineCertificateSubject"
 
+	// Hostname is the hostname of the device that is running Tailscale.
+	// When this policy is set, it overrides the hostname that the client
+	// would otherwise obtain from the OS, e.g. by calling os.Hostname().
+	Hostname Key = "Hostname"
+
 	// Keys with a string array value.
 	// AllowedSuggestedExitNodes's string array value is a list of exit node IDs that restricts which exit nodes are considered when generating suggestions for exit nodes.
 	AllowedSuggestedExitNodes Key = "AllowedSuggestedExitNodes"
@@ -134,6 +149,7 @@ const (
 var implicitDefinitions = []*setting.Definition{
 	// Device policy settings (can only be configured on a per-device basis):
 	setting.NewDefinition(AllowedSuggestedExitNodes, setting.DeviceSetting, setting.StringListValue),
+	setting.NewDefinition(AlwaysOn, setting.DeviceSetting, setting.BooleanValue),
 	setting.NewDefinition(ApplyUpdates, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(AuthKey, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(CheckUpdates, setting.DeviceSetting, setting.PreferenceOptionValue),
@@ -148,6 +164,7 @@ var implicitDefinitions = []*setting.Definition{
 	setting.NewDefinition(ExitNodeID, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(ExitNodeIP, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(FlushDNSOnSessionUnlock, setting.DeviceSetting, setting.BooleanValue),
+	setting.NewDefinition(Hostname, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(LogSCMInteractions, setting.DeviceSetting, setting.BooleanValue),
 	setting.NewDefinition(LogTarget, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(MachineCertificateSubject, setting.DeviceSetting, setting.StringValue),

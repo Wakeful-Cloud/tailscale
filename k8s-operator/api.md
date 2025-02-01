@@ -313,6 +313,37 @@ _Appears in:_
 
 
 
+#### LabelValue
+
+_Underlying type:_ _string_
+
+
+
+_Validation:_
+- MaxLength: 63
+- Pattern: `^(([a-zA-Z0-9][-._a-zA-Z0-9]*)?[a-zA-Z0-9])?$`
+- Type: string
+
+_Appears in:_
+- [Labels](#labels)
+
+
+
+#### Labels
+
+_Underlying type:_ _[map[string]LabelValue](#map[string]labelvalue)_
+
+
+
+
+
+_Appears in:_
+- [Pod](#pod)
+- [ServiceMonitor](#servicemonitor)
+- [StatefulSet](#statefulset)
+
+
+
 #### Metrics
 
 
@@ -407,7 +438,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `labels` _object (keys:string, values:string)_ | Labels that will be added to the proxy Pod.<br />Any labels specified here will be merged with the default labels<br />applied to the Pod by the Tailscale Kubernetes operator.<br />Label keys and values must be valid Kubernetes label keys and values.<br />https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set |  |  |
+| `labels` _[Labels](#labels)_ | Labels that will be added to the proxy Pod.<br />Any labels specified here will be merged with the default labels<br />applied to the Pod by the Tailscale Kubernetes operator.<br />Label keys and values must be valid Kubernetes label keys and values.<br />https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set |  |  |
 | `annotations` _object (keys:string, values:string)_ | Annotations that will be added to the proxy Pod.<br />Any annotations specified here will be merged with the default<br />annotations applied to the Pod by the Tailscale Kubernetes operator.<br />Annotations must be valid Kubernetes annotations.<br />https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/#syntax-and-character-set |  |  |
 | `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#affinity-v1-core)_ | Proxy Pod's affinity rules.<br />By default, the Tailscale Kubernetes operator does not apply any affinity rules.<br />https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#affinity |  |  |
 | `tailscaleContainer` _[Container](#container)_ | Configuration for the proxy container running tailscale. |  |  |
@@ -568,9 +599,9 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `type` _[ProxyGroupType](#proxygrouptype)_ | Type of the ProxyGroup proxies. Currently the only supported type is egress. |  | Enum: [egress] <br />Type: string <br /> |
+| `type` _[ProxyGroupType](#proxygrouptype)_ | Type of the ProxyGroup proxies. Currently the only supported type is egress.<br />Type is immutable once a ProxyGroup is created. |  | Enum: [egress ingress] <br />Type: string <br /> |
 | `tags` _[Tags](#tags)_ | Tags that the Tailscale devices will be tagged with. Defaults to [tag:k8s].<br />If you specify custom tags here, make sure you also make the operator<br />an owner of these tags.<br />See  https://tailscale.com/kb/1236/kubernetes-operator/#setting-up-the-kubernetes-operator.<br />Tags cannot be changed once a ProxyGroup device has been created.<br />Tag values must be in form ^tag:[a-zA-Z][a-zA-Z0-9-]*$. |  | Pattern: `^tag:[a-zA-Z][a-zA-Z0-9-]*$` <br />Type: string <br /> |
-| `replicas` _integer_ | Replicas specifies how many replicas to create the StatefulSet with.<br />Defaults to 2. |  |  |
+| `replicas` _integer_ | Replicas specifies how many replicas to create the StatefulSet with.<br />Defaults to 2. |  | Minimum: 0 <br /> |
 | `hostnamePrefix` _[HostnamePrefix](#hostnameprefix)_ | HostnamePrefix is the hostname prefix to use for tailnet devices created<br />by the ProxyGroup. Each device will have the integer number from its<br />StatefulSet pod appended to this prefix to form the full hostname.<br />HostnamePrefix can contain lower case letters, numbers and dashes, it<br />must not start with a dash and must be between 1 and 62 characters long. |  | Pattern: `^[a-z0-9][a-z0-9-]{0,61}$` <br />Type: string <br /> |
 | `proxyClass` _string_ | ProxyClass is the name of the ProxyClass custom resource that contains<br />configuration options that should be applied to the resources created<br />for this ProxyGroup. If unset, and there is no default ProxyClass<br />configured, the operator will create resources with the default<br />configuration. |  |  |
 
@@ -599,7 +630,7 @@ _Underlying type:_ _string_
 
 
 _Validation:_
-- Enum: [egress]
+- Enum: [egress ingress]
 - Type: string
 
 _Appears in:_
@@ -864,6 +895,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `enable` _boolean_ | If Enable is set to true, a Prometheus ServiceMonitor will be created. Enable can only be set to true if metrics are enabled. |  |  |
+| `labels` _[Labels](#labels)_ | Labels to add to the ServiceMonitor.<br />Labels must be valid Kubernetes labels.<br />https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set |  |  |
 
 
 #### StatefulSet
@@ -879,7 +911,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `labels` _object (keys:string, values:string)_ | Labels that will be added to the StatefulSet created for the proxy.<br />Any labels specified here will be merged with the default labels<br />applied to the StatefulSet by the Tailscale Kubernetes operator as<br />well as any other labels that might have been applied by other<br />actors.<br />Label keys and values must be valid Kubernetes label keys and values.<br />https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set |  |  |
+| `labels` _[Labels](#labels)_ | Labels that will be added to the StatefulSet created for the proxy.<br />Any labels specified here will be merged with the default labels<br />applied to the StatefulSet by the Tailscale Kubernetes operator as<br />well as any other labels that might have been applied by other<br />actors.<br />Label keys and values must be valid Kubernetes label keys and values.<br />https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set |  |  |
 | `annotations` _object (keys:string, values:string)_ | Annotations that will be added to the StatefulSet created for the proxy.<br />Any Annotations specified here will be merged with the default annotations<br />applied to the StatefulSet by the Tailscale Kubernetes operator as<br />well as any other annotations that might have been applied by other<br />actors.<br />Annotations must be valid Kubernetes annotations.<br />https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/#syntax-and-character-set |  |  |
 | `pod` _[Pod](#pod)_ | Configuration for the proxy Pod. |  |  |
 

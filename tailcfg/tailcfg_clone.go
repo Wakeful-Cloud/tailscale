@@ -26,17 +26,14 @@ func (src *User) Clone() *User {
 	}
 	dst := new(User)
 	*dst = *src
-	dst.Logins = append(src.Logins[:0:0], src.Logins...)
 	return dst
 }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _UserCloneNeedsRegeneration = User(struct {
 	ID            UserID
-	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
-	Logins        []LoginID
 	Created       time.Time
 }{})
 
@@ -102,7 +99,8 @@ var _NodeCloneNeedsRegeneration = Node(struct {
 	Addresses                     []netip.Prefix
 	AllowedIPs                    []netip.Prefix
 	Endpoints                     []netip.AddrPort
-	DERP                          string
+	LegacyDERPString              string
+	HomeDERP                      int
 	Hostinfo                      HostinfoView
 	Created                       time.Time
 	Cap                           CapabilityVersion
@@ -168,6 +166,7 @@ var _HostinfoCloneNeedsRegeneration = Hostinfo(struct {
 	ShareeNode      bool
 	NoLogsNoSupport bool
 	WireIngress     bool
+	IngressEnabled  bool
 	AllowsUpdate    bool
 	Machine         string
 	GoArch          string
@@ -302,7 +301,6 @@ func (src *RegisterResponse) Clone() *RegisterResponse {
 	}
 	dst := new(RegisterResponse)
 	*dst = *src
-	dst.User = *src.User.Clone()
 	dst.NodeKeySignature = append(src.NodeKeySignature[:0:0], src.NodeKeySignature...)
 	return dst
 }

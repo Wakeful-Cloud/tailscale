@@ -4,6 +4,7 @@
 package ipnauth
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"tailscale.com/ipn"
@@ -25,6 +26,11 @@ type Actor interface {
 	// ClientID returns a non-zero ClientID and true if the actor represents
 	// a connected LocalAPI client. Otherwise, it returns a zero value and false.
 	ClientID() (_ ClientID, ok bool)
+
+	// CheckProfileAccess checks whether the actor has the necessary access rights
+	// to perform a given action on the specified Tailscale profile.
+	// It returns an error if access is denied.
+	CheckProfileAccess(profile ipn.LoginProfileView, requestedAccess ProfileAccess) error
 
 	// IsLocalSystem reports whether the actor is the Windows' Local System account.
 	//
@@ -75,4 +81,16 @@ func (id ClientID) String() string {
 		return "(none)"
 	}
 	return fmt.Sprint(id.v)
+}
+
+// MarshalJSON implements [json.Marshaler].
+// It is primarily used for testing.
+func (id ClientID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(id.v)
+}
+
+// UnmarshalJSON implements [json.Unmarshaler].
+// It is primarily used for testing.
+func (id *ClientID) UnmarshalJSON(b []byte) error {
+	return json.Unmarshal(b, &id.v)
 }

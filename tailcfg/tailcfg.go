@@ -27,6 +27,7 @@ import (
 	"tailscale.com/types/tkatype"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/slicesx"
+	"tailscale.com/util/vizerror"
 )
 
 // CapabilityVersion represents the client's capability level. That
@@ -153,37 +154,75 @@ type CapabilityVersion int
 //   - 108: 2024-11-08: Client sends ServicesHash in Hostinfo, understands c2n GET /vip-services.
 //   - 109: 2024-11-18: Client supports filtertype.Match.SrcCaps (issue #12542)
 //   - 110: 2024-12-12: removed never-before-used Tailscale SSH public key support (#14373)
-const CurrentCapabilityVersion CapabilityVersion = 110
+//   - 111: 2025-01-14: Client supports a peer having Node.HomeDERP (issue #14636)
+//   - 112: 2025-01-14: Client interprets AllowedIPs of nil as meaning same as Addresses
+//   - 113: 2025-01-20: Client communicates to control whether funnel is enabled by sending Hostinfo.IngressEnabled (#14688)
+const CurrentCapabilityVersion CapabilityVersion = 113
 
-type StableID string
-
+// ID is an integer ID for a user, node, or login allocated by the
+// control plane.
+//
+// To be nice, control plane servers should not use int64s that are too large to
+// fit in a JavaScript number (see JavaScript's Number.MAX_SAFE_INTEGER).
+// The Tailscale-hosted control plane stopped allocating large integers in
+// March 2023 but nodes prior to that may have IDs larger than
+// MAX_SAFE_INTEGER (2^53 – 1).
+//
+// IDs must not be zero or negative.
 type ID int64
 
+// UserID is an [ID] for a [User].
 type UserID ID
 
 func (u UserID) IsZero() bool {
 	return u == 0
 }
 
+// LoginID is an [ID] for a [Login].
+//
+// It is not used in the Tailscale client, but is used in the control plane.
 type LoginID ID
 
 func (u LoginID) IsZero() bool {
 	return u == 0
 }
 
+// NodeID is a unique integer ID for a node.
+//
+// It's global within a control plane URL ("tailscale up --login-server") and is
+// (as of 2025-01-06) never re-used even after a node is deleted.
+//
+// To be nice, control plane servers should not use int64s that are too large to
+// fit in a JavaScript number (see JavaScript's Number.MAX_SAFE_INTEGER).
+// The Tailscale-hosted control plane stopped allocating large integers in
+// March 2023 but nodes prior to that may have node IDs larger than
+// MAX_SAFE_INTEGER (2^53 – 1).
+//
+// NodeIDs are not stable across control plane URLs. For more stable URLs,
+// see [StableNodeID].
 type NodeID ID
 
 func (u NodeID) IsZero() bool {
 	return u == 0
 }
 
-type StableNodeID StableID
+// StableNodeID is a string form of [NodeID].
+//
+// Different control plane servers should ideally have different StableNodeID
+// suffixes for different sites or regions.
+//
+// Being a string, it's safer to use in JavaScript without worrying about the
+// size of the integer, as documented on [NodeID].
+//
+// But in general, Tailscale APIs can accept either a [NodeID] integer or a
+// [StableNodeID] string when referring to a node.
+type StableNodeID string
 
 func (u StableNodeID) IsZero() bool {
 	return u == ""
 }
 
-// User is an IPN user.
+// User is a Tailscale user.
 //
 // A user can have multiple logins associated with it (e.g. gmail and github oauth).
 // (Note: none of our UIs support this yet.)
@@ -196,23 +235,23 @@ func (u StableNodeID) IsZero() bool {
 // have a general gmail address login associated with the user.
 type User struct {
 	ID            UserID
-	LoginName     string `json:"-"` // not stored, filled from Login // TODO REMOVE
 	DisplayName   string // if non-empty overrides Login field
 	ProfilePicURL string // if non-empty overrides Login field
-	Logins        []LoginID
 	Created       time.Time
 }
 
+// Login is a user from a specific identity provider, not associated with any
+// particular tailnet.
 type Login struct {
 	_             structs.Incomparable
-	ID            LoginID
-	Provider      string
-	LoginName     string
-	DisplayName   string
-	ProfilePicURL string
+	ID            LoginID // unused in the Tailscale client
+	Provider      string  // "google", "github", "okta_foo", etc.
+	LoginName     string  // an email address or "email-ish" string (like alice@github)
+	DisplayName   string  // from the IdP
+	ProfilePicURL string  // from the IdP
 }
 
-// A UserProfile is display-friendly data for a user.
+// A UserProfile is display-friendly data for a [User].
 // It includes the LoginName for display purposes but *not* the Provider.
 // It also includes derived data from one of the user's logins.
 type UserProfile struct {
@@ -283,6 +322,7 @@ func MarshalCapJSON[T any](capRule T) (RawMessage, error) {
 	return RawMessage(string(bs)), nil
 }
 
+// Node is a Tailscale device in a tailnet.
 type Node struct {
 	ID       NodeID
 	StableID StableNodeID
@@ -306,19 +346,37 @@ type Node struct {
 	KeySignature tkatype.MarshaledSignature `json:",omitempty"`
 	Machine      key.MachinePublic
 	DiscoKey     key.DiscoPublic
-	Addresses    []netip.Prefix   // IP addresses of this Node directly
-	AllowedIPs   []netip.Prefix   // range of IP addresses to route to this node
-	Endpoints    []netip.AddrPort `json:",omitempty"` // IP+port (public via STUN, and local LANs)
 
-	// DERP is this node's home DERP region ID integer, but shoved into an
+	// Addresses are the IP addresses of this Node directly.
+	Addresses []netip.Prefix
+
+	// AllowedIPs are the IP ranges to route to this node.
+	//
+	// As of CapabilityVersion 112, this may be nil (null or undefined) on the wire
+	// to mean the same as Addresses. Internally, it is always filled in with
+	// its possibly-implicit value.
+	AllowedIPs []netip.Prefix
+
+	Endpoints []netip.AddrPort `json:",omitempty"` // IP+port (public via STUN, and local LANs)
+
+	// LegacyDERPString is this node's home LegacyDERPString region ID integer, but shoved into an
 	// IP:port string for legacy reasons. The IP address is always "127.3.3.40"
 	// (a loopback address (127) followed by the digits over the letters DERP on
-	// a QWERTY keyboard (3.3.40)). The "port number" is the home DERP region ID
+	// a QWERTY keyboard (3.3.40)). The "port number" is the home LegacyDERPString region ID
 	// integer.
 	//
-	// TODO(bradfitz): simplify this legacy mess; add a new HomeDERPRegionID int
-	// field behind a new capver bump.
-	DERP string `json:",omitempty"` // DERP-in-IP:port ("127.3.3.40:N") endpoint
+	// Deprecated: HomeDERP has replaced this, but old servers might still send
+	// this field. See tailscale/tailscale#14636. Do not use this field in code
+	// other than in the upgradeNode func, which canonicalizes it to HomeDERP
+	// if it arrives as a LegacyDERPString string on the wire.
+	LegacyDERPString string `json:"DERP,omitempty"` // DERP-in-IP:port ("127.3.3.40:N") endpoint
+
+	// HomeDERP is the modern version of the DERP string field, with just an
+	// integer. The client advertises support for this as of capver 111.
+	//
+	// HomeDERP may be zero if not (yet) known, but ideally always be non-zero
+	// for magicsock connectivity to function normally.
+	HomeDERP int `json:",omitempty"` // DERP region ID of the node's home DERP
 
 	Hostinfo HostinfoView
 	Created  time.Time
@@ -563,6 +621,11 @@ func (n *Node) InitDisplayNames(networkMagicDNSSuffix string) {
 	n.ComputedNameWithHost = nameWithHost
 }
 
+// MachineStatus is the state of a [Node]'s approval into a tailnet.
+//
+// A "node" and a "machine" are often 1:1, but technically a Tailscale
+// daemon has one machine key and can have multiple nodes (e.g. different
+// users on Windows) for that one machine key.
 type MachineStatus int
 
 const (
@@ -653,21 +716,6 @@ func CheckTag(tag string) error {
 	}
 
 	return nil
-}
-
-// CheckServiceName validates svc for use as a service name.
-// We only allow valid DNS labels, since the expectation is that these will be
-// used as parts of domain names.
-func CheckServiceName(svc string) error {
-	var ok bool
-	svc, ok = strings.CutPrefix(svc, "svc:")
-	if !ok {
-		return errors.New("services must start with 'svc:'")
-	}
-	if svc == "" {
-		return errors.New("service names must not be empty")
-	}
-	return dnsname.ValidLabel(svc)
 }
 
 // CheckRequestTags checks that all of h.RequestTags are valid.
@@ -808,6 +856,7 @@ type Hostinfo struct {
 	ShareeNode      bool           `json:",omitempty"` // indicates this node exists in netmap because it's owned by a shared-to user
 	NoLogsNoSupport bool           `json:",omitempty"` // indicates that the user has opted out of sending logs and support
 	WireIngress     bool           `json:",omitempty"` // indicates that the node wants the option to receive ingress connections
+	IngressEnabled  bool           `json:",omitempty"` // if the node has any funnel endpoint enabled
 	AllowsUpdate    bool           `json:",omitempty"` // indicates that the node has opted-in to admin-console-drive remote updates
 	Machine         string         `json:",omitempty"` // the current host's machine type (uname -m)
 	GoArch          string         `json:",omitempty"` // GOARCH value (of the built binary)
@@ -834,16 +883,51 @@ type Hostinfo struct {
 	//       require changes to Hostinfo.Equal.
 }
 
+// ServiceName is the name of a service, of the form `svc:dns-label`. Services
+// represent some kind of application provided for users of the tailnet with a
+// MagicDNS name and possibly dedicated IP addresses. Currently (2024-01-21),
+// the only type of service is [VIPService].
+// This is not related to the older [Service] used in [Hostinfo.Services].
+type ServiceName string
+
+// Validate validates if the service name is formatted correctly.
+// We only allow valid DNS labels, since the expectation is that these will be
+// used as parts of domain names. All errors are [vizerror.Error].
+func (sn ServiceName) Validate() error {
+	bareName, ok := strings.CutPrefix(string(sn), "svc:")
+	if !ok {
+		return vizerror.Errorf("%q is not a valid service name: must start with 'svc:'", sn)
+	}
+	if bareName == "" {
+		return vizerror.Errorf("%q is not a valid service name: must not be empty after the 'svc:' prefix", sn)
+	}
+	return dnsname.ValidLabel(bareName)
+}
+
+// String implements [fmt.Stringer].
+func (sn ServiceName) String() string {
+	return string(sn)
+}
+
+// WithoutPrefix is the name of the service without the `svc:` prefix, used for
+// DNS names. If the name does not include the prefix (which means
+// [ServiceName.Validate] would return an error) then it returns "".
+func (sn ServiceName) WithoutPrefix() string {
+	bareName, ok := strings.CutPrefix(string(sn), "svc:")
+	if !ok {
+		return ""
+	}
+	return bareName
+}
+
 // VIPService represents a service created on a tailnet from the
 // perspective of a node providing that service. These services
 // have an virtual IP (VIP) address pair distinct from the node's IPs.
 type VIPService struct {
-	// Name is the name of the service, of the form `svc:dns-label`.
-	// See CheckServiceName for a validation func.
-	// Name uniquely identifies a service on a particular tailnet,
-	// and so also corresponds uniquely to the pair of IP addresses
-	// belonging to the VIP service.
-	Name string
+	// Name is the name of the service. The Name uniquely identifies a service
+	// on a particular tailnet, and so also corresponds uniquely to the pair of
+	// IP addresses belonging to the VIP service.
+	Name ServiceName
 
 	// Ports specify which ProtoPorts are made available by this node
 	// on the service's IPs.
@@ -863,14 +947,6 @@ func (hi *Hostinfo) TailscaleSSHEnabled() bool {
 }
 
 func (v HostinfoView) TailscaleSSHEnabled() bool { return v.ж.TailscaleSSHEnabled() }
-
-// TailscaleFunnelEnabled reports whether or not this node has explicitly
-// enabled Funnel.
-func (hi *Hostinfo) TailscaleFunnelEnabled() bool {
-	return hi != nil && hi.WireIngress
-}
-
-func (v HostinfoView) TailscaleFunnelEnabled() bool { return v.ж.TailscaleFunnelEnabled() }
 
 // NetInfo contains information about the host's network state.
 type NetInfo struct {
@@ -2121,7 +2197,8 @@ func (n *Node) Equal(n2 *Node) bool {
 		slicesx.EqualSameNil(n.AllowedIPs, n2.AllowedIPs) &&
 		slicesx.EqualSameNil(n.PrimaryRoutes, n2.PrimaryRoutes) &&
 		slicesx.EqualSameNil(n.Endpoints, n2.Endpoints) &&
-		n.DERP == n2.DERP &&
+		n.LegacyDERPString == n2.LegacyDERPString &&
+		n.HomeDERP == n2.HomeDERP &&
 		n.Cap == n2.Cap &&
 		n.Hostinfo.Equal(n2.Hostinfo) &&
 		n.Created.Equal(n2.Created) &&
@@ -2392,6 +2469,11 @@ const (
 	// NodeAttrDisableCaptivePortalDetection instructs the client to not perform captive portal detection
 	// automatically when the network state changes.
 	NodeAttrDisableCaptivePortalDetection NodeCapability = "disable-captive-portal-detection"
+
+	// NodeAttrDisableSkipStatusQueue is set when the node should disable skipping
+	// of queued netmap.NetworkMap between the controlclient and LocalBackend.
+	// See tailscale/tailscale#14768.
+	NodeAttrDisableSkipStatusQueue NodeCapability = "disable-skip-status-queue"
 
 	// NodeAttrSSHEnvironmentVariables enables logic for handling environment variables sent
 	// via SendEnv in the SSH server and applying them to the SSH session.
@@ -2916,10 +2998,10 @@ type EarlyNoise struct {
 // vs NodeKey)
 const LBHeader = "Ts-Lb"
 
-// ServiceIPMappings maps service names (strings that conform to
-// [CheckServiceName]) to lists of IP addresses. This is used as the value of
-// the [NodeAttrServiceHost] capability, to inform service hosts what IP
-// addresses they need to listen on for each service that they are advertising.
+// ServiceIPMappings maps ServiceName to lists of IP addresses. This is used
+// as the value of the [NodeAttrServiceHost] capability, to inform service hosts
+// what IP addresses they need to listen on for each service that they are
+// advertising.
 //
 // This is of the form:
 //
@@ -2932,4 +3014,4 @@ const LBHeader = "Ts-Lb"
 // provided in AllowedIPs, but this lets the client know which services
 // correspond to those IPs. Any services that don't correspond to a service
 // this client is hosting can be ignored.
-type ServiceIPMappings map[string][]netip.Addr
+type ServiceIPMappings map[ServiceName][]netip.Addr

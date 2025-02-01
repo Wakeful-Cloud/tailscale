@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -59,8 +60,8 @@ type derpProber struct {
 	qdPacketsPerSecond int // in packets per second
 	qdPacketTimeout    time.Duration
 
-	// Optionally restrict probes to a single regionCode.
-	regionCode string
+	// Optionally restrict probes to a single regionCodeOrID.
+	regionCodeOrID string
 
 	// Probe class for fetching & updating the DERP map.
 	ProbeMap ProbeClass
@@ -134,11 +135,11 @@ func WithTLSProbing(interval time.Duration) DERPOpt {
 	}
 }
 
-// WithRegion restricts probing to the specified region identified by its code
-// (e.g. "lax"). This is case sensitive.
-func WithRegion(regionCode string) DERPOpt {
+// WithRegionCodeOrID restricts probing to the specified region identified by its code
+// (e.g. "lax") or its id (e.g. "17"). This is case sensitive.
+func WithRegionCodeOrID(regionCode string) DERPOpt {
 	return func(d *derpProber) {
-		d.regionCode = regionCode
+		d.regionCodeOrID = regionCode
 	}
 }
 
@@ -300,13 +301,14 @@ func (d *derpProber) probeBandwidth(from, to string, size int64) ProbeClass {
 		derpPath = "single"
 	}
 	var transferTimeSeconds expvar.Float
+	var totalBytesTransferred expvar.Float
 	return ProbeClass{
 		Probe: func(ctx context.Context) error {
 			fromN, toN, err := d.getNodePair(from, to)
 			if err != nil {
 				return err
 			}
-			return derpProbeBandwidth(ctx, d.lastDERPMap, fromN, toN, size, &transferTimeSeconds, d.bwTUNIPv4Prefix)
+			return derpProbeBandwidth(ctx, d.lastDERPMap, fromN, toN, size, &transferTimeSeconds, &totalBytesTransferred, d.bwTUNIPv4Prefix)
 		},
 		Class: "derp_bw",
 		Labels: Labels{
@@ -314,10 +316,15 @@ func (d *derpProber) probeBandwidth(from, to string, size int64) ProbeClass {
 			"tcp_in_tcp": strconv.FormatBool(d.bwTUNIPv4Prefix != nil),
 		},
 		Metrics: func(l prometheus.Labels) []prometheus.Metric {
-			return []prometheus.Metric{
+			metrics := []prometheus.Metric{
 				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_probe_size_bytes", "Payload size of the bandwidth prober", nil, l), prometheus.GaugeValue, float64(size)),
 				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_transfer_time_seconds_total", "Time it took to transfer data", nil, l), prometheus.CounterValue, transferTimeSeconds.Value()),
 			}
+			if d.bwTUNIPv4Prefix != nil {
+				// For TCP-in-TCP probes, also record cumulative bytes transferred.
+				metrics = append(metrics, prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_bytes_total", "Amount of data transferred", nil, l), prometheus.CounterValue, totalBytesTransferred.Value()))
+			}
+			return metrics
 		},
 	}
 }
@@ -350,7 +357,7 @@ func (d *derpProber) probeQueuingDelay(from, to string, packetsPerSecond int, pa
 			qdh.mx.Lock()
 			result := []prometheus.Metric{
 				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_qd_probe_dropped_packets", "Total packets dropped", nil, l), prometheus.CounterValue, float64(packetsDropped.Value())),
-				prometheus.MustNewConstHistogram(prometheus.NewDesc("derp_qd_probe_delays_seconds", "Distribution of queuing delays", nil, l), qdh.count, qdh.sum, qdh.bucketedCounts),
+				prometheus.MustNewConstHistogram(prometheus.NewDesc("derp_qd_probe_delays_seconds", "Distribution of queuing delays", nil, l), qdh.count, qdh.sum, maps.Clone(qdh.bucketedCounts)),
 			}
 			qdh.mx.Unlock()
 			return result
@@ -424,6 +431,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 		t := time.NewTicker(time.Second / time.Duration(packetsPerSecond))
 		defer t.Stop()
 
+		toDERPPubKey := toc.SelfPublicKey()
 		seq := uint64(0)
 		for {
 			select {
@@ -439,7 +447,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 				txRecordsMu.Unlock()
 				binary.BigEndian.PutUint64(pkt, seq)
 				seq++
-				if err := fromc.Send(toc.SelfPublicKey(), pkt); err != nil {
+				if err := fromc.Send(toDERPPubKey, pkt); err != nil {
 					sendErrC <- fmt.Errorf("sending packet %w", err)
 					return
 				}
@@ -453,6 +461,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	go func() {
 		defer wg.Done()
 		defer close(recvFinishedC) // to break out of 'select' below.
+		fromDERPPubKey := fromc.SelfPublicKey()
 		for {
 			m, err := toc.Recv()
 			if err != nil {
@@ -462,7 +471,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 			switch v := m.(type) {
 			case derp.ReceivedPacket:
 				now := time.Now()
-				if v.Source != fromc.SelfPublicKey() {
+				if v.Source != fromDERPPubKey {
 					recvFinishedC <- fmt.Errorf("got data packet from unexpected source, %v", v.Source)
 					return
 				}
@@ -596,7 +605,7 @@ func (d *derpProber) ProbeUDP(ipaddr string, port int) ProbeClass {
 }
 
 func (d *derpProber) skipRegion(region *tailcfg.DERPRegion) bool {
-	return d.regionCode != "" && region.RegionCode != d.regionCode
+	return d.regionCodeOrID != "" && region.RegionCode != d.regionCodeOrID && strconv.Itoa(region.RegionID) != d.regionCodeOrID
 }
 
 func derpProbeUDP(ctx context.Context, ipStr string, port int) error {
@@ -653,7 +662,7 @@ func derpProbeUDP(ctx context.Context, ipStr string, port int) error {
 // DERP clients connected to two DERP servers.If tunIPv4Address is specified,
 // probes will use a TCP connection over a TUN device at this address in order
 // to exercise TCP-in-TCP in similar fashion to TCP over Tailscale via DERP.
-func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, size int64, transferTimeSeconds *expvar.Float, tunIPv4Prefix *netip.Prefix) (err error) {
+func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, size int64, transferTimeSeconds, totalBytesTransferred *expvar.Float, tunIPv4Prefix *netip.Prefix) (err error) {
 	// This probe uses clients with isProber=false to avoid spamming the derper logs with every packet
 	// sent by the bandwidth probe.
 	fromc, err := newConn(ctx, dm, from, false)
@@ -675,7 +684,7 @@ func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tail
 	}
 
 	if tunIPv4Prefix != nil {
-		err = derpProbeBandwidthTUN(ctx, transferTimeSeconds, from, to, fromc, toc, size, tunIPv4Prefix)
+		err = derpProbeBandwidthTUN(ctx, transferTimeSeconds, totalBytesTransferred, from, to, fromc, toc, size, tunIPv4Prefix)
 	} else {
 		err = derpProbeBandwidthDirect(ctx, transferTimeSeconds, from, to, fromc, toc, size)
 	}
@@ -760,9 +769,10 @@ func runDerpProbeNodePair(ctx context.Context, from, to *tailcfg.DERPNode, fromc
 	// Send the packets.
 	sendc := make(chan error, 1)
 	go func() {
+		toDERPPubKey := toc.SelfPublicKey()
 		for idx, pkt := range pkts {
 			inFlight.AcquireContext(ctx)
-			if err := fromc.Send(toc.SelfPublicKey(), pkt); err != nil {
+			if err := fromc.Send(toDERPPubKey, pkt); err != nil {
 				sendc <- fmt.Errorf("sending packet %d: %w", idx, err)
 				return
 			}
@@ -774,6 +784,7 @@ func runDerpProbeNodePair(ctx context.Context, from, to *tailcfg.DERPNode, fromc
 	go func() {
 		defer close(recvc) // to break out of 'select' below.
 		idx := 0
+		fromDERPPubKey := fromc.SelfPublicKey()
 		for {
 			m, err := toc.Recv()
 			if err != nil {
@@ -783,7 +794,7 @@ func runDerpProbeNodePair(ctx context.Context, from, to *tailcfg.DERPNode, fromc
 			switch v := m.(type) {
 			case derp.ReceivedPacket:
 				inFlight.Release()
-				if v.Source != fromc.SelfPublicKey() {
+				if v.Source != fromDERPPubKey {
 					recvc <- fmt.Errorf("got data packet %d from unexpected source, %v", idx, v.Source)
 					return
 				}
@@ -846,7 +857,7 @@ var derpProbeBandwidthTUNMu sync.Mutex
 // to another over a TUN device at an address at the start of the usable host IP
 // range that the given tunAddress lives in. The time taken to finish the transfer
 // is recorded in `transferTimeSeconds`.
-func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds *expvar.Float, from, to *tailcfg.DERPNode, fromc, toc *derphttp.Client, size int64, prefix *netip.Prefix) error {
+func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesTransferred *expvar.Float, from, to *tailcfg.DERPNode, fromc, toc *derphttp.Client, size int64, prefix *netip.Prefix) error {
 	// Make sure all goroutines have finished.
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -918,6 +929,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds *expvar.Floa
 
 		destinationAddrBytes := destinationAddr.AsSlice()
 		scratch := make([]byte, 4)
+		toDERPPubKey := toc.SelfPublicKey()
 		for {
 			n, err := dev.Read(bufs, sizes, tunStartOffset)
 			if err != nil {
@@ -946,7 +958,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds *expvar.Floa
 				copy(pkt[12:16], pkt[16:20])
 				copy(pkt[16:20], scratch)
 
-				if err := fromc.Send(toc.SelfPublicKey(), pkt); err != nil {
+				if err := fromc.Send(toDERPPubKey, pkt); err != nil {
 					tunReadErrC <- err
 					return
 				}
@@ -964,6 +976,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds *expvar.Floa
 		buf := make([]byte, mtu+tunStartOffset)
 		bufs := make([][]byte, 1)
 
+		fromDERPPubKey := fromc.SelfPublicKey()
 		for {
 			m, err := toc.Recv()
 			if err != nil {
@@ -972,7 +985,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds *expvar.Floa
 			}
 			switch v := m.(type) {
 			case derp.ReceivedPacket:
-				if v.Source != fromc.SelfPublicKey() {
+				if v.Source != fromDERPPubKey {
 					recvErrC <- fmt.Errorf("got data packet from unexpected source, %v", v.Source)
 					return
 				}
@@ -1035,6 +1048,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds *expvar.Floa
 		readConn, err := l.Accept()
 		if err != nil {
 			readFinishedC <- err
+			return
 		}
 		defer readConn.Close()
 		deadline, ok := ctx.Deadline()
@@ -1042,11 +1056,13 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds *expvar.Floa
 			// Don't try reading past our context's deadline.
 			if err := readConn.SetReadDeadline(deadline); err != nil {
 				readFinishedC <- fmt.Errorf("unable to set read deadline: %w", err)
+				return
 			}
 		}
-		_, err = io.CopyN(io.Discard, readConn, size)
-		// Measure transfer time irrespective of whether it succeeded or failed.
+		n, err := io.CopyN(io.Discard, readConn, size)
+		// Measure transfer time and bytes transferred irrespective of whether it succeeded or failed.
 		transferTimeSeconds.Add(time.Since(start).Seconds())
+		totalBytesTransferred.Add(float64(n))
 		readFinishedC <- err
 	}()
 

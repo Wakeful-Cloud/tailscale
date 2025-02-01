@@ -13,10 +13,13 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"tailscale.com/client/tailscale"
 )
 
@@ -39,14 +42,14 @@ func startTailscaled(ctx context.Context, cfg *settings) (*tailscale.LocalClient
 	log.Printf("Waiting for tailscaled socket")
 	for {
 		if ctx.Err() != nil {
-			log.Fatalf("Timed out waiting for tailscaled socket")
+			return nil, nil, errors.New("timed out waiting for tailscaled socket")
 		}
 		_, err := os.Stat(cfg.Socket)
 		if errors.Is(err, fs.ErrNotExist) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		} else if err != nil {
-			log.Fatalf("Waiting for tailscaled socket: %v", err)
+			return nil, nil, fmt.Errorf("error waiting for tailscaled socket: %w", err)
 		}
 		break
 	}
@@ -165,4 +168,71 @@ func tailscaleSet(ctx context.Context, cfg *settings) error {
 		return fmt.Errorf("tailscale set failed: %v", err)
 	}
 	return nil
+}
+
+func watchTailscaledConfigChanges(ctx context.Context, path string, lc *tailscale.LocalClient, errCh chan<- error) {
+	var (
+		tickChan          <-chan time.Time
+		tailscaledCfgDir  = filepath.Dir(path)
+		prevTailscaledCfg []byte
+	)
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("tailscaled config watch: failed to create fsnotify watcher, timer-only mode: %v", err)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		tickChan = ticker.C
+	} else {
+		defer w.Close()
+		if err := w.Add(tailscaledCfgDir); err != nil {
+			errCh <- fmt.Errorf("failed to add fsnotify watch: %w", err)
+			return
+		}
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		errCh <- fmt.Errorf("error reading configfile: %w", err)
+		return
+	}
+	prevTailscaledCfg = b
+	// kubelet mounts Secrets to Pods using a series of symlinks, one of
+	// which is <mount-dir>/..data that Kubernetes recommends consumers to
+	// use if they need to monitor changes
+	// https://github.com/kubernetes/kubernetes/blob/v1.28.1/pkg/volume/util/atomic_writer.go#L39-L61
+	const kubeletMountedCfg = "..data"
+	toWatch := filepath.Join(tailscaledCfgDir, kubeletMountedCfg)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-w.Errors:
+			errCh <- fmt.Errorf("watcher error: %w", err)
+			return
+		case <-tickChan:
+		case event := <-w.Events:
+			if event.Name != toWatch {
+				continue
+			}
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			errCh <- fmt.Errorf("error reading configfile: %w", err)
+			return
+		}
+		// For some proxy types the mounted volume also contains tailscaled state and other files. We
+		// don't want to reload config unnecessarily on unrelated changes to these files.
+		if reflect.DeepEqual(b, prevTailscaledCfg) {
+			continue
+		}
+		prevTailscaledCfg = b
+		log.Printf("tailscaled config watch: ensuring that config is up to date")
+		ok, err := lc.ReloadConfig(ctx)
+		if err != nil {
+			errCh <- fmt.Errorf("error reloading tailscaled config: %w", err)
+			return
+		}
+		if ok {
+			log.Printf("tailscaled config watch: config was reloaded")
+		}
+	}
 }
