@@ -317,16 +317,19 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	if tcpipErr != nil {
 		return nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
-	if runtime.GOOS == "windows" {
-		// See https://github.com/tailscale/tailscale/issues/9707
-		// Windows w/RACK performs poorly. ACKs do not appear to be handled in a
-		// timely manner, leading to spurious retransmissions and a reduced
-		// congestion window.
-		tcpRecoveryOpt := tcpip.TCPRecovery(0)
-		tcpipErr = ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecoveryOpt)
-		if tcpipErr != nil {
-			return nil, fmt.Errorf("could not disable TCP RACK: %v", tcpipErr)
-		}
+	// See https://github.com/tailscale/tailscale/issues/9707
+	// gVisor's RACK performs poorly. ACKs do not appear to be handled in a
+	// timely manner, leading to spurious retransmissions and a reduced
+	// congestion window.
+	tcpRecoveryOpt := tcpip.TCPRecovery(0)
+	tcpipErr = ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecoveryOpt)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("could not disable TCP RACK: %v", tcpipErr)
+	}
+	cubicOpt := tcpip.CongestionControlOption("cubic")
+	tcpipErr = ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &cubicOpt)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("could not set cubic congestion control: %v", tcpipErr)
 	}
 	err := setTCPBufSizes(ipstack)
 	if err != nil {
@@ -632,9 +635,10 @@ var v4broadcast = netaddr.IPv4(255, 255, 255, 255)
 // address slice views.
 func (ns *Impl) UpdateNetstackIPs(nm *netmap.NetworkMap) {
 	var selfNode tailcfg.NodeView
+	var serviceAddrSet set.Set[netip.Addr]
 	if nm != nil {
 		vipServiceIPMap := nm.GetVIPServiceIPMap()
-		serviceAddrSet := set.Set[netip.Addr]{}
+		serviceAddrSet = make(set.Set[netip.Addr], len(vipServiceIPMap)*2)
 		for _, addrs := range vipServiceIPMap {
 			serviceAddrSet.AddSlice(addrs)
 		}
@@ -670,6 +674,11 @@ func (ns *Impl) UpdateNetstackIPs(nm *netmap.NetworkMap) {
 				newPfx[p] = true
 			}
 		}
+	}
+
+	for addr := range serviceAddrSet {
+		p := netip.PrefixFrom(addr, addr.BitLen())
+		newPfx[p] = true
 	}
 
 	pfxToAdd := make(map[netip.Prefix]bool)
@@ -1016,12 +1025,18 @@ func (ns *Impl) shouldProcessInbound(p *packet.Parsed, t *tstun.Wrapper) bool {
 			return true
 		}
 	}
-	if ns.lb != nil && p.IPProto == ipproto.TCP && isService {
-		// An assumption holds for this to work: when tun mode is on for a service,
-		// its tcp and web are not set. This is enforced in b.setServeConfigLocked.
-		if ns.lb.ShouldInterceptVIPServiceTCPPort(p.Dst) {
+	if isService {
+		if p.IsEchoRequest() {
 			return true
 		}
+		if ns.lb != nil && p.IPProto == ipproto.TCP {
+			// An assumption holds for this to work: when tun mode is on for a service,
+			// its tcp and web are not set. This is enforced in b.setServeConfigLocked.
+			if ns.lb.ShouldInterceptVIPServiceTCPPort(p.Dst) {
+				return true
+			}
+		}
+		return false
 	}
 	if p.IPVersion == 6 && !isLocal && viaRange.Contains(dstIP) {
 		return ns.lb != nil && ns.lb.ShouldHandleViaIP(dstIP)

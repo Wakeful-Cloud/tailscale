@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/types/netmap"
@@ -28,13 +28,15 @@ import (
 // applies it to lc. It exits when ctx is canceled. cdChanged is a channel that
 // is written to when the certDomain changes, causing the serve config to be
 // re-read and applied.
-func watchServeConfigChanges(ctx context.Context, path string, cdChanged <-chan bool, certDomainAtomic *atomic.Pointer[string], lc *tailscale.LocalClient, kc *kubeClient) {
+func watchServeConfigChanges(ctx context.Context, path string, cdChanged <-chan bool, certDomainAtomic *atomic.Pointer[string], lc *local.Client, kc *kubeClient) {
 	if certDomainAtomic == nil {
 		panic("certDomainAtomic must not be nil")
 	}
 	var tickChan <-chan time.Time
 	var eventChan <-chan fsnotify.Event
 	if w, err := fsnotify.NewWatcher(); err != nil {
+		// Creating a new fsnotify watcher would fail for example if inotify was not able to create a new file descriptor.
+		// See https://github.com/tailscale/tailscale/issues/15081
 		log.Printf("serve proxy: failed to create fsnotify watcher, timer-only mode: %v", err)
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -91,7 +93,7 @@ func certDomainFromNetmap(nm *netmap.NetworkMap) string {
 	return nm.DNS.CertDomains[0]
 }
 
-// localClient is a subset of tailscale.LocalClient that can be mocked for testing.
+// localClient is a subset of [local.Client] that can be mocked for testing.
 type localClient interface {
 	SetServeConfig(context.Context, *ipn.ServeConfig) error
 }
