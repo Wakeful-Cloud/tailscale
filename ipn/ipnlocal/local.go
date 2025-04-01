@@ -78,6 +78,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/paths"
 	"tailscale.com/portlist"
+	"tailscale.com/posture"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/taildrop"
@@ -168,8 +169,8 @@ type watchSession struct {
 	cancel    context.CancelFunc // to shut down the session
 }
 
-// localBackendExtension extends [LocalBackend] with additional functionality.
-type localBackendExtension interface {
+// Extension extends [LocalBackend] with additional functionality.
+type Extension interface {
 	// Init is called to initialize the extension when the [LocalBackend] is created
 	// and before it starts running. If the extension cannot be initialized,
 	// it must return an error, and the Shutdown method will not be called.
@@ -183,17 +184,17 @@ type localBackendExtension interface {
 	Shutdown() error
 }
 
-// newLocalBackendExtension is a function that instantiates a [localBackendExtension].
-type newLocalBackendExtension func(logger.Logf, *tsd.System) (localBackendExtension, error)
+// NewExtensionFn is a function that instantiates an [Extension].
+type NewExtensionFn func(logger.Logf, *tsd.System) (Extension, error)
 
 // registeredExtensions is a map of registered local backend extensions,
 // where the key is the name of the extension and the value is the function
 // that instantiates the extension.
-var registeredExtensions map[string]newLocalBackendExtension
+var registeredExtensions map[string]NewExtensionFn
 
 // RegisterExtension registers a function that creates a [localBackendExtension].
 // It panics if newExt is nil or if an extension with the same name has already been registered.
-func RegisterExtension(name string, newExt newLocalBackendExtension) {
+func RegisterExtension(name string, newExt NewExtensionFn) {
 	if newExt == nil {
 		panic(fmt.Sprintf("lb: newExt is nil: %q", name))
 	}
@@ -210,6 +211,36 @@ func RegisterExtension(name string, newExt newLocalBackendExtension) {
 //
 // It is called with [LocalBackend.mu] held.
 type profileResolver func() (_ ipn.WindowsUserID, _ ipn.ProfileID, ok bool)
+
+// NewControlClientCallback is a function to be called when a new [controlclient.Client]
+// is created and before it is first used. The login profile and prefs represent
+// the profile for which the cc is created and are always valid; however, the
+// profile's [ipn.LoginProfileView.ID] returns a zero [ipn.ProfileID] if the profile
+// is new and has not been persisted yet.
+//
+// The callback is called with [LocalBackend.mu] held and must not call
+// any [LocalBackend] methods.
+//
+// It returns a function to be called when the cc is being shut down,
+// or nil if no cleanup is needed.
+type NewControlClientCallback func(controlclient.Client, ipn.LoginProfileView, ipn.PrefsView) (cleanup func())
+
+// ProfileChangeCallback is a function to be called when the current login profile changes.
+// The sameNode parameter indicates whether the profile represents the same node as before,
+// such as when only the profile metadata is updated but the node ID remains the same,
+// or when a new profile is persisted and assigned an [ipn.ProfileID] for the first time.
+// The subscribers can use this information to decide whether to reset their state.
+//
+// The profile and prefs are always valid, but the profile's [ipn.LoginProfileView.ID]
+// returns a zero [ipn.ProfileID] if the profile is new and has not been persisted yet.
+//
+// The callback is called with [LocalBackend.mu] held and must not call
+// any [LocalBackend] methods.
+type ProfileChangeCallback func(_ ipn.LoginProfileView, _ ipn.PrefsView, sameNode bool)
+
+// AuditLogProvider is a function that returns an [ipnauth.AuditLogFunc] for
+// logging auditable actions.
+type AuditLogProvider func() ipnauth.AuditLogFunc
 
 // LocalBackend is the glue between the major pieces of the Tailscale
 // network software: the cloud control plane (via controlclient), the
@@ -403,6 +434,12 @@ type LocalBackend struct {
 	// notified about.
 	lastNotifiedDriveShares *views.SliceView[*drive.Share, drive.ShareView]
 
+	// lastKnownHardwareAddrs is a list of the previous known hardware addrs.
+	// Previously known hwaddrs are kept to work around an issue on Windows
+	// where all addresses might disappear.
+	// http://go/corp/25168
+	lastKnownHardwareAddrs syncs.AtomicValue[[]string]
+
 	// outgoingFiles keeps track of Taildrop outgoing files keyed to their OutgoingFile.ID
 	outgoingFiles map[string]*ipn.OutgoingFile
 
@@ -450,6 +487,20 @@ type LocalBackend struct {
 	// Each callback is called exactly once in unspecified order and without b.mu held.
 	// Returned errors are logged but otherwise ignored and do not affect the shutdown process.
 	shutdownCbs set.HandleSet[func() error]
+
+	// newControlClientCbs are the functions to be called when a new control client is created.
+	newControlClientCbs set.HandleSet[NewControlClientCallback]
+
+	// profileChangeCbs are the callbacks to be called when the current login profile changes,
+	// either because of a profile switch, or because the profile information was updated
+	// by [LocalBackend.SetControlClientStatus], including when the profile is first populated
+	// and persisted.
+	profileChangeCbs set.HandleSet[ProfileChangeCallback]
+
+	// auditLoggers is a collection of registered audit log providers.
+	// Each [AuditLogProvider] is called to get an [ipnauth.AuditLogFunc] when an auditable action
+	// is about to be performed. If an audit logger returns an error, the action is denied.
+	auditLoggers set.HandleSet[AuditLogProvider]
 }
 
 // HealthTracker returns the health tracker for the backend.
@@ -615,19 +666,6 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 				// conditional to avoid log spam at start when off
 				b.SetComponentDebugLogging(component, until)
 			}
-		}
-	}
-
-	// initialize Taildrive shares from saved state
-	fs, ok := b.sys.DriveForRemote.GetOK()
-	if ok {
-		currentShares := b.pm.prefs.DriveShares()
-		if currentShares.Len() > 0 {
-			var shares []*drive.Share
-			for _, share := range currentShares.All() {
-				shares = append(shares, share.AsStruct())
-			}
-			fs.SetShares(shares)
 		}
 	}
 
@@ -963,7 +1001,9 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 
 	if peerAPIListenAsync && b.netMap != nil && b.state == ipn.Running {
 		want := b.netMap.GetAddresses().Len()
-		if len(b.peerAPIListeners) < want {
+		have := len(b.peerAPIListeners)
+		b.logf("[v1] linkChange: have %d peerAPIListeners, want %d", have, want)
+		if have < want {
 			b.logf("linkChange: peerAPIListeners too low; trying again")
 			b.goTracker.Go(b.initPeerAPIListener)
 		}
@@ -1684,6 +1724,7 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 
 	// Perform all mutations of prefs based on the netmap here.
 	if prefsChanged {
+		profile := b.pm.CurrentProfile()
 		// Prefs will be written out if stale; this is not safe unless locked or cloned.
 		if err := b.pm.SetPrefs(prefs.View(), ipn.NetworkProfile{
 			MagicDNSName: curNetMap.MagicDNSSuffix(),
@@ -1691,7 +1732,22 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 		}); err != nil {
 			b.logf("Failed to save new controlclient state: %v", err)
 		}
+		// Updating profile prefs may have resulted in a change to the current [ipn.LoginProfile],
+		// either because the user completed a login, which populated and persisted their profile
+		// for the first time, or because of an [ipn.NetworkProfile] or [tailcfg.UserProfile] change.
+		// Theoretically, a completed login could also result in a switch to a different existing
+		// profile representing a different node (see tailscale/tailscale#8816).
+		//
+		// Let's check if the current profile has changed, and invoke all registered [ProfileChangeCallback]
+		// if necessary.
+		if cp := b.pm.CurrentProfile(); *cp.AsStruct() != *profile.AsStruct() {
+			// If the profile ID was empty before SetPrefs, it's a new profile
+			// and the user has just completed a login for the first time.
+			sameNode := profile.ID() == "" || profile.ID() == cp.ID()
+			b.notifyProfileChangeLocked(profile, prefs.View(), sameNode)
+		}
 	}
+
 	// initTKALocked is dependent on CurrentProfile.ID, which is initialized
 	// (for new profiles) on the first call to b.pm.SetPrefs.
 	if err := b.initTKALocked(); err != nil {
@@ -2376,12 +2432,10 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	}
 	b.applyPrefsToHostinfoLocked(hostinfo, prefs)
 
-	b.setNetMapLocked(nil)
 	persistv := prefs.Persist().AsStruct()
 	if persistv == nil {
 		persistv = new(persist.Persist)
 	}
-	b.updateFilterLocked(nil, ipn.PrefsView{})
 
 	if b.portpoll != nil {
 		b.portpollOnce.Do(func() {
@@ -2399,6 +2453,12 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		debugFlags = append([]string{"netstack"}, debugFlags...)
 	}
 
+	var ccShutdownCbs []func()
+	ccShutdown := func() {
+		for _, cb := range ccShutdownCbs {
+			cb()
+		}
+	}
 	// TODO(apenwarr): The only way to change the ServerURL is to
 	// re-run b.Start, because this is the only place we create a
 	// new controlclient. EditPrefs allows you to overwrite ServerURL,
@@ -2424,6 +2484,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		C2NHandler:                 http.HandlerFunc(b.handleC2N),
 		DialPlan:                   &b.dialPlan, // pointer because it can't be copied
 		ControlKnobs:               b.sys.ControlKnobs(),
+		Shutdown:                   ccShutdown,
 
 		// Don't warn about broken Linux IP forwarding when
 		// netstack is being used.
@@ -2431,6 +2492,11 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	})
 	if err != nil {
 		return err
+	}
+	for _, cb := range b.newControlClientCbs {
+		if cleanup := cb(cc, b.pm.CurrentProfile(), prefs); cleanup != nil {
+			ccShutdownCbs = append(ccShutdownCbs, cleanup)
+		}
 	}
 
 	b.setControlClientLocked(cc)
@@ -2457,6 +2523,16 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	blid := b.backendLogID.String()
 	b.logf("Backend: logs: be:%v fe:%v", blid, opts.FrontendLogID)
 	b.sendToLocked(ipn.Notify{Prefs: &prefs}, allClients)
+
+	// initialize Taildrive shares from saved state
+	if fs, ok := b.sys.DriveForRemote.GetOK(); ok {
+		currentShares := b.pm.CurrentPrefs().DriveShares()
+		var shares []*drive.Share
+		for _, share := range currentShares.All() {
+			shares = append(shares, share.AsStruct())
+		}
+		fs.SetShares(shares)
+	}
 
 	if !loggedOut && (b.hasNodeKeyLocked() || confWantRunning) {
 		// If we know that we're either logged in or meant to be
@@ -3445,18 +3521,20 @@ func (b *LocalBackend) onTailnetDefaultAutoUpdate(au bool) {
 		// can still manually enable auto-updates on this node.
 		return
 	}
-	b.logf("using tailnet default auto-update setting: %v", au)
-	prefsClone := prefs.AsStruct()
-	prefsClone.AutoUpdate.Apply = opt.NewBool(au)
-	_, err := b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
-		Prefs: *prefsClone,
-		AutoUpdateSet: ipn.AutoUpdatePrefsMask{
-			ApplySet: true,
-		},
-	}, unlock)
-	if err != nil {
-		b.logf("failed to apply tailnet-wide default for auto-updates (%v): %v", au, err)
-		return
+	if clientupdate.CanAutoUpdate() {
+		b.logf("using tailnet default auto-update setting: %v", au)
+		prefsClone := prefs.AsStruct()
+		prefsClone.AutoUpdate.Apply = opt.NewBool(au)
+		_, err := b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
+			Prefs: *prefsClone,
+			AutoUpdateSet: ipn.AutoUpdatePrefsMask{
+				ApplySet: true,
+			},
+		}, unlock)
+		if err != nil {
+			b.logf("failed to apply tailnet-wide default for auto-updates (%v): %v", au, err)
+			return
+		}
 	}
 }
 
@@ -4266,6 +4344,47 @@ func (b *LocalBackend) MaybeClearAppConnector(mp *ipn.MaskedPrefs) error {
 	return err
 }
 
+// RegisterAuditLogProvider registers an audit log provider, which returns a function
+// to be called when an auditable action is about to be performed.
+// The returned function unregisters the provider.
+// It panics if the provider is nil.
+func (b *LocalBackend) RegisterAuditLogProvider(provider AuditLogProvider) (unregister func()) {
+	if provider == nil {
+		panic("nil audit log provider")
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	handle := b.auditLoggers.Add(provider)
+	return func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		delete(b.auditLoggers, handle)
+	}
+}
+
+// getAuditLoggerLocked returns a function that calls all currently registered
+// audit loggers, failing as soon as any of them returns an error.
+//
+// b.mu must be held.
+func (b *LocalBackend) getAuditLoggerLocked() ipnauth.AuditLogFunc {
+	var loggers []ipnauth.AuditLogFunc
+	if len(b.auditLoggers) != 0 {
+		loggers = make([]ipnauth.AuditLogFunc, 0, len(b.auditLoggers))
+		for _, getLogger := range b.auditLoggers {
+			loggers = append(loggers, getLogger())
+		}
+	}
+	return func(action tailcfg.ClientAuditAction, details string) error {
+		b.logf("auditlog: %v: %v", action, details)
+		for _, logger := range loggers {
+			if err := logger(action, details); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 // EditPrefs applies the changes in mp to the current prefs,
 // acting as the tailscaled itself rather than a specific user.
 func (b *LocalBackend) EditPrefs(mp *ipn.MaskedPrefs) (ipn.PrefsView, error) {
@@ -4291,9 +4410,8 @@ func (b *LocalBackend) EditPrefsAs(mp *ipn.MaskedPrefs, actor ipnauth.Actor) (ip
 	unlock := b.lockAndGetUnlock()
 	defer unlock()
 	if mp.WantRunningSet && !mp.WantRunning && b.pm.CurrentPrefs().WantRunning() {
-		// TODO(barnstar,nickkhyl): replace loggerFn with the actual audit logger.
-		loggerFn := func(action, details string) { b.logf("[audit]: %s: %s", action, details) }
-		if err := actor.CheckProfileAccess(b.pm.CurrentProfile(), ipnauth.Disconnect, loggerFn); err != nil {
+		if err := actor.CheckProfileAccess(b.pm.CurrentProfile(), ipnauth.Disconnect, b.getAuditLoggerLocked()); err != nil {
+			b.logf("check profile access failed: %v", err)
 			return ipn.PrefsView{}, err
 		}
 
@@ -4918,7 +5036,7 @@ func (b *LocalBackend) authReconfig() {
 		return
 	}
 
-	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.ControlKnobs(), version.OS())
+	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.NetMon.Get(), b.sys.ControlKnobs(), version.OS())
 	rcfg := b.routerConfig(cfg, prefs, oneCGNATRoute)
 
 	err = b.e.Reconfig(cfg, rcfg, dcfg)
@@ -4942,7 +5060,7 @@ func (b *LocalBackend) authReconfig() {
 //
 // The versionOS is a Tailscale-style version ("iOS", "macOS") and not
 // a runtime.GOOS.
-func shouldUseOneCGNATRoute(logf logger.Logf, controlKnobs *controlknobs.Knobs, versionOS string) bool {
+func shouldUseOneCGNATRoute(logf logger.Logf, mon *netmon.Monitor, controlKnobs *controlknobs.Knobs, versionOS string) bool {
 	if controlKnobs != nil {
 		// Explicit enabling or disabling always take precedence.
 		if v, ok := controlKnobs.OneCGNAT.Load().Get(); ok {
@@ -4957,7 +5075,7 @@ func shouldUseOneCGNATRoute(logf logger.Logf, controlKnobs *controlknobs.Knobs, 
 	// use fine-grained routes if another interfaces is also using the CGNAT
 	// IP range.
 	if versionOS == "macOS" {
-		hasCGNATInterface, err := netmon.HasCGNATInterface()
+		hasCGNATInterface, err := mon.HasCGNATInterface()
 		if err != nil {
 			logf("shouldUseOneCGNATRoute: Could not determine if any interfaces use CGNAT: %v", err)
 			return false
@@ -5252,9 +5370,11 @@ func (b *LocalBackend) closePeerAPIListenersLocked() {
 const peerAPIListenAsync = runtime.GOOS == "windows" || runtime.GOOS == "android"
 
 func (b *LocalBackend) initPeerAPIListener() {
+	b.logf("[v1] initPeerAPIListener: entered")
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.shutdownCalled {
+		b.logf("[v1] initPeerAPIListener: shutting down")
 		return
 	}
 
@@ -5264,6 +5384,7 @@ func (b *LocalBackend) initPeerAPIListener() {
 		// ResetForClientDisconnect, or Start happens when its
 		// mutex was released, the netMap could be
 		// nil'ed out (Issue 1996). Bail out early here if so.
+		b.logf("[v1] initPeerAPIListener: no netmap")
 		return
 	}
 
@@ -5278,6 +5399,7 @@ func (b *LocalBackend) initPeerAPIListener() {
 		}
 		if allSame {
 			// Nothing to do.
+			b.logf("[v1] initPeerAPIListener: %d netmap addresses match existing listeners", addrs.Len())
 			return
 		}
 	}
@@ -5286,6 +5408,7 @@ func (b *LocalBackend) initPeerAPIListener() {
 
 	selfNode := b.netMap.SelfNode
 	if !selfNode.Valid() || b.netMap.GetAddresses().Len() == 0 {
+		b.logf("[v1] initPeerAPIListener: no addresses in netmap")
 		return
 	}
 
@@ -5319,6 +5442,7 @@ func (b *LocalBackend) initPeerAPIListener() {
 			ln, err = ps.listen(a.Addr(), b.prevIfState)
 			if err != nil {
 				if peerAPIListenAsync {
+					b.logf("[v1] possibly transient peerapi listen(%q) error, will try again on linkChange: %v", a.Addr(), err)
 					// Expected. But we fix it later in linkChange
 					// ("peerAPIListeners too low").
 					continue
@@ -5656,13 +5780,15 @@ func (b *LocalBackend) enterStateLockedOnEntry(newState ipn.State, unlock unlock
 		}
 		b.blockEngineUpdates(true)
 		fallthrough
-	case ipn.Stopped:
+	case ipn.Stopped, ipn.NoState:
+		// Unconfigure the engine if it has stopped (WantRunning is set to false)
+		// or if we've switched to a different profile and the state is unknown.
 		err := b.e.Reconfig(&wgcfg.Config{}, &router.Config{}, &dns.Config{})
 		if err != nil {
 			b.logf("Reconfig(down): %v", err)
 		}
 
-		if authURL == "" {
+		if newState == ipn.Stopped && authURL == "" {
 			systemd.Status("Stopped; run 'tailscale up' to log in")
 		}
 	case ipn.Starting, ipn.NeedsMachineAuth:
@@ -5676,8 +5802,6 @@ func (b *LocalBackend) enterStateLockedOnEntry(newState ipn.State, unlock unlock
 			addrStrs = append(addrStrs, p.Addr().String())
 		}
 		systemd.Status("Connected; %s; %s", activeLogin, strings.Join(addrStrs, " "))
-	case ipn.NoState:
-		// Do nothing.
 	default:
 		b.logf("[unexpected] unknown newState %#v", newState)
 	}
@@ -5868,6 +5992,23 @@ func (b *LocalBackend) requestEngineStatusAndWait() {
 	b.logf("requestEngineStatusAndWait: waiting...")
 	b.statusChanged.Wait() // temporarily releases lock while waiting
 	b.logf("requestEngineStatusAndWait: got status update.")
+}
+
+// RegisterControlClientCallback registers a function to be called every time a new
+// control client is created, until the returned unregister function is called.
+// It panics if the cb is nil.
+func (b *LocalBackend) RegisterControlClientCallback(cb NewControlClientCallback) (unregister func()) {
+	if cb == nil {
+		panic("nil control client callback")
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	handle := b.newControlClientCbs.Add(cb)
+	return func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		delete(b.newControlClientCbs, handle)
+	}
 }
 
 // setControlClientLocked sets the control client to cc,
@@ -7459,6 +7600,56 @@ func (b *LocalBackend) resetDialPlan() {
 	}
 }
 
+// RegisterProfileChangeCallback registers a function to be called when the current [ipn.LoginProfile] changes.
+// If includeCurrent is true, the callback is called immediately with the current profile.
+// The returned function unregisters the callback.
+// It panics if the cb is nil.
+func (b *LocalBackend) RegisterProfileChangeCallback(cb ProfileChangeCallback, includeCurrent bool) (unregister func()) {
+	if cb == nil {
+		panic("nil profile change callback")
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	handle := b.profileChangeCbs.Add(cb)
+	if includeCurrent {
+		cb(b.pm.CurrentProfile(), stripKeysFromPrefs(b.pm.CurrentPrefs()), false)
+	}
+	return func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		delete(b.profileChangeCbs, handle)
+	}
+}
+
+// notifyProfileChangeLocked invokes all registered profile change callbacks.
+//
+// b.mu must be held.
+func (b *LocalBackend) notifyProfileChangeLocked(profile ipn.LoginProfileView, prefs ipn.PrefsView, sameNode bool) {
+	prefs = stripKeysFromPrefs(prefs)
+	for _, cb := range b.profileChangeCbs {
+		cb(profile, prefs, sameNode)
+	}
+}
+
+// getHardwareAddrs returns the hardware addresses for the machine. If the list
+// of hardware addresses is empty, it will return the previously known hardware
+// addresses. Both the current, and previously known hardware addresses might be
+// empty.
+func (b *LocalBackend) getHardwareAddrs() ([]string, error) {
+	addrs, err := posture.GetHardwareAddrs()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(addrs) == 0 {
+		b.logf("getHardwareAddrs: got empty list of hwaddrs, returning previous list")
+		return b.lastKnownHardwareAddrs.Load(), nil
+	}
+
+	b.lastKnownHardwareAddrs.Store(addrs)
+	return addrs, nil
+}
+
 // resetForProfileChangeLockedOnEntry resets the backend for a profile change.
 //
 // b.mu must held on entry. It is released on exit.
@@ -7472,6 +7663,7 @@ func (b *LocalBackend) resetForProfileChangeLockedOnEntry(unlock unlockOnce) err
 		return nil
 	}
 	b.setNetMapLocked(nil) // Reset netmap.
+	b.updateFilterLocked(nil, ipn.PrefsView{})
 	// Reset the NetworkMap in the engine
 	b.e.SetNetworkMap(new(netmap.NetworkMap))
 	if prevCC := b.resetControlClientLocked(); prevCC != nil {
@@ -7486,6 +7678,7 @@ func (b *LocalBackend) resetForProfileChangeLockedOnEntry(unlock unlockOnce) err
 	b.lastSuggestedExitNode = ""
 	b.keyExpired = false
 	b.resetAlwaysOnOverrideLocked()
+	b.notifyProfileChangeLocked(b.pm.CurrentProfile(), b.pm.CurrentPrefs(), false)
 	b.setAtomicValuesFromPrefsLocked(b.pm.CurrentPrefs())
 	b.enterStateLockedOnEntry(ipn.NoState, unlock) // Reset state; releases b.mu
 	b.health.SetLocalLogConfigHealth(nil)
@@ -8241,7 +8434,14 @@ func (b *LocalBackend) vipServicesFromPrefsLocked(prefs ipn.PrefsView) []*tailcf
 		services[sn].Active = true
 	}
 
-	return slicesx.MapValues(services)
+	servicesList := slicesx.MapValues(services)
+	// [slicesx.MapValues] provides the values in an indeterminate order, but since we'll
+	// be hashing a representation of this list later we want it to be in a consistent
+	// order.
+	slices.SortFunc(servicesList, func(a, b *tailcfg.VIPService) int {
+		return strings.Compare(a.Name.String(), b.Name.String())
+	})
+	return servicesList
 }
 
 var (

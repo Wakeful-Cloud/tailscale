@@ -387,6 +387,9 @@ type probePlan map[string][]probe
 func sortRegions(dm *tailcfg.DERPMap, last *Report, preferredDERP int) (prev []*tailcfg.DERPRegion) {
 	prev = make([]*tailcfg.DERPRegion, 0, len(dm.Regions))
 	for _, reg := range dm.Regions {
+		if reg.NoMeasureNoHome {
+			continue
+		}
 		// include an otherwise avoid region if it is the current preferred region
 		if reg.Avoid && reg.RegionID != preferredDERP {
 			continue
@@ -533,7 +536,7 @@ func makeProbePlanInitial(dm *tailcfg.DERPMap, ifState *netmon.State) (plan prob
 	plan = make(probePlan)
 
 	for _, reg := range dm.Regions {
-		if len(reg.Nodes) == 0 {
+		if reg.NoMeasureNoHome || len(reg.Nodes) == 0 {
 			continue
 		}
 
@@ -1042,7 +1045,7 @@ func (c *Client) finishAndStoreReport(rs *reportState, dm *tailcfg.DERPMap) *Rep
 }
 
 // runHTTPOnlyChecks is the netcheck done by environments that can
-// only do HTTP requests, such as ws/wasm.
+// only do HTTP requests, such as js/wasm.
 func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *reportState, dm *tailcfg.DERPMap) error {
 	var regions []*tailcfg.DERPRegion
 	if rs.incremental && last != nil {
@@ -1054,6 +1057,9 @@ func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *report
 	}
 	if len(regions) == 0 {
 		for _, dr := range dm.Regions {
+			if dr.NoMeasureNoHome {
+				continue
+			}
 			regions = append(regions, dr)
 		}
 	}

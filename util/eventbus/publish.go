@@ -4,76 +4,71 @@
 package eventbus
 
 import (
-	"context"
 	"reflect"
 )
 
 // publisher is a uniformly typed wrapper around Publisher[T], so that
 // debugging facilities can look at active publishers.
 type publisher interface {
-	publisherName() string
+	publishType() reflect.Type
+	Close()
 }
 
-// A Publisher publishes events on the bus.
+// A Publisher publishes typed events on a bus.
 type Publisher[T any] struct {
-	bus     *Bus
-	name    string
-	stopCtx context.Context
-	stop    context.CancelFunc
+	client *Client
+	stop   stopFlag
 }
 
-// PublisherOf returns a publisher for event type T on the given bus.
-//
-// The publisher's name should be a short, human-readable string that
-// identifies this event publisher. The name is only visible through
-// debugging APIs.
-func PublisherOf[T any](b *Bus, name string) *Publisher[T] {
-	ctx, cancel := context.WithCancel(context.Background())
+func newPublisher[T any](c *Client) *Publisher[T] {
 	ret := &Publisher[T]{
-		bus:     b,
-		name:    name,
-		stopCtx: ctx,
-		stop:    cancel,
+		client: c,
 	}
-	b.addPublisher(ret)
+	c.addPublisher(ret)
 	return ret
 }
 
-func (p *Publisher[T]) publisherName() string { return p.name }
+// Close closes the publisher.
+//
+// Calls to Publish after Close silently do nothing.
+func (p *Publisher[T]) Close() {
+	// Just unblocks any active calls to Publish, no other
+	// synchronization needed.
+	p.stop.Stop()
+	p.client.deletePublisher(p)
+}
+
+func (p *Publisher[T]) publishType() reflect.Type {
+	return reflect.TypeFor[T]()
+}
 
 // Publish publishes event v on the bus.
 func (p *Publisher[T]) Publish(v T) {
 	// Check for just a stopped publisher or bus before trying to
 	// write, so that once closed Publish consistently does nothing.
 	select {
-	case <-p.stopCtx.Done():
-		return
-	case <-p.bus.stop.WaitChan():
+	case <-p.stop.Done():
 		return
 	default:
 	}
 
+	evt := PublishedEvent{
+		Event: v,
+		From:  p.client,
+	}
+
 	select {
-	case p.bus.write <- v:
-	case <-p.stopCtx.Done():
-	case <-p.bus.stop.WaitChan():
+	case p.client.publish() <- evt:
+	case <-p.stop.Done():
 	}
 }
 
-// ShouldPublish reports whether anyone is subscribed to events of
-// type T.
+// ShouldPublish reports whether anyone is subscribed to the events
+// that this publisher emits.
 //
 // ShouldPublish can be used to skip expensive event construction if
 // nobody seems to care. Publishers must not assume that someone will
 // definitely receive an event if ShouldPublish returns true.
 func (p *Publisher[T]) ShouldPublish() bool {
-	dests := p.bus.dest(reflect.TypeFor[T]())
-	return len(dests) > 0
-}
-
-// Close closes the publisher, indicating that no further events will
-// be published with it.
-func (p *Publisher[T]) Close() {
-	p.stop()
-	p.bus.deletePublisher(p)
+	return p.client.shouldPublish(reflect.TypeFor[T]())
 }
