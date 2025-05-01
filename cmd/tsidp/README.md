@@ -38,7 +38,7 @@
      --name `tsidp` \
      -p 443:443 \
      -e TS_AUTHKEY=YOUR_TAILSCALE_AUTHKEY \
-     -e TS_HOSTNAME=tsidp \
+     -e TS_HOSTNAME=idp \
      -v tsidp-data:/var/lib/tsidp \
      tsidp:latest
    ```
@@ -48,7 +48,7 @@
    docker logs tsidp
    ```
 
-   Visit `https://tsidp.tailnet.ts.net` to confirm the service is running.
+   Visit `https://idp.tailnet.ts.net` to confirm the service is running.
 
 ## Usage Example: Proxmox Integration
 
@@ -82,13 +82,14 @@ The `tsidp` server supports several command-line flags:
 - `--port`: Port to listen on (default: 443)
 - `--local-port`: Allow requests from localhost
 - `--use-local-tailscaled`: Use local tailscaled instead of tsnet
+- `--hostname`: tsnet hostname
 - `--dir`: tsnet state directory
 
 ## Environment Variables
 
 - `TS_AUTHKEY`: Your Tailscale authentication key (required)
-- `TS_HOSTNAME`: Hostname for the `tsidp` server (default: "idp")
-- `TS_STATE_DIR`: State directory (default: "/var/lib/tsidp")
+- `TS_HOSTNAME`: Hostname for the `tsidp` server (default: "idp", Docker only)
+- `TS_STATE_DIR`: State directory (default: "/var/lib/tsidp", Docker only)
 - `TAILSCALE_USE_WIP_CODE`: Enable work-in-progress code (default: "1")
 
 ## Support

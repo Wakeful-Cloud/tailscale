@@ -37,6 +37,7 @@ import (
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
+	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tshttpproxy"
@@ -272,7 +273,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		tr.Proxy = tshttpproxy.ProxyFromEnvironment
 		tshttpproxy.SetTransportGetProxyConnectHeader(tr)
 		tr.TLSClientConfig = tlsdial.Config(serverURL.Hostname(), opts.HealthTracker, tr.TLSClientConfig)
-		var dialFunc dialFunc
+		var dialFunc netx.DialFunc
 		dialFunc, interceptedDial = makeScreenTimeDetectingDialFunc(opts.Dialer.SystemDial)
 		tr.DialContext = dnscache.Dialer(dialFunc, dnsCache)
 		tr.DialTLSContext = dnscache.TLSDialer(dialFunc, dnsCache, tr.TLSClientConfig)
@@ -1086,7 +1087,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 		} else {
 			vlogf("netmap: got new map")
 		}
-		if resp.ControlDialPlan != nil {
+		if resp.ControlDialPlan != nil && !ignoreDialPlan() {
 			if c.dialPlan != nil {
 				c.logf("netmap: got new dial plan from control")
 				c.dialPlan.Store(resp.ControlDialPlan)
@@ -1749,14 +1750,12 @@ func addLBHeader(req *http.Request, nodeKey key.NodePublic) {
 	}
 }
 
-type dialFunc = func(ctx context.Context, network, addr string) (net.Conn, error)
-
 // makeScreenTimeDetectingDialFunc returns dialFunc, optionally wrapped (on
 // Apple systems) with a func that sets the returned atomic.Bool for whether
 // Screen Time seemed to intercept the connection.
 //
 // The returned *atomic.Bool is nil on non-Apple systems.
-func makeScreenTimeDetectingDialFunc(dial dialFunc) (dialFunc, *atomic.Bool) {
+func makeScreenTimeDetectingDialFunc(dial netx.DialFunc) (netx.DialFunc, *atomic.Bool) {
 	switch runtime.GOOS {
 	case "darwin", "ios":
 		// Continue below.
@@ -1772,6 +1771,13 @@ func makeScreenTimeDetectingDialFunc(dial dialFunc) (dialFunc, *atomic.Bool) {
 		ab.Store(isTCPLoopback(c.LocalAddr()) && isTCPLoopback(c.RemoteAddr()))
 		return c, nil
 	}, ab
+}
+
+func ignoreDialPlan() bool {
+	// If we're running in v86 (a JavaScript-based emulation of a 32-bit x86)
+	// our networking is very limited. Let's ignore the dial plan since it's too
+	// complicated to race that many IPs anyway.
+	return hostinfo.IsInVM86()
 }
 
 func isTCPLoopback(a net.Addr) bool {

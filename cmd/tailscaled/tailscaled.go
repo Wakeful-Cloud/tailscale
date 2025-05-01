@@ -82,7 +82,9 @@ func defaultTunName() string {
 		// "utun" is recognized by wireguard-go/tun/tun_darwin.go
 		// as a magic value that uses/creates any free number.
 		return "utun"
-	case "plan9", "aix", "solaris", "illumos":
+	case "plan9":
+		return "auto"
+	case "aix", "solaris", "illumos":
 		return "userspace-networking"
 	case "linux":
 		switch distro.Get() {
@@ -198,6 +200,10 @@ func main() {
 	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
 	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2)")
 
+	if runtime.GOOS == "plan9" && os.Getenv("_NETSHELL_CHILD_") != "" {
+		os.Args = []string{"tailscaled", "be-child", "plan9-netshell"}
+	}
+
 	if len(os.Args) > 1 {
 		sub := os.Args[1]
 		if fp, ok := subCommands[sub]; ok {
@@ -248,7 +254,18 @@ func main() {
 	// Only apply a default statepath when neither have been provided, so that a
 	// user may specify only --statedir if they wish.
 	if args.statepath == "" && args.statedir == "" {
-		args.statepath = paths.DefaultTailscaledStateFile()
+		if runtime.GOOS == "plan9" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				log.Fatalf("failed to get home directory: %v", err)
+			}
+			args.statedir = filepath.Join(home, "tailscale-state")
+			if err := os.MkdirAll(args.statedir, 0700); err != nil {
+				log.Fatalf("failed to create state directory: %v", err)
+			}
+		} else {
+			args.statepath = paths.DefaultTailscaledStateFile()
+		}
 	}
 
 	if args.disableLogs {
@@ -357,7 +374,9 @@ var debugMux *http.ServeMux
 func run() (err error) {
 	var logf logger.Logf = log.Printf
 
-	sys := new(tsd.System)
+	// Install an event bus as early as possible, so that it's
+	// available universally when setting up everything else.
+	sys := tsd.NewSystem()
 
 	// Parse config, if specified, to fail early if it's invalid.
 	var conf *conffile.Config
@@ -372,9 +391,7 @@ func run() (err error) {
 	var netMon *netmon.Monitor
 	isWinSvc := isWindowsService()
 	if !isWinSvc {
-		netMon, err = netmon.New(func(format string, args ...any) {
-			logf(format, args...)
-		})
+		netMon, err = netmon.New(sys.Bus.Get(), logf)
 		if err != nil {
 			return fmt.Errorf("netmon.New: %w", err)
 		}
@@ -747,6 +764,12 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			}
 			sys.Set(e)
 			return false, err
+		}
+
+		if runtime.GOOS == "plan9" {
+			// TODO(bradfitz): why don't we do this on all platforms?
+			// We should. Doing it just on plan9 for now conservatively.
+			sys.NetMon.Get().SetTailscaleInterfaceName(devName)
 		}
 
 		r, err := router.New(logf, dev, sys.NetMon.Get(), sys.HealthTracker())

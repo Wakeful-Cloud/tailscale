@@ -5,7 +5,7 @@
 // the node and the coordination server.
 package tailcfg
 
-//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,RegisterResponseAuth,RegisterRequest,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile --clonefunc
+//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,RegisterResponseAuth,RegisterRequest,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile,VIPService --clonefunc
 
 import (
 	"bytes"
@@ -1462,6 +1462,18 @@ const (
 	// user groups as Kubernetes user groups. This capability is read by
 	// peers that are Tailscale Kubernetes operator instances.
 	PeerCapabilityKubernetes PeerCapability = "tailscale.com/cap/kubernetes"
+
+	// PeerCapabilityRelay grants the ability for a peer to allocate relay
+	// endpoints.
+	PeerCapabilityRelay PeerCapability = "tailscale.com/cap/relay"
+	// PeerCapabilityRelayTarget grants the current node the ability to allocate
+	// relay endpoints to the peer which has this capability.
+	PeerCapabilityRelayTarget PeerCapability = "tailscale.com/cap/relay-target"
+
+	// PeerCapabilityTsIDP grants a peer tsidp-specific
+	// capabilities, such as the ability to add user groups to the OIDC
+	// claim
+	PeerCapabilityTsIDP PeerCapability = "tailscale.com/cap/tsidp"
 )
 
 // NodeCapMap is a map of capabilities to their optional values. It is valid for
@@ -2446,6 +2458,14 @@ const (
 	// native tailnet. This is currently only sent to Hello, in its
 	// peer node list.
 	NodeAttrNativeIPV4 NodeCapability = "native-ipv4"
+
+	// NodeAttrRelayServer permits the node to act as an underlay UDP relay
+	// server. There are no expected values for this key in NodeCapMap.
+	NodeAttrRelayServer NodeCapability = "relay:server"
+
+	// NodeAttrRelayClient permits the node to act as an underlay UDP relay
+	// client. There are no expected values for this key in NodeCapMap.
+	NodeAttrRelayClient NodeCapability = "relay:client"
 )
 
 // SetDNSRequest is a request to add a DNS record.

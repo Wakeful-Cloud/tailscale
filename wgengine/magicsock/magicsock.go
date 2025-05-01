@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"expvar"
 	"fmt"
@@ -56,6 +57,7 @@ import (
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/ringbuffer"
 	"tailscale.com/util/set"
@@ -136,6 +138,8 @@ type Conn struct {
 	// This block mirrors the contents and field order of the Options
 	// struct. Initialized once at construction, then constant.
 
+	eventBus               *eventbus.Bus
+	eventClient            *eventbus.Client
 	logf                   logger.Logf
 	epFunc                 func([]tailcfg.Endpoint)
 	derpActiveFunc         func()
@@ -401,8 +405,15 @@ func (c *Conn) dlogf(format string, a ...any) {
 
 // Options contains options for Listen.
 type Options struct {
-	// Logf optionally provides a log function to use.
-	// Must not be nil.
+	// EventBus, if non-nil, is used for event publication and subscription by
+	// each Conn created from these Options.
+	//
+	// TODO(creachadair): As of 2025-03-19 this is optional, but is intended to
+	// become required non-nil.
+	EventBus *eventbus.Bus
+
+	// Logf provides a log function to use. It must not be nil.
+	// Use [logger.Discard] to disrcard logs.
 	Logf logger.Logf
 
 	// Port is the port to listen on.
@@ -529,6 +540,7 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c := newConn(opts.logf())
+	c.eventBus = opts.EventBus
 	c.port.Store(uint32(opts.Port))
 	c.controlKnobs = opts.ControlKnobs
 	c.epFunc = opts.endpointsFunc()
@@ -537,6 +549,31 @@ func NewConn(opts Options) (*Conn, error) {
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
 
+	// If an event bus is enabled, subscribe to portmapping changes; otherwise
+	// use the callback mechanism of portmapper.Client.
+	//
+	// TODO(creachadair): Remove the switch once the event bus is mandatory.
+	onPortMapChanged := c.onPortMapChanged
+	if c.eventBus != nil {
+		c.eventClient = c.eventBus.Client("magicsock.Conn")
+
+		pmSub := eventbus.Subscribe[portmapper.Mapping](c.eventClient)
+		go func() {
+			defer pmSub.Close()
+			for {
+				select {
+				case <-pmSub.Events():
+					c.onPortMapChanged()
+				case <-pmSub.Done():
+					return
+				}
+			}
+		}()
+
+		// Disable the explicit callback from the portmapper, the subscriber handles it.
+		onPortMapChanged = nil
+	}
+
 	// Don't log the same log messages possibly every few seconds in our
 	// portmapper.
 	portmapperLogf := logger.WithPrefix(c.logf, "portmapper: ")
@@ -544,7 +581,14 @@ func NewConn(opts Options) (*Conn, error) {
 	portMapOpts := &portmapper.DebugKnobs{
 		DisableAll: func() bool { return opts.DisablePortMapper || c.onlyTCP443.Load() },
 	}
-	c.portMapper = portmapper.NewClient(portmapperLogf, opts.NetMon, portMapOpts, opts.ControlKnobs, c.onPortMapChanged)
+	c.portMapper = portmapper.NewClient(portmapper.Config{
+		EventBus:     c.eventBus,
+		Logf:         portmapperLogf,
+		NetMon:       opts.NetMon,
+		DebugKnobs:   portMapOpts,
+		ControlKnobs: opts.ControlKnobs,
+		OnChange:     onPortMapChanged,
+	})
 	c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
 	c.netMon = opts.NetMon
 	c.health = opts.HealthTracker
@@ -719,7 +763,7 @@ func (c *Conn) updateEndpoints(why string) {
 		c.muCond.Broadcast()
 	}()
 	c.dlogf("[v1] magicsock: starting endpoint update (%s)", why)
-	if c.noV4Send.Load() && runtime.GOOS != "js" && !c.onlyTCP443.Load() {
+	if c.noV4Send.Load() && runtime.GOOS != "js" && !c.onlyTCP443.Load() && !hostinfo.IsInVM86() {
 		c.mu.Lock()
 		closed := c.closed
 		c.mu.Unlock()
@@ -1559,12 +1603,21 @@ var debugIPv4DiscoPingPenalty = envknob.RegisterDuration("TS_DISCO_PONG_IPV4_DEL
 //
 // If dst is a DERP IP:port, then dstKey must be non-zero.
 //
+// If geneveVNI is non-nil, then the [disco.Message] will be preceded by a
+// Geneve header with the supplied VNI set.
+//
 // The dstKey should only be non-zero if the dstDisco key
 // unambiguously maps to exactly one peer.
-func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
+func (c *Conn) sendDiscoMessage(dst netip.AddrPort, geneveVNI *uint32, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
 	isDERP := dst.Addr() == tailcfg.DerpMagicIPAddr
 	if _, isPong := m.(*disco.Pong); isPong && !isDERP && dst.Addr().Is4() {
 		time.Sleep(debugIPv4DiscoPingPenalty())
+	}
+
+	isRelayHandshakeMsg := false
+	switch m.(type) {
+	case *disco.BindUDPRelayEndpoint, *disco.BindUDPRelayEndpointAnswer:
+		isRelayHandshakeMsg = true
 	}
 
 	c.mu.Lock()
@@ -1573,9 +1626,37 @@ func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDi
 		return false, errConnClosed
 	}
 	pkt := make([]byte, 0, 512) // TODO: size it correctly? pool? if it matters.
+	if geneveVNI != nil {
+		gh := packet.GeneveHeader{
+			Version:  0,
+			Protocol: packet.GeneveProtocolDisco,
+			VNI:      *geneveVNI,
+			Control:  isRelayHandshakeMsg,
+		}
+		pkt = append(pkt, make([]byte, packet.GeneveFixedHeaderLength)...)
+		err := gh.Encode(pkt)
+		if err != nil {
+			return false, err
+		}
+	}
 	pkt = append(pkt, disco.Magic...)
 	pkt = c.discoPublic.AppendTo(pkt)
-	di := c.discoInfoLocked(dstDisco)
+	var di *discoInfo
+	if !isRelayHandshakeMsg {
+		di = c.discoInfoLocked(dstDisco)
+	} else {
+		// c.discoInfoLocked() caches [*discoInfo] for dstDisco. It assumes that
+		// dstDisco is a known Tailscale peer, and will be cleaned around
+		// network map changes. In the case of a relay handshake message,
+		// dstDisco belongs to a relay server with a disco key that is
+		// discovered at endpoint allocation time or [disco.CallMeMaybeVia]
+		// reception time. There is no clear ending to its lifetime, so we
+		// can't cache with the same strategy. Instead, generate the shared
+		// key on the fly for now.
+		di = &discoInfo{
+			sharedKey: c.discoPrivate.Shared(dstDisco),
+		}
+	}
 	c.mu.Unlock()
 
 	if isDERP {
@@ -1627,6 +1708,45 @@ const (
 	discoRXPathRawSocket discoRXPath = "raw socket"
 )
 
+const discoHeaderLen = len(disco.Magic) + key.DiscoPublicRawLen
+
+// isDiscoMaybeGeneve reports whether msg is a Tailscale Disco protocol
+// message, and if true, whether it is encapsulated by a Geneve header.
+//
+// isGeneveEncap is only relevant when isDiscoMsg is true.
+//
+// Naked Disco, Geneve followed by Disco, and naked WireGuard can be confidently
+// distinguished based on the following:
+//  1. [disco.Magic] is sufficiently non-overlapping with a Geneve protocol
+//     field value of [packet.GeneveProtocolDisco].
+//  2. [disco.Magic] is sufficiently non-overlapping with the first 4 bytes of
+//     a WireGuard packet.
+//  3. [packet.GeneveHeader] with a Geneve protocol field value of
+//     [packet.GeneveProtocolDisco] is sufficiently non-overlapping with the
+//     first 4 bytes of a WireGuard packet.
+func isDiscoMaybeGeneve(msg []byte) (isDiscoMsg bool, isGeneveEncap bool) {
+	if len(msg) < discoHeaderLen {
+		return false, false
+	}
+	if string(msg[:len(disco.Magic)]) == disco.Magic {
+		return true, false
+	}
+	if len(msg) < packet.GeneveFixedHeaderLength+discoHeaderLen {
+		return false, false
+	}
+	if msg[0]&0xC0 != 0 || // version bits that we always transmit as 0s
+		msg[1]&0x3F != 0 || // reserved bits that we always transmit as 0s
+		binary.BigEndian.Uint16(msg[2:4]) != packet.GeneveProtocolDisco ||
+		msg[7] != 0 { // reserved byte that we always transmit as 0
+		return false, false
+	}
+	msg = msg[packet.GeneveFixedHeaderLength:]
+	if string(msg[:len(disco.Magic)]) == disco.Magic {
+		return true, true
+	}
+	return false, false
+}
+
 // handleDiscoMessage handles a discovery message and reports whether
 // msg was a Tailscale inter-node discovery message.
 //
@@ -1642,18 +1762,16 @@ const (
 // it was received from at the DERP layer. derpNodeSrc is zero when received
 // over UDP.
 func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc key.NodePublic, via discoRXPath) (isDiscoMsg bool) {
-	const headerLen = len(disco.Magic) + key.DiscoPublicRawLen
-	if len(msg) < headerLen || string(msg[:len(disco.Magic)]) != disco.Magic {
-		return false
+	isDiscoMsg, isGeneveEncap := isDiscoMaybeGeneve(msg)
+	if !isDiscoMsg {
+		return
+	}
+	if isGeneveEncap {
+		// TODO(jwhited): decode Geneve header
+		msg = msg[packet.GeneveFixedHeaderLength:]
 	}
 
-	// If the first four parts are the prefix of disco.Magic
-	// (0x5453f09f) then it's definitely not a valid WireGuard
-	// packet (which starts with little-endian uint32 1, 2, 3, 4).
-	// Use naked returns for all following paths.
-	isDiscoMsg = true
-
-	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):headerLen]))
+	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):discoHeaderLen]))
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1671,6 +1789,10 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 	}
 
 	if !c.peerMap.knownPeerDiscoKey(sender) {
+		// Geneve encapsulated disco used for udp relay handshakes are not known
+		// "peer" keys as they are dynamically discovered by UDP relay endpoint
+		// allocation or [disco.CallMeMaybeVia] reception.
+		// TODO(jwhited): handle relay handshake messsages instead of early return
 		metricRecvDiscoBadPeer.Add(1)
 		if debugDisco() {
 			c.logf("magicsock: disco: ignoring disco-looking frame, don't know of key %v", sender.ShortString())
@@ -1694,7 +1816,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 
 	di := c.discoInfoLocked(sender)
 
-	sealedBox := msg[headerLen:]
+	sealedBox := msg[discoHeaderLen:]
 	payload, ok := di.sharedKey.Open(sealedBox)
 	if !ok {
 		// This might be have been intended for a previous
@@ -1900,7 +2022,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInf
 
 	ipDst := src
 	discoDest := di.discoKey
-	go c.sendDiscoMessage(ipDst, dstKey, discoDest, &disco.Pong{
+	go c.sendDiscoMessage(ipDst, nil, dstKey, discoDest, &disco.Pong{
 		TxID: dm.TxID,
 		Src:  src,
 	}, discoVerboseLog)
@@ -1945,12 +2067,12 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
 	for _, ep := range c.lastEndpoints {
 		eps = append(eps, ep.Addr)
 	}
-	go de.c.sendDiscoMessage(derpAddr, de.publicKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+	go de.c.sendDiscoMessage(derpAddr, nil, de.publicKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
 	if debugSendCallMeUnknownPeer() {
 		// Send a callMeMaybe packet to a non-existent peer
 		unknownKey := key.NewNode().Public()
 		c.logf("magicsock: sending CallMeMaybe to unknown peer per TS_DEBUG_SEND_CALLME_UNKNOWN_PEER")
-		go de.c.sendDiscoMessage(derpAddr, unknownKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+		go de.c.sendDiscoMessage(derpAddr, nil, unknownKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
 	}
 }
 
@@ -2461,6 +2583,9 @@ func (c *connBind) Close() error {
 	if c.closeDisco6 != nil {
 		c.closeDisco6.Close()
 	}
+	if c.eventClient != nil {
+		c.eventClient.Close()
+	}
 	// Send an empty read result to unblock receiveDERP,
 	// which will then check connBind.Closed.
 	// connBind.Closed takes c.mu, but c.derpRecvCh is buffered.
@@ -2767,7 +2892,9 @@ func (c *Conn) Rebind() {
 		c.logf("Rebind; defIf=%q, ips=%v", defIf, ifIPs)
 	}
 
-	c.maybeCloseDERPsOnRebind(ifIPs)
+	if len(ifIPs) > 0 {
+		c.maybeCloseDERPsOnRebind(ifIPs)
+	}
 	c.resetEndpointStates()
 }
 
@@ -3018,6 +3145,10 @@ func (c *Conn) DebugForcePreferDERP(n int) {
 // portableTrySetSocketBuffer sets SO_SNDBUF and SO_RECVBUF on pconn to socketBufferSize,
 // logging an error if it occurs.
 func portableTrySetSocketBuffer(pconn nettype.PacketConn, logf logger.Logf) {
+	if runtime.GOOS == "plan9" {
+		// Not supported. Don't try. Avoid logspam.
+		return
+	}
 	if c, ok := pconn.(*net.UDPConn); ok {
 		// Attempt to increase the buffer size, and allow failures.
 		if err := c.SetReadBuffer(socketBufferSize); err != nil {

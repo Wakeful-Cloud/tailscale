@@ -7,9 +7,11 @@
 package systray
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"net/http"
@@ -23,6 +25,7 @@ import (
 	"time"
 
 	"fyne.io/systray"
+	ico "github.com/Kodeworks/golang-image-ico"
 	"github.com/atotto/clipboard"
 	dbus "github.com/godbus/dbus/v5"
 	"github.com/toqueteos/webbrowser"
@@ -81,12 +84,13 @@ type Menu struct {
 	bgCancel context.CancelFunc
 
 	// Top-level menu items
-	connect    *systray.MenuItem
-	disconnect *systray.MenuItem
-	self       *systray.MenuItem
-	exitNodes  *systray.MenuItem
-	more       *systray.MenuItem
-	quit       *systray.MenuItem
+	connect     *systray.MenuItem
+	disconnect  *systray.MenuItem
+	self        *systray.MenuItem
+	exitNodes   *systray.MenuItem
+	more        *systray.MenuItem
+	rebuildMenu *systray.MenuItem
+	quit        *systray.MenuItem
 
 	rebuildCh  chan struct{} // triggers a menu rebuild
 	accountsCh chan ipn.ProfileID
@@ -292,6 +296,17 @@ func (menu *Menu) rebuild() {
 		})
 	}
 
+	// TODO(#15528): this menu item shouldn't be necessary at all,
+	// but is at least more discoverable than having users switch profiles or exit nodes.
+	menu.rebuildMenu = systray.AddMenuItem("Rebuild menu", "Fix missing menu items")
+	onClick(ctx, menu.rebuildMenu, func(ctx context.Context) {
+		select {
+		case <-ctx.Done():
+		case menu.rebuildCh <- struct{}{}:
+		}
+	})
+	menu.rebuildMenu.Enable()
+
 	menu.quit = systray.AddMenuItem("Quit", "Quit the app")
 	menu.quit.Enable()
 
@@ -330,6 +345,20 @@ func setRemoteIcon(menu *systray.MenuItem, urlStr string) {
 		resp, err := http.Get(urlStr)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			b, _ = io.ReadAll(resp.Body)
+
+			// Convert image to ICO format on Windows
+			if runtime.GOOS == "windows" {
+				im, _, err := image.Decode(bytes.NewReader(b))
+				if err != nil {
+					return
+				}
+				buf := bytes.NewBuffer(nil)
+				if err := ico.Encode(buf, im); err != nil {
+					return
+				}
+				b = buf.Bytes()
+			}
+
 			httpCache[urlStr] = b
 			resp.Body.Close()
 		}
