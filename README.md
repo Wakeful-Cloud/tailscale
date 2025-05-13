@@ -11,7 +11,7 @@ To download, [find the artifacts](https://github.com/actions/upload-artifact?tab
 ## FAQ
 
 ### What are the differences between this fork and upstream?
-This fork uses a modified [`build_dist.sh`](./build_dist.sh) to support cross-compilation and [UPX](https://upx.github.io) for minification. Beyond
+This fork uses a modified [`build_dist.sh`](./build_dist.sh) to support cross-compilation. Beyond
 that, this fork adds the [GitHub actions](.github/workflows) required for automatic synchronization
 and building.
 
@@ -22,8 +22,6 @@ and building.
 * Arm 64-bit (`linux/arm64`)
 * MIPS 32-bit big endian (`linux/mips`)
 * MIPS 32-bit little endian (`linux/mipsle`)
-* MIPS 64-bit big endian (`linux/mips64`)[^1]
-* MIPS 64-bit little endian (`linux/mips64le`)[^1]
-* RISC-V 64-bit (`linux/riscv64`)[^1]
-
-[^1]: UPX is not supported for these architectures, therefore the binaries are not as small as the others.
+* MIPS 64-bit big endian (`linux/mips64`)
+* MIPS 64-bit little endian (`linux/mips64le`)
+* RISC-V 64-bit (`linux/riscv64`)

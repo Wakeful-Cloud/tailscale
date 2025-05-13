@@ -2,10 +2,9 @@
 
 # Tools
 GO="${GO:-go}"
-UPX_BIN="${UPX_BIN:-upx}"
 
 # Ensure tools are installed
-for TOOL in $GO $UPX_BIN; do
+for TOOL in $GO; do
 	if [ ! -x "$(command -v $TOOL)" ]; then
 		echo "Error: $TOOL is not installed." >&2
 		exit 1
@@ -23,12 +22,12 @@ for GOARCH in 386 amd64 arm arm64 mips mipsle mips64 mips64le riscv64; do
 
 	# Update the environment variables
 	eval `CGO_ENABLED=0 GOOS=$(${GO} env GOHOSTOS) GOARCH=$(${GO} env GOHOSTARCH) ${GO} run ./cmd/mkversion`
-	VERSION_LONG="${VERSION_LONG}_minified"
-	VERSION_SHORT="${VERSION_SHORT}_minified"
+	VERSION_LONG="${VERSION_LONG}_small"
+	VERSION_SHORT="${VERSION_SHORT}_small"
 
 	# Generate the build information
 	# See https://tailscale.com/kb/1207/small-tailscale#step-1-building-tailscale
-	TAGS="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube"
+	TAGS="ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_ssh,ts_omit_wakeonlan,ts_omit_capture,ts_omit_relayserver,ts_omit_taildrop,ts_omit_tpm"
 	LDFLAGS="-s -w -X tailscale.com/version.longStamp=${VERSION_LONG} -X tailscale.com/version.shortStamp=${VERSION_SHORT}"
 	DIST="dist/tailscale_${VERSION_SHORT}_${GOARCH}"
 	OUT="${DIST}/tailscaled"
@@ -38,17 +37,6 @@ for GOARCH in 386 amd64 arm arm64 mips mipsle mips64 mips64le riscv64; do
 
 	# Log
 	echo "Built ${OUT}"
-
-	# Minify
-	OLD_SIZE=$(stat -c%s "${OUT}")
-	if ${UPX_BIN} --lzma --best "${OUT}" > /dev/null 2>&1 ; then
-		NEW_SIZE=$(stat -c%s $OUT)
-	
-		# Log
-		echo "Minified ${OUT} from ${OLD_SIZE} B to ${NEW_SIZE} B (Savings: ~$((100 * (${OLD_SIZE} - ${NEW_SIZE}) / ${OLD_SIZE}))%)"
-	else
-		echo "Failed to minify ${OUT} (Size: ${OLD_SIZE} B)"
-	fi
 
 	# Copy systemd files
 	mkdir -p "${DIST}/systemd"

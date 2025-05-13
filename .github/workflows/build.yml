@@ -30,12 +30,6 @@ jobs:
       - name: Download module dependencies
         run: go mod download
 
-      - name: Install UPX
-        uses: crazy-max/ghaction-upx@v3
-        with:
-          install-only: true
-          version: latest
-
       - name: Build
         run: ./build_dist.sh
 
