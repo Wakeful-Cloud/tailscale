@@ -21,9 +21,9 @@ import (
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/localapi"
 	"tailscale.com/tailcfg"
-	"tailscale.com/taildrop"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httphdr"
 	"tailscale.com/util/mak"
@@ -80,9 +80,13 @@ func serveFilePut(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lb := h.LocalBackend()
+	ext, ok := ipnlocal.GetExt[*Extension](h.LocalBackend())
+	if !ok {
+		http.Error(w, "misconfigured taildrop extension", http.StatusInternalServerError)
+		return
+	}
 
-	fts, err := lb.FileTargets()
+	fts, err := ext.FileTargets()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -131,7 +135,7 @@ func serveFilePut(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		defer t.Stop()
-		defer lb.UpdateOutgoingFiles(outgoingFiles)
+		defer ext.updateOutgoingFiles(outgoingFiles)
 		for {
 			select {
 			case u, ok := <-progressUpdates:
@@ -140,7 +144,7 @@ func serveFilePut(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
 				}
 				outgoingFiles[u.ID] = &u
 			case <-t.C:
-				lb.UpdateOutgoingFiles(outgoingFiles)
+				ext.updateOutgoingFiles(outgoingFiles)
 			}
 		}
 	}()
@@ -301,7 +305,11 @@ func singleFilePut(
 		fail()
 		return false
 	}
-	switch resp, err := client.Do(req); {
+	resp, err := client.Do(req)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+	switch {
 	case err != nil:
 		h.Logf("could not fetch remote hashes: %v", err)
 	case resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotFound:
@@ -311,7 +319,7 @@ func singleFilePut(
 	default:
 		resumeStart := time.Now()
 		dec := json.NewDecoder(resp.Body)
-		offset, remainingBody, err = taildrop.ResumeReader(body, func() (out taildrop.BlockChecksum, err error) {
+		offset, remainingBody, err = resumeReader(body, func() (out blockChecksum, err error) {
 			err = dec.Decode(&out)
 			return out, err
 		})
@@ -353,7 +361,13 @@ func serveFiles(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "file access denied", http.StatusForbidden)
 		return
 	}
-	lb := h.LocalBackend()
+
+	ext, ok := ipnlocal.GetExt[*Extension](h.LocalBackend())
+	if !ok {
+		http.Error(w, "misconfigured taildrop extension", http.StatusInternalServerError)
+		return
+	}
+
 	suffix, ok := strings.CutPrefix(r.URL.EscapedPath(), "/localapi/v0/files/")
 	if !ok {
 		http.Error(w, "misconfigured", http.StatusInternalServerError)
@@ -365,6 +379,7 @@ func serveFiles(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ctx := r.Context()
+		var wfs []apitype.WaitingFile
 		if s := r.FormValue("waitsec"); s != "" && s != "0" {
 			d, err := strconv.Atoi(s)
 			if err != nil {
@@ -375,11 +390,18 @@ func serveFiles(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithDeadline(ctx, deadline)
 			defer cancel()
-		}
-		wfs, err := lb.AwaitWaitingFiles(ctx)
-		if err != nil && ctx.Err() == nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			wfs, err = ext.AwaitWaitingFiles(ctx)
+			if err != nil && ctx.Err() == nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			var err error
+			wfs, err = ext.WaitingFiles()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(wfs)
@@ -391,14 +413,14 @@ func serveFiles(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "DELETE" {
-		if err := lb.DeleteFile(name); err != nil {
+		if err := ext.DeleteFile(name); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	rc, size, err := lb.OpenFile(name)
+	rc, size, err := ext.OpenFile(name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -418,7 +440,14 @@ func serveFileTargets(h *localapi.Handler, w http.ResponseWriter, r *http.Reques
 		http.Error(w, "want GET to list targets", http.StatusBadRequest)
 		return
 	}
-	fts, err := h.LocalBackend().FileTargets()
+
+	ext, ok := ipnlocal.GetExt[*Extension](h.LocalBackend())
+	if !ok {
+		http.Error(w, "misconfigured taildrop extension", http.StatusInternalServerError)
+		return
+	}
+
+	fts, err := ext.FileTargets()
 	if err != nil {
 		localapi.WriteErrorJSON(w, err)
 		return

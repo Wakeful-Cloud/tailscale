@@ -26,7 +26,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
@@ -58,6 +57,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/ipn/ipnauth"
+	"tailscale.com/ipn/ipnext"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/policy"
 	"tailscale.com/log/sockstatlog"
@@ -102,7 +102,6 @@ import (
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/multierr"
-	"tailscale.com/util/osshare"
 	"tailscale.com/util/osuser"
 	"tailscale.com/util/rands"
 	"tailscale.com/util/set"
@@ -166,6 +165,8 @@ type watchSession struct {
 	sessionID string
 	cancel    context.CancelFunc // to shut down the session
 }
+
+var metricCaptivePortalDetected = clientmetric.NewCounter("captiveportal_detected")
 
 // LocalBackend is the glue between the major pieces of the Tailscale
 // network software: the cloud control plane (via controlclient), the
@@ -236,6 +237,8 @@ type LocalBackend struct {
 	// for testing and graceful shutdown purposes.
 	goTracker goroutines.Tracker
 
+	startOnce sync.Once // protects the one‑time initialization in [LocalBackend.Start]
+
 	// extHost is the bridge between [LocalBackend] and the registered [ipnext.Extension]s.
 	// It may be nil in tests that use direct composite literal initialization of [LocalBackend]
 	// instead of calling [NewLocalBackend]. A nil pointer is a valid, no-op host.
@@ -258,7 +261,7 @@ type LocalBackend struct {
 	// We intend to relax this in the future and only require holding b.mu when replacing it,
 	// but that requires a better (strictly ordered?) state machine and better management
 	// of [LocalBackend]'s own state that is not tied to the node context.
-	currentNodeAtomic atomic.Pointer[localNodeContext]
+	currentNodeAtomic atomic.Pointer[nodeBackend]
 
 	conf           *conffile.Config   // latest parsed config, or nil if not in declarative mode
 	pm             *profileManager    // mu guards access
@@ -274,40 +277,25 @@ type LocalBackend struct {
 	machinePrivKey key.MachinePrivate
 	tka            *tkaState // TODO(nickkhyl): move to nodeContext
 	state          ipn.State // TODO(nickkhyl): move to nodeContext
-	capFileSharing bool      // whether netMap contains the file sharing capability
 	capTailnetLock bool      // whether netMap contains the tailnet lock capability
 	// hostinfo is mutated in-place while mu is held.
-	hostinfo         *tailcfg.Hostinfo      // TODO(nickkhyl): move to nodeContext
-	nmExpiryTimer    tstime.TimerController // for updating netMap on node expiry; can be nil; TODO(nickkhyl): move to nodeContext
-	activeLogin      string                 // last logged LoginName from netMap; TODO(nickkhyl): move to nodeContext (or remove? it's in [ipn.LoginProfile]).
-	engineStatus     ipn.EngineStatus
-	endpoints        []tailcfg.Endpoint
-	blocked          bool
-	keyExpired       bool          // TODO(nickkhyl): move to nodeContext
-	authURL          string        // non-empty if not Running; TODO(nickkhyl): move to nodeContext
-	authURLTime      time.Time     // when the authURL was received from the control server; TODO(nickkhyl): move to nodeContext
-	authActor        ipnauth.Actor // an actor who called [LocalBackend.StartLoginInteractive] last, or nil; TODO(nickkhyl): move to nodeContext
-	egg              bool
-	prevIfState      *netmon.State
-	peerAPIServer    *peerAPIServer // or nil
-	peerAPIListeners []*peerAPIListener
-	loginFlags       controlclient.LoginFlags
-	fileWaiters      set.HandleSet[context.CancelFunc] // of wake-up funcs
-	notifyWatchers   map[string]*watchSession          // by session ID
-	lastStatusTime   time.Time                         // status.AsOf value of the last processed status update
-	// directFileRoot, if non-empty, means to write received files
-	// directly to this directory, without staging them in an
-	// intermediate buffered directory for "pick-up" later. If
-	// empty, the files are received in a daemon-owned location
-	// and the localapi is used to enumerate, download, and delete
-	// them. This is used on macOS where the GUI lifetime is the
-	// same as the Network Extension lifetime and we can thus avoid
-	// double-copying files by writing them to the right location
-	// immediately.
-	// It's also used on several NAS platforms (Synology, TrueNAS, etc)
-	// but in that case DoFinalRename is also set true, which moves the
-	// *.partial file to its final name on completion.
-	directFileRoot    string
+	hostinfo          *tailcfg.Hostinfo      // TODO(nickkhyl): move to nodeContext
+	nmExpiryTimer     tstime.TimerController // for updating netMap on node expiry; can be nil; TODO(nickkhyl): move to nodeContext
+	activeLogin       string                 // last logged LoginName from netMap; TODO(nickkhyl): move to nodeContext (or remove? it's in [ipn.LoginProfile]).
+	engineStatus      ipn.EngineStatus
+	endpoints         []tailcfg.Endpoint
+	blocked           bool
+	keyExpired        bool          // TODO(nickkhyl): move to nodeContext
+	authURL           string        // non-empty if not Running; TODO(nickkhyl): move to nodeContext
+	authURLTime       time.Time     // when the authURL was received from the control server; TODO(nickkhyl): move to nodeContext
+	authActor         ipnauth.Actor // an actor who called [LocalBackend.StartLoginInteractive] last, or nil; TODO(nickkhyl): move to nodeContext
+	egg               bool
+	prevIfState       *netmon.State
+	peerAPIServer     *peerAPIServer // or nil
+	peerAPIListeners  []*peerAPIListener
+	loginFlags        controlclient.LoginFlags
+	notifyWatchers    map[string]*watchSession // by session ID
+	lastStatusTime    time.Time                // status.AsOf value of the last processed status update
 	componentLogUntil map[string]componentLogState
 	// c2nUpdateStatus is the status of c2n-triggered client update.
 	c2nUpdateStatus updateStatus
@@ -370,9 +358,6 @@ type LocalBackend struct {
 	// where all addresses might disappear.
 	// http://go/corp/25168
 	lastKnownHardwareAddrs syncs.AtomicValue[[]string]
-
-	// outgoingFiles keeps track of Taildrop outgoing files keyed to their OutgoingFile.ID
-	outgoingFiles map[string]*ipn.OutgoingFile
 
 	// lastSuggestedExitNode stores the last suggested exit node suggestion to
 	// avoid unnecessary churn between multiple equally-good options.
@@ -477,7 +462,6 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	}
 
 	envknob.LogCurrent(logf)
-	osshare.SetFileSharingEnabled(false, logf)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	clock := tstime.StdClock{}
@@ -519,7 +503,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 		captiveCancel:         nil, // so that we start checkCaptivePortalLoop when Running
 		needsCaptiveDetection: make(chan bool),
 	}
-	b.currentNodeAtomic.Store(newLocalNodeContext())
+	b.currentNodeAtomic.Store(newNodeBackend())
 	mConn.SetNetInfoCallback(b.setNetInfo)
 
 	if sys.InitialConfig != nil {
@@ -586,20 +570,23 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 			}
 		}
 	}
-
-	b.extHost.Init()
 	return b, nil
 }
 
 func (b *LocalBackend) Clock() tstime.Clock { return b.clock }
 func (b *LocalBackend) Sys() *tsd.System    { return b.sys }
 
-func (b *LocalBackend) currentNode() *localNodeContext {
+// NodeBackend returns the current node's NodeBackend interface.
+func (b *LocalBackend) NodeBackend() ipnext.NodeBackend {
+	return b.currentNode()
+}
+
+func (b *LocalBackend) currentNode() *nodeBackend {
 	if v := b.currentNodeAtomic.Load(); v != nil || !testenv.InTest() {
 		return v
 	}
 	// Auto-init one in tests for LocalBackend created without the NewLocalBackend constructor...
-	v := newLocalNodeContext()
+	v := newNodeBackend()
 	b.currentNodeAtomic.CompareAndSwap(nil, v)
 	return b.currentNodeAtomic.Load()
 }
@@ -772,17 +759,6 @@ func (b *LocalBackend) Dialer() *tsdial.Dialer {
 	return b.dialer
 }
 
-// SetDirectFileRoot sets the directory to download files to directly,
-// without buffering them through an intermediate daemon-owned
-// tailcfg.UserID-specific directory.
-//
-// This must be called before the LocalBackend starts being used.
-func (b *LocalBackend) SetDirectFileRoot(dir string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.directFileRoot = dir
-}
-
 // ReloadConfig reloads the backend's config from disk.
 //
 // It returns (false, nil) if not running in declarative mode, (true, nil) on
@@ -841,6 +817,16 @@ func (b *LocalBackend) setStaticEndpointsFromConfigLocked(conf *conffile.Config)
 		} else {
 			ms.SetStaticEndpoints(views.SliceOf(conf.Parsed.StaticEndpoints))
 		}
+	}
+}
+
+func (b *LocalBackend) setStateLocked(state ipn.State) {
+	if b.state == state {
+		return
+	}
+	b.state = state
+	for _, f := range b.extHost.Hooks().BackendStateChange {
+		f(state)
 	}
 }
 
@@ -947,11 +933,15 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	}
 }
 
-func (b *LocalBackend) onHealthChange(w *health.Warnable, us *health.UnhealthyState) {
-	if us == nil {
-		b.logf("health(warnable=%s): ok", w.Code)
-	} else {
-		b.logf("health(warnable=%s): error: %s", w.Code, us.Text)
+func (b *LocalBackend) onHealthChange(change health.Change) {
+	if change.WarnableChanged {
+		w := change.Warnable
+		us := change.UnhealthyState
+		if us == nil {
+			b.logf("health(warnable=%s): ok", w.Code)
+		} else {
+			b.logf("health(warnable=%s): error: %s", w.Code, us.Text)
+		}
 	}
 
 	// Whenever health changes, send the current health state to the frontend.
@@ -1309,8 +1299,8 @@ func (b *LocalBackend) populatePeerStatusLocked(sb *ipnstate.StatusBuilder) {
 			Location:        p.Hostinfo().Location().AsStruct(),
 			Capabilities:    p.Capabilities().AsSlice(),
 		}
-		if f := hookSetPeerStatusTaildropTargetLocked; f != nil {
-			f(b, ps, p)
+		for _, f := range b.extHost.Hooks().SetPeerStatus {
+			f(ps, p, cn)
 		}
 		if cm := p.CapMap(); cm.Len() > 0 {
 			ps.CapMap = make(tailcfg.NodeCapMap, cm.Len())
@@ -1463,53 +1453,12 @@ func (b *LocalBackend) PeerCaps(src netip.Addr) tailcfg.PeerCapMap {
 	return b.currentNode().PeerCaps(src)
 }
 
-func (b *localNodeContext) AppendMatchingPeers(base []tailcfg.NodeView, pred func(tailcfg.NodeView) bool) []tailcfg.NodeView {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	ret := base
-	if b.netMap == nil {
-		return ret
+func (b *LocalBackend) GetFilterForTest() *filter.Filter {
+	if !testenv.InTest() {
+		panic("GetFilterForTest called outside of test")
 	}
-	for _, peer := range b.netMap.Peers {
-		if pred(peer) {
-			ret = append(ret, peer)
-		}
-	}
-	return ret
-}
-
-// PeerCaps returns the capabilities that remote src IP has to
-// ths current node.
-func (b *localNodeContext) PeerCaps(src netip.Addr) tailcfg.PeerCapMap {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.peerCapsLocked(src)
-}
-
-func (b *localNodeContext) peerCapsLocked(src netip.Addr) tailcfg.PeerCapMap {
-	if b.netMap == nil {
-		return nil
-	}
-	filt := b.filterAtomic.Load()
-	if filt == nil {
-		return nil
-	}
-	addrs := b.netMap.GetAddresses()
-	for i := range addrs.Len() {
-		a := addrs.At(i)
-		if !a.IsSingleIP() {
-			continue
-		}
-		dst := a.Addr()
-		if dst.BitLen() == src.BitLen() { // match on family
-			return filt.CapsWithValues(src, dst)
-		}
-	}
-	return nil
-}
-
-func (b *localNodeContext) GetFilterForTest() *filter.Filter {
-	return b.filterAtomic.Load()
+	nb := b.currentNode()
+	return nb.filterAtomic.Load()
 }
 
 // SetControlClientStatus is the callback invoked by the control client whenever it posts a new status.
@@ -2019,20 +1968,6 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	return true
 }
 
-func (c *localNodeContext) netMapWithPeers() *netmap.NetworkMap {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.netMap == nil {
-		return nil
-	}
-	nm := ptr.To(*c.netMap) // shallow clone
-	nm.Peers = slicesx.MapValues(c.peers)
-	slices.SortFunc(nm.Peers, func(a, b tailcfg.NodeView) int {
-		return cmp.Compare(a.ID(), b.ID())
-	})
-	return nm
-}
-
 // mutationsAreWorthyOfTellingIPNBus reports whether any mutation type in muts is
 // worthy of spamming the IPN bus (the Windows & Mac GUIs, basically) to tell them
 // about the update.
@@ -2061,37 +1996,6 @@ func (b *LocalBackend) pickNewAutoExitNode() {
 	}
 
 	b.send(ipn.Notify{Prefs: &newPrefs})
-}
-
-func (c *localNodeContext) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.netMap == nil || len(c.peers) == 0 {
-		return false
-	}
-
-	// Locally cloned mutable nodes, to avoid calling AsStruct (clone)
-	// multiple times on a node if it's mutated multiple times in this
-	// call (e.g. its endpoints + online status both change)
-	var mutableNodes map[tailcfg.NodeID]*tailcfg.Node
-
-	for _, m := range muts {
-		n, ok := mutableNodes[m.NodeIDBeingMutated()]
-		if !ok {
-			nv, ok := c.peers[m.NodeIDBeingMutated()]
-			if !ok {
-				// TODO(bradfitz): unexpected metric?
-				return false
-			}
-			n = nv.AsStruct()
-			mak.Set(&mutableNodes, nv.ID(), n)
-		}
-		m.Apply(n)
-	}
-	for nid, n := range mutableNodes {
-		c.peers[nid] = n.View()
-	}
-	return true
 }
 
 // setExitNodeID updates prefs to reference an exit node by ID, rather
@@ -2250,16 +2154,6 @@ func (b *LocalBackend) PeersForTest() []tailcfg.NodeView {
 	return b.currentNode().PeersForTest()
 }
 
-func (b *localNodeContext) PeersForTest() []tailcfg.NodeView {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	ret := slicesx.MapValues(b.peers)
-	slices.SortFunc(ret, func(a, b tailcfg.NodeView) int {
-		return cmp.Compare(a.ID(), b.ID())
-	})
-	return ret
-}
-
 func (b *LocalBackend) getNewControlClientFuncLocked() clientGen {
 	if b.ccGen == nil {
 		// Initialize it rather than just returning the
@@ -2270,6 +2164,11 @@ func (b *LocalBackend) getNewControlClientFuncLocked() clientGen {
 		}
 	}
 	return b.ccGen
+}
+
+// initOnce is called on the first call to [LocalBackend.Start].
+func (b *LocalBackend) initOnce() {
+	b.extHost.Init()
 }
 
 // Start applies the configuration specified in opts, and starts the
@@ -2284,6 +2183,8 @@ func (b *LocalBackend) getNewControlClientFuncLocked() clientGen {
 // from the following whether or not that is a safe transition).
 func (b *LocalBackend) Start(opts ipn.Options) error {
 	b.logf("Start")
+
+	b.startOnce.Do(b.initOnce)
 
 	var clientToShutdown controlclient.Client
 	defer func() {
@@ -2342,7 +2243,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 		hostinfo.Services = b.hostinfo.Services // keep any previous services
 	}
 	b.hostinfo = hostinfo
-	b.state = ipn.NoState
+	b.setStateLocked(ipn.NoState)
 
 	cn := b.currentNode()
 	if opts.UpdatePrefs != nil {
@@ -2532,12 +2433,12 @@ var invalidPacketFilterWarnable = health.Register(&health.Warnable{
 // b.mu must be held.
 func (b *LocalBackend) updateFilterLocked(prefs ipn.PrefsView) {
 	// TODO(nickkhyl) split this into two functions:
-	// - (*localNodeContext).RebuildFilters() (normalFilter, jailedFilter *filter.Filter, changed bool),
+	// - (*nodeBackend).RebuildFilters() (normalFilter, jailedFilter *filter.Filter, changed bool),
 	//   which would return packet filters for the current state and whether they changed since the last call.
 	// - (*LocalBackend).updateFilters(), which would use the above to update the engine with the new filters,
 	//    notify b.sshServer, etc.
 	//
-	// For this, we would need to plumb a few more things into the [localNodeContext]. Most importantly,
+	// For this, we would need to plumb a few more things into the [nodeBackend]. Most importantly,
 	// the current [ipn.PrefsView]), but also maybe also a b.logf and a b.health?
 	//
 	// NOTE(danderson): keep change detection as the first thing in
@@ -2761,6 +2662,9 @@ func (b *LocalBackend) performCaptiveDetection() {
 	b.mu.Unlock()
 	found := d.Detect(ctx, netMon, dm, preferredDERP)
 	if found {
+		if !b.health.IsUnhealthy(captivePortalWarnable) {
+			metricCaptivePortalDetected.Add(1)
+		}
 		b.health.SetUnhealthy(captivePortalWarnable, health.Args{})
 	} else {
 		b.health.SetHealthy(captivePortalWarnable)
@@ -2821,10 +2725,6 @@ func packetFilterPermitsUnlockedNodes(peers map[tailcfg.NodeID]tailcfg.NodeView,
 func (b *LocalBackend) setFilter(f *filter.Filter) {
 	b.currentNode().setFilter(f)
 	b.e.SetFilter(f)
-}
-
-func (c *localNodeContext) setFilter(f *filter.Filter) {
-	c.filterAtomic.Store(f)
 }
 
 var removeFromDefaultRoute = []netip.Prefix{
@@ -3301,17 +3201,6 @@ func (b *LocalBackend) sendTo(n ipn.Notify, recipient notificationTarget) {
 	b.sendToLocked(n, recipient)
 }
 
-var (
-	// hookSetNotifyFilesWaitingLocked, if non-nil, is called in sendToLocked to
-	// populate ipn.Notify.FilesWaiting when taildrop is linked in to the binary
-	// and enabled on a LocalBackend.
-	hookSetNotifyFilesWaitingLocked func(*LocalBackend, *ipn.Notify)
-
-	// hookSetPeerStatusTaildropTargetLocked, if non-nil, is called to populate PeerStatus
-	// if taildrop is linked in to the binary and enabled on the LocalBackend.
-	hookSetPeerStatusTaildropTargetLocked func(*LocalBackend, *ipnstate.PeerStatus, tailcfg.NodeView)
-)
-
 // sendToLocked is like [LocalBackend.sendTo], but assumes b.mu is already held.
 func (b *LocalBackend) sendToLocked(n ipn.Notify, recipient notificationTarget) {
 	if n.Prefs != nil {
@@ -3321,8 +3210,8 @@ func (b *LocalBackend) sendToLocked(n ipn.Notify, recipient notificationTarget) 
 		n.Version = version.Long()
 	}
 
-	if f := hookSetNotifyFilesWaitingLocked; f != nil {
-		f(b, &n)
+	for _, f := range b.extHost.Hooks().MutateNotifyLocked {
+		f(&n)
 	}
 
 	for _, sess := range b.notifyWatchers {
@@ -3886,7 +3775,7 @@ func (b *LocalBackend) parseWgStatusLocked(s *wgengine.Status) (ret ipn.EngineSt
 // in Hostinfo. When the user preferences currently request "shields up"
 // mode, all inbound connections are refused, so services are not reported.
 // Otherwise, shouldUploadServices respects NetMap.CollectServices.
-// TODO(nickkhyl): move this into [localNodeContext]?
+// TODO(nickkhyl): move this into [nodeBackend]?
 func (b *LocalBackend) shouldUploadServices() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -4261,8 +4150,8 @@ func (b *LocalBackend) SetUseExitNodeEnabled(v bool) (ipn.PrefsView, error) {
 // AdvertiseRoutes has been set in the MaskedPrefs.
 func (b *LocalBackend) MaybeClearAppConnector(mp *ipn.MaskedPrefs) error {
 	var err error
-	if b.appConnector != nil && mp.AdvertiseRoutesSet {
-		err = b.appConnector.ClearRoutes()
+	if ac := b.AppConnector(); ac != nil && mp.AdvertiseRoutesSet {
+		err = ac.ClearRoutes()
 		if err != nil {
 			b.logf("appc: clear routes error: %v", err)
 		}
@@ -4387,9 +4276,11 @@ func (b *LocalBackend) editPrefsLockedOnEntry(mp *ipn.MaskedPrefs, unlock unlock
 		b.egg = true
 		b.goTracker.Go(b.doSetHostinfoFilterServices)
 	}
+
 	p0 := b.pm.CurrentPrefs()
 	p1 := b.pm.CurrentPrefs().AsStruct()
 	p1.ApplyEdits(mp)
+
 	if err := b.checkPrefsLocked(p1); err != nil {
 		b.logf("EditPrefs check error: %v", err)
 		return ipn.PrefsView{}, err
@@ -4401,8 +4292,22 @@ func (b *LocalBackend) editPrefsLockedOnEntry(mp *ipn.MaskedPrefs, unlock unlock
 	if p1.View().Equals(p0) {
 		return stripKeysFromPrefs(p0), nil
 	}
+
 	b.logf("EditPrefs: %v", mp.Pretty())
 	newPrefs := b.setPrefsLockedOnEntry(p1, unlock)
+
+	// This is recorded here in the EditPrefs path, not the setPrefs path on purpose.
+	// recordForEdit records metrics related to edits and changes, not the final state.
+	// If, in the future, we want to record gauge-metrics related to the state of prefs,
+	// that should be done in the setPrefs path.
+	e := prefsMetricsEditEvent{
+		change:                mp,
+		pNew:                  p1.View(),
+		pOld:                  p0,
+		node:                  b.currentNode(),
+		lastSuggestedExitNode: b.lastSuggestedExitNode,
+	}
+	e.record()
 
 	// Note: don't perform any actions for the new prefs here. Not
 	// every prefs change goes through EditPrefs. Put your actions
@@ -4475,6 +4380,7 @@ func (b *LocalBackend) setPrefsLockedOnEntry(newp *ipn.Prefs, unlock unlockOnce)
 	applySysPolicy(newp, b.lastSuggestedExitNode, b.overrideAlwaysOn)
 	// setExitNodeID does likewise. No-op if no exit node resolution is needed.
 	setExitNodeID(newp, netMap)
+
 	// We do this to avoid holding the lock while doing everything else.
 
 	oldHi := b.hostinfo
@@ -4758,12 +4664,6 @@ func (b *LocalBackend) NetMap() *netmap.NetworkMap {
 	return b.currentNode().NetMap()
 }
 
-func (c *localNodeContext) NetMap() *netmap.NetworkMap {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.netMap
-}
-
 func (b *LocalBackend) isEngineBlocked() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -4855,9 +4755,7 @@ func (b *LocalBackend) readvertiseAppConnectorRoutes() {
 	//
 	// Grab a copy of the field, since b.mu only guards access to the
 	// b.appConnector field itself.
-	b.mu.Lock()
-	appConnector := b.appConnector
-	b.mu.Unlock()
+	appConnector := b.AppConnector()
 
 	if appConnector == nil {
 		return
@@ -4894,7 +4792,6 @@ func (b *LocalBackend) authReconfig() {
 	nm := cn.NetMap()
 	hasPAC := b.prevIfState.HasPAC()
 	disableSubnetsIfPAC := cn.SelfHasCap(tailcfg.NodeAttrDisableSubnetsIfPAC)
-	userDialUseRoutes := cn.SelfHasCap(tailcfg.NodeAttrUserDialUseRoutes)
 	dohURL, dohURLOK := cn.exitNodeCanProxyDNS(prefs.ExitNodeID())
 	dcfg := cn.dnsConfigForNetmap(prefs, b.keyExpired, b.logf, version.OS())
 	// If the current node is an app connector, ensure the app connector machine is started
@@ -4955,12 +4852,6 @@ func (b *LocalBackend) authReconfig() {
 	}
 	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", prefs.RouteAll(), prefs.CorpDNS(), flags, err)
 
-	if userDialUseRoutes {
-		b.dialer.SetRoutes(rcfg.Routes, rcfg.LocalRoutes)
-	} else {
-		b.dialer.SetRoutes(nil, nil)
-	}
-
 	b.initPeerAPIListener()
 	b.readvertiseAppConnectorRoutes()
 }
@@ -5001,199 +4892,6 @@ func shouldUseOneCGNATRoute(logf logger.Logf, mon *netmon.Monitor, controlKnobs 
 		}
 	}
 	return false
-}
-
-func (c *localNodeContext) dnsConfigForNetmap(prefs ipn.PrefsView, selfExpired bool, logf logger.Logf, versionOS string) *dns.Config {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return dnsConfigForNetmap(c.netMap, c.peers, prefs, selfExpired, logf, versionOS)
-}
-
-// dnsConfigForNetmap returns a *dns.Config for the given netmap,
-// prefs, client OS version, and cloud hosting environment.
-//
-// The versionOS is a Tailscale-style version ("iOS", "macOS") and not
-// a runtime.GOOS.
-func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.NodeView, prefs ipn.PrefsView, selfExpired bool, logf logger.Logf, versionOS string) *dns.Config {
-	if nm == nil {
-		return nil
-	}
-
-	// If the current node's key is expired, then we don't program any DNS
-	// configuration into the operating system. This ensures that if the
-	// DNS configuration specifies a DNS server that is only reachable over
-	// Tailscale, we don't break connectivity for the user.
-	//
-	// TODO(andrew-d): this also stops returning anything from quad-100; we
-	// could do the same thing as having "CorpDNS: false" and keep that but
-	// not program the OS?
-	if selfExpired {
-		return &dns.Config{}
-	}
-
-	dcfg := &dns.Config{
-		Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
-		Hosts:  map[dnsname.FQDN][]netip.Addr{},
-	}
-
-	// selfV6Only is whether we only have IPv6 addresses ourselves.
-	selfV6Only := nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs6) &&
-		!nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs4)
-	dcfg.OnlyIPv6 = selfV6Only
-
-	// Populate MagicDNS records. We do this unconditionally so that
-	// quad-100 can always respond to MagicDNS queries, even if the OS
-	// isn't configured to make MagicDNS resolution truly
-	// magic. Details in
-	// https://github.com/tailscale/tailscale/issues/1886.
-	set := func(name string, addrs views.Slice[netip.Prefix]) {
-		if addrs.Len() == 0 || name == "" {
-			return
-		}
-		fqdn, err := dnsname.ToFQDN(name)
-		if err != nil {
-			return // TODO: propagate error?
-		}
-		var have4 bool
-		for _, addr := range addrs.All() {
-			if addr.Addr().Is4() {
-				have4 = true
-				break
-			}
-		}
-		var ips []netip.Addr
-		for _, addr := range addrs.All() {
-			if selfV6Only {
-				if addr.Addr().Is6() {
-					ips = append(ips, addr.Addr())
-				}
-				continue
-			}
-			// If this node has an IPv4 address, then
-			// remove peers' IPv6 addresses for now, as we
-			// don't guarantee that the peer node actually
-			// can speak IPv6 correctly.
-			//
-			// https://github.com/tailscale/tailscale/issues/1152
-			// tracks adding the right capability reporting to
-			// enable AAAA in MagicDNS.
-			if addr.Addr().Is6() && have4 {
-				continue
-			}
-			ips = append(ips, addr.Addr())
-		}
-		dcfg.Hosts[fqdn] = ips
-	}
-	set(nm.Name, nm.GetAddresses())
-	for _, peer := range peers {
-		set(peer.Name(), peer.Addresses())
-	}
-	for _, rec := range nm.DNS.ExtraRecords {
-		switch rec.Type {
-		case "", "A", "AAAA":
-			// Treat these all the same for now: infer from the value
-		default:
-			// TODO: more
-			continue
-		}
-		ip, err := netip.ParseAddr(rec.Value)
-		if err != nil {
-			// Ignore.
-			continue
-		}
-		fqdn, err := dnsname.ToFQDN(rec.Name)
-		if err != nil {
-			continue
-		}
-		dcfg.Hosts[fqdn] = append(dcfg.Hosts[fqdn], ip)
-	}
-
-	if !prefs.CorpDNS() {
-		return dcfg
-	}
-
-	for _, dom := range nm.DNS.Domains {
-		fqdn, err := dnsname.ToFQDN(dom)
-		if err != nil {
-			logf("[unexpected] non-FQDN search domain %q", dom)
-		}
-		dcfg.SearchDomains = append(dcfg.SearchDomains, fqdn)
-	}
-	if nm.DNS.Proxied { // actually means "enable MagicDNS"
-		for _, dom := range magicDNSRootDomains(nm) {
-			dcfg.Routes[dom] = nil // resolve internally with dcfg.Hosts
-		}
-	}
-
-	addDefault := func(resolvers []*dnstype.Resolver) {
-		dcfg.DefaultResolvers = append(dcfg.DefaultResolvers, resolvers...)
-	}
-
-	// If we're using an exit node and that exit node is new enough (1.19.x+)
-	// to run a DoH DNS proxy, then send all our DNS traffic through it.
-	if dohURL, ok := exitNodeCanProxyDNS(nm, peers, prefs.ExitNodeID()); ok {
-		addDefault([]*dnstype.Resolver{{Addr: dohURL}})
-		return dcfg
-	}
-
-	// If the user has set default resolvers ("override local DNS"), prefer to
-	// use those resolvers as the default, otherwise if there are WireGuard exit
-	// node resolvers, use those as the default.
-	if len(nm.DNS.Resolvers) > 0 {
-		addDefault(nm.DNS.Resolvers)
-	} else {
-		if resolvers, ok := wireguardExitNodeDNSResolvers(nm, peers, prefs.ExitNodeID()); ok {
-			addDefault(resolvers)
-		}
-	}
-
-	for suffix, resolvers := range nm.DNS.Routes {
-		fqdn, err := dnsname.ToFQDN(suffix)
-		if err != nil {
-			logf("[unexpected] non-FQDN route suffix %q", suffix)
-		}
-
-		// Create map entry even if len(resolvers) == 0; Issue 2706.
-		// This lets the control plane send ExtraRecords for which we
-		// can authoritatively answer "name not exists" for when the
-		// control plane also sends this explicit but empty route
-		// making it as something we handle.
-		//
-		// While we're already populating it, might as well size the
-		// slice appropriately.
-		// Per #9498 the exact requirements of nil vs empty slice remain
-		// unclear, this is a haunted graveyard to be resolved.
-		dcfg.Routes[fqdn] = make([]*dnstype.Resolver, 0, len(resolvers))
-		dcfg.Routes[fqdn] = append(dcfg.Routes[fqdn], resolvers...)
-	}
-
-	// Set FallbackResolvers as the default resolvers in the
-	// scenarios that can't handle a purely split-DNS config. See
-	// https://github.com/tailscale/tailscale/issues/1743 for
-	// details.
-	switch {
-	case len(dcfg.DefaultResolvers) != 0:
-		// Default resolvers already set.
-	case !prefs.ExitNodeID().IsZero():
-		// When using an exit node, we send all DNS traffic to the exit node, so
-		// we don't need a fallback resolver.
-		//
-		// However, if the exit node is too old to run a DoH DNS proxy, then we
-		// need to use a fallback resolver as it's very likely the LAN resolvers
-		// will become unreachable.
-		//
-		// This is especially important on Apple OSes, where
-		// adding the default route to the tunnel interface makes
-		// it "primary", and we MUST provide VPN-sourced DNS
-		// settings or we break all DNS resolution.
-		//
-		// https://github.com/tailscale/tailscale/issues/1713
-		addDefault(nm.DNS.FallbackResolvers)
-	case len(dcfg.Routes) == 0:
-		// No settings requiring split DNS, no problem.
-	}
-
-	return dcfg
 }
 
 // SetTCPHandlerForFunnelFlow sets the TCP handler for Funnel flows.
@@ -5247,26 +4945,6 @@ func (b *LocalBackend) TailscaleVarRoot() string {
 		}
 	}
 	return ""
-}
-
-func (b *LocalBackend) fileRootLocked(uid tailcfg.UserID) string {
-	if v := b.directFileRoot; v != "" {
-		return v
-	}
-	varRoot := b.TailscaleVarRoot()
-	if varRoot == "" {
-		b.logf("Taildrop disabled; no state directory")
-		return ""
-	}
-	baseDir := fmt.Sprintf("%s-uid-%d",
-		strings.ReplaceAll(b.activeLogin, "@", "-"),
-		uid)
-	dir := filepath.Join(varRoot, "files", baseDir)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		b.logf("Taildrop disabled; error making directory: %v", err)
-		return ""
-	}
-	return dir
 }
 
 // closePeerAPIListenersLocked closes any existing PeerAPI listeners
@@ -5336,8 +5014,7 @@ func (b *LocalBackend) initPeerAPIListener() {
 	}
 
 	ps := &peerAPIServer{
-		b:        b,
-		taildrop: b.newTaildropManager(b.fileRootLocked(selfNode.User())),
+		b: b,
 	}
 	if dm, ok := b.sys.DNSManager.GetOK(); ok {
 		ps.resolver = dm.Resolver()
@@ -5626,7 +5303,7 @@ func (b *LocalBackend) enterState(newState ipn.State) {
 func (b *LocalBackend) enterStateLockedOnEntry(newState ipn.State, unlock unlockOnce) {
 	cn := b.currentNode()
 	oldState := b.state
-	b.state = newState
+	b.setStateLocked(newState)
 	prefs := b.pm.CurrentPrefs()
 
 	// Some temporary (2024-05-05) debugging code to help us catch
@@ -6129,18 +5806,12 @@ func (b *LocalBackend) setAutoExitNodeIDLockedOnEntry(unlock unlockOnce) (newPre
 	return newPrefs
 }
 
-func (c *localNodeContext) SetNetMap(nm *netmap.NetworkMap) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.netMap = nm
-	c.updateNodeByAddrLocked()
-	c.updatePeersLocked()
-}
-
 // setNetMapLocked updates the LocalBackend state to reflect the newly
 // received nm. If nm is nil, it resets all configuration as though
 // Tailscale is turned off.
 func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
+	oldSelf := b.currentNode().NetMap().SelfNodeOrZero()
+
 	b.dialer.SetNetMap(nm)
 	if ns, ok := b.sys.Netstack.GetOK(); ok {
 		ns.UpdateNetstackIPs(nm)
@@ -6157,17 +5828,17 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	b.pauseOrResumeControlClientLocked()
 
 	if nm != nil {
-		b.health.SetControlHealth(nm.ControlHealth)
+		messages := make(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage)
+		for id, msg := range nm.DisplayMessages {
+			if msg.PrimaryAction != nil && !b.validPopBrowserURL(msg.PrimaryAction.URL) {
+				msg.PrimaryAction = nil
+			}
+			messages[id] = msg
+		}
+		b.health.SetControlHealth(messages)
 	} else {
 		b.health.SetControlHealth(nil)
 	}
-
-	// Determine if file sharing is enabled
-	fs := nm.HasCap(tailcfg.CapabilityFileSharing)
-	if fs != b.capFileSharing {
-		osshare.SetFileSharingEnabled(fs, b.logf)
-	}
-	b.capFileSharing = fs
 
 	if nm.HasCap(tailcfg.NodeAttrLinuxMustUseIPTables) {
 		b.capForcedNetfilter = "iptables"
@@ -6188,6 +5859,13 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 
 	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(b.pm.CurrentPrefs())
 	b.ipVIPServiceMap = nm.GetIPVIPServiceMap()
+
+	if !oldSelf.Equal(nm.SelfNodeOrZero()) {
+		for _, f := range b.extHost.Hooks().OnSelfChange {
+			f(nm.SelfNode)
+		}
+	}
+
 	if nm == nil {
 		// If there is no netmap, the client is going into a "turned off"
 		// state so reset the metrics.
@@ -6207,67 +5885,6 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 
 	b.updateDrivePeersLocked(nm)
 	b.driveNotifyCurrentSharesLocked()
-}
-
-func (b *localNodeContext) updateNodeByAddrLocked() {
-	nm := b.netMap
-	if nm == nil {
-		b.nodeByAddr = nil
-		return
-	}
-
-	// Update the nodeByAddr index.
-	if b.nodeByAddr == nil {
-		b.nodeByAddr = map[netip.Addr]tailcfg.NodeID{}
-	}
-	// First pass, mark everything unwanted.
-	for k := range b.nodeByAddr {
-		b.nodeByAddr[k] = 0
-	}
-	addNode := func(n tailcfg.NodeView) {
-		for _, ipp := range n.Addresses().All() {
-			if ipp.IsSingleIP() {
-				b.nodeByAddr[ipp.Addr()] = n.ID()
-			}
-		}
-	}
-	if nm.SelfNode.Valid() {
-		addNode(nm.SelfNode)
-	}
-	for _, p := range nm.Peers {
-		addNode(p)
-	}
-	// Third pass, actually delete the unwanted items.
-	for k, v := range b.nodeByAddr {
-		if v == 0 {
-			delete(b.nodeByAddr, k)
-		}
-	}
-}
-
-func (b *localNodeContext) updatePeersLocked() {
-	nm := b.netMap
-	if nm == nil {
-		b.peers = nil
-		return
-	}
-
-	// First pass, mark everything unwanted.
-	for k := range b.peers {
-		b.peers[k] = tailcfg.NodeView{}
-	}
-
-	// Second pass, add everything wanted.
-	for _, p := range nm.Peers {
-		mak.Set(&b.peers, p.ID(), p)
-	}
-
-	// Third pass, remove deleted things.
-	for k, v := range b.peers {
-		if !v.Valid() {
-			delete(b.peers, k)
-		}
-	}
 }
 
 // responseBodyWrapper wraps an io.ReadCloser and stores
@@ -6650,18 +6267,6 @@ func (b *LocalBackend) TestOnlyPublicKeys() (machineKey key.MachinePublic, nodeK
 	return mk, nk
 }
 
-// PeerHasCap reports whether the peer with the given Tailscale IP addresses
-// contains the given capability string, with any value(s).
-func (b *localNodeContext) PeerHasCap(addr netip.Addr, wantCap tailcfg.PeerCapability) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.peerHasCapLocked(addr, wantCap)
-}
-
-func (b *localNodeContext) peerHasCapLocked(addr netip.Addr, wantCap tailcfg.PeerCapability) bool {
-	return b.peerCapsLocked(addr).HasCapability(wantCap)
-}
-
 // SetDNS adds a DNS record for the given domain name & TXT record
 // value.
 //
@@ -6709,70 +6314,6 @@ func peerAPIPorts(peer tailcfg.NodeView) (p4, p6 uint16) {
 		}
 	}
 	return
-}
-
-// peerAPIURL returns an HTTP URL for the peer's peerapi service,
-// without a trailing slash.
-//
-// If ip or port is the zero value then it returns the empty string.
-func peerAPIURL(ip netip.Addr, port uint16) string {
-	if port == 0 || !ip.IsValid() {
-		return ""
-	}
-	return fmt.Sprintf("http://%v", netip.AddrPortFrom(ip, port))
-}
-
-func (c *localNodeContext) PeerHasPeerAPI(p tailcfg.NodeView) bool {
-	return c.PeerAPIBase(p) != ""
-}
-
-// PeerAPIBase returns the "http://ip:port" URL base to reach peer's PeerAPI,
-// or the empty string if the peer is invalid or doesn't support PeerAPI.
-func (c *localNodeContext) PeerAPIBase(p tailcfg.NodeView) string {
-	c.mu.Lock()
-	nm := c.netMap
-	c.mu.Unlock()
-	return peerAPIBase(nm, p)
-}
-
-// peerAPIBase returns the "http://ip:port" URL base to reach peer's peerAPI.
-// It returns the empty string if the peer doesn't support the peerapi
-// or there's no matching address family based on the netmap's own addresses.
-func peerAPIBase(nm *netmap.NetworkMap, peer tailcfg.NodeView) string {
-	if nm == nil || !peer.Valid() || !peer.Hostinfo().Valid() {
-		return ""
-	}
-
-	var have4, have6 bool
-	addrs := nm.GetAddresses()
-	for _, a := range addrs.All() {
-		if !a.IsSingleIP() {
-			continue
-		}
-		switch {
-		case a.Addr().Is4():
-			have4 = true
-		case a.Addr().Is6():
-			have6 = true
-		}
-	}
-	p4, p6 := peerAPIPorts(peer)
-	switch {
-	case have4 && p4 != 0:
-		return peerAPIURL(nodeIP(peer, netip.Addr.Is4), p4)
-	case have6 && p6 != 0:
-		return peerAPIURL(nodeIP(peer, netip.Addr.Is6), p6)
-	}
-	return ""
-}
-
-func nodeIP(n tailcfg.NodeView, pred func(netip.Addr) bool) netip.Addr {
-	for _, pfx := range n.Addresses().All() {
-		if pfx.IsSingleIP() && pred(pfx.Addr()) {
-			return pfx.Addr()
-		}
-	}
-	return netip.Addr{}
 }
 
 func (b *LocalBackend) CheckIPForwarding() error {
@@ -6896,6 +6437,15 @@ func (b *LocalBackend) OfferingAppConnector() bool {
 	return b.appConnector != nil
 }
 
+// AppConnector returns the current AppConnector, or nil if not configured.
+//
+// TODO(nickkhyl): move app connectors to [nodeBackend], or perhaps a feature package?
+func (b *LocalBackend) AppConnector() *appc.AppConnector {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.appConnector
+}
+
 // allowExitNodeDNSProxyToServeName reports whether the Exit Node DNS
 // proxy is allowed to serve responses for the provided DNS name.
 func (b *LocalBackend) allowExitNodeDNSProxyToServeName(name string) bool {
@@ -6970,12 +6520,6 @@ func exitNodeCanProxyDNS(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg
 		}
 	}
 	return "", false
-}
-
-func (c *localNodeContext) exitNodeCanProxyDNS(exitNodeID tailcfg.StableNodeID) (dohURL string, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return exitNodeCanProxyDNS(c.netMap, c.peers, exitNodeID)
 }
 
 // wireguardExitNodeDNSResolvers returns the DNS resolvers to use for a
@@ -7396,7 +6940,7 @@ func (b *LocalBackend) resetForProfileChangeLockedOnEntry(unlock unlockOnce) err
 		// down, so no need to do any work.
 		return nil
 	}
-	b.currentNodeAtomic.Store(newLocalNodeContext())
+	b.currentNodeAtomic.Store(newNodeBackend())
 	b.setNetMapLocked(nil) // Reset netmap.
 	b.updateFilterLocked(ipn.PrefsView{})
 	// Reset the NetworkMap in the engine
@@ -8086,7 +7630,7 @@ func (b *LocalBackend) startAutoUpdate(logPrefix string) (retErr error) {
 // rules that require a source IP to have a certain node capability.
 //
 // TODO(bradfitz): optimize this later if/when it matters.
-// TODO(nickkhyl): move this into [localNodeContext] along with [LocalBackend.updateFilterLocked].
+// TODO(nickkhyl): move this into [nodeBackend] along with [LocalBackend.updateFilterLocked].
 func (b *LocalBackend) srcIPHasCapForFilter(srcIP netip.Addr, cap tailcfg.NodeCapability) bool {
 	if cap == "" {
 		// Shouldn't happen, but just in case.

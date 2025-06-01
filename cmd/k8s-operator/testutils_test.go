@@ -38,6 +38,10 @@ import (
 	"tailscale.com/util/mak"
 )
 
+const (
+	vipTestIP = "5.6.7.8"
+)
+
 // confgOpts contains configuration options for creating cluster resources for
 // Tailscale proxies.
 type configOpts struct {
@@ -561,6 +565,23 @@ func expectedSecret(t *testing.T, cl client.Client, opts configOpts) *corev1.Sec
 	return s
 }
 
+func findNoGenName(t *testing.T, client client.Client, ns, name, typ string) {
+	t.Helper()
+	labels := map[string]string{
+		kubetypes.LabelManaged: "true",
+		LabelParentName:        name,
+		LabelParentNamespace:   ns,
+		LabelParentType:        typ,
+	}
+	s, err := getSingleObject[corev1.Secret](context.Background(), client, "operator-ns", labels)
+	if err != nil {
+		t.Fatalf("finding secrets for %q: %v", name, err)
+	}
+	if s != nil {
+		t.Fatalf("found unexpected secret with name %q", s.GetName())
+	}
+}
+
 func findGenName(t *testing.T, client client.Client, ns, name, typ string) (full, noSuffix string) {
 	t.Helper()
 	labels := map[string]string{
@@ -880,13 +901,22 @@ func (c *fakeTSClient) GetVIPService(ctx context.Context, name tailcfg.ServiceNa
 	c.Lock()
 	defer c.Unlock()
 	if c.vipServices == nil {
-		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+		return nil, tailscale.ErrResponse{Status: http.StatusNotFound}
 	}
 	svc, ok := c.vipServices[name]
 	if !ok {
-		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+		return nil, tailscale.ErrResponse{Status: http.StatusNotFound}
 	}
 	return svc, nil
+}
+
+func (c *fakeTSClient) ListVIPServices(ctx context.Context) (map[tailcfg.ServiceName]*tailscale.VIPService, error) {
+	c.Lock()
+	defer c.Unlock()
+	if c.vipServices == nil {
+		return nil, &tailscale.ErrResponse{Status: http.StatusNotFound}
+	}
+	return c.vipServices, nil
 }
 
 func (c *fakeTSClient) CreateOrUpdateVIPService(ctx context.Context, svc *tailscale.VIPService) error {
@@ -895,6 +925,11 @@ func (c *fakeTSClient) CreateOrUpdateVIPService(ctx context.Context, svc *tailsc
 	if c.vipServices == nil {
 		c.vipServices = make(map[tailcfg.ServiceName]*tailscale.VIPService)
 	}
+
+	if svc.Addrs == nil {
+		svc.Addrs = []string{vipTestIP}
+	}
+
 	c.vipServices[svc.Name] = svc
 	return nil
 }

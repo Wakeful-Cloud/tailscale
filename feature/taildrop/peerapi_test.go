@@ -21,7 +21,6 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/tailcfg"
-	"tailscale.com/taildrop"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
@@ -50,23 +49,23 @@ func (h *peerAPIHandler) PeerCaps() tailcfg.PeerCapMap {
 	return nil
 }
 
-type fakeLocalBackend struct {
+type fakeExtension struct {
 	logf           logger.Logf
 	capFileSharing bool
 	clock          tstime.Clock
-	taildrop       *taildrop.Manager
+	taildrop       *manager
 }
 
-func (lb *fakeLocalBackend) Clock() tstime.Clock { return lb.clock }
-func (lb *fakeLocalBackend) HasCapFileSharing() bool {
-	return lb.capFileSharing
+func (lb *fakeExtension) manager() *manager {
+	return lb.taildrop
 }
-func (lb *fakeLocalBackend) TaildropManager() (*taildrop.Manager, error) {
-	return lb.taildrop, nil
+func (lb *fakeExtension) Clock() tstime.Clock { return lb.clock }
+func (lb *fakeExtension) hasCapFileSharing() bool {
+	return lb.capFileSharing
 }
 
 type peerAPITestEnv struct {
-	taildrop *taildrop.Manager
+	taildrop *manager
 	ph       *peerAPIHandler
 	rr       *httptest.ResponseRecorder
 	logBuf   tstest.MemLogger
@@ -472,16 +471,17 @@ func TestHandlePeerAPI(t *testing.T) {
 				selfNode.CapMap = tailcfg.NodeCapMap{tailcfg.CapabilityDebug: nil}
 			}
 			var rootDir string
-			var e peerAPITestEnv
 			if !tt.omitRoot {
 				rootDir = t.TempDir()
-				e.taildrop = taildrop.ManagerOptions{
-					Logf: e.logBuf.Logf,
-					Dir:  rootDir,
-				}.New()
 			}
 
-			lb := &fakeLocalBackend{
+			var e peerAPITestEnv
+			e.taildrop = managerOptions{
+				Logf: e.logBuf.Logf,
+				Dir:  rootDir,
+			}.New()
+
+			ext := &fakeExtension{
 				logf:           e.logBuf.Logf,
 				capFileSharing: tt.capSharing,
 				clock:          &tstest.Clock{},
@@ -499,7 +499,7 @@ func TestHandlePeerAPI(t *testing.T) {
 				if req.Host == "example.com" {
 					req.Host = "100.100.100.101:12345"
 				}
-				handlePeerPutWithBackend(e.ph, lb, e.rr, req)
+				handlePeerPutWithBackend(e.ph, ext, e.rr, req)
 			}
 			for _, f := range tt.checks {
 				f(t, &e)
@@ -525,7 +525,7 @@ func TestHandlePeerAPI(t *testing.T) {
 // a bit. So test that we work around that sufficiently.
 func TestFileDeleteRace(t *testing.T) {
 	dir := t.TempDir()
-	taildropMgr := taildrop.ManagerOptions{
+	taildropMgr := managerOptions{
 		Logf: t.Logf,
 		Dir:  dir,
 	}.New()
@@ -539,7 +539,7 @@ func TestFileDeleteRace(t *testing.T) {
 			Addresses: []netip.Prefix{netip.MustParsePrefix("100.100.100.101/32")},
 		}).View(),
 	}
-	fakeLB := &fakeLocalBackend{
+	fakeLB := &fakeExtension{
 		logf:           t.Logf,
 		capFileSharing: true,
 		clock:          &tstest.Clock{},

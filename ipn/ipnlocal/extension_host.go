@@ -22,6 +22,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/execqueue"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/testenv"
 )
 
@@ -87,6 +88,8 @@ type ExtensionHost struct {
 
 	shuttingDown atomic.Bool
 
+	extByType sync.Map // reflect.Type -> ipnext.Extension
+
 	// mu protects the following fields.
 	// It must not be held when calling [LocalBackend] methods
 	// or when invoking callbacks registered by extensions.
@@ -95,7 +98,8 @@ type ExtensionHost struct {
 	initialized atomic.Bool
 	// activeExtensions is a subset of allExtensions that have been initialized and are ready to use.
 	activeExtensions []ipnext.Extension
-	// extensionsByName are the activeExtensions indexed by their names.
+	// extensionsByName are the extensions indexed by their names.
+	// They are not necessarily initialized (in activeExtensions) yet.
 	extensionsByName map[string]ipnext.Extension
 	// postInitWorkQueue is a queue of functions to be executed
 	// by the workQueue after all extensions have been initialized.
@@ -117,6 +121,9 @@ type Backend interface {
 	SwitchToBestProfile(reason string)
 
 	SendNotify(ipn.Notify)
+
+	NodeBackend() ipnext.NodeBackend
+
 	ipnext.SafeBackend
 }
 
@@ -179,8 +186,33 @@ func newExtensionHost(logf logger.Logf, b Backend, overrideExts ...*ipnext.Defin
 			return nil, fmt.Errorf("failed to create %q extension: %v", d.Name(), err)
 		}
 		host.allExtensions = append(host.allExtensions, ext)
+
+		if d.Name() != ext.Name() {
+			return nil, fmt.Errorf("extension name %q does not match the registered name %q", ext.Name(), d.Name())
+		}
+
+		if _, ok := host.extensionsByName[ext.Name()]; ok {
+			return nil, fmt.Errorf("duplicate extension name %q", ext.Name())
+		} else {
+			mak.Set(&host.extensionsByName, ext.Name(), ext)
+		}
+
+		typ := reflect.TypeOf(ext)
+		if _, ok := host.extByType.Load(typ); ok {
+			if _, ok := ext.(interface{ PermitDoubleRegister() }); !ok {
+				return nil, fmt.Errorf("duplicate extension type %T", ext)
+			}
+		}
+		host.extByType.Store(typ, ext)
 	}
 	return host, nil
+}
+
+func (h *ExtensionHost) NodeBackend() ipnext.NodeBackend {
+	if h == nil {
+		return nil
+	}
+	return h.b.NodeBackend()
 }
 
 // Init initializes the host and the extensions it manages.
@@ -203,10 +235,6 @@ func (h *ExtensionHost) init() {
 	defer h.initDone.Store(true)
 
 	// Initialize the extensions in the order they were registered.
-	h.mu.Lock()
-	h.activeExtensions = make([]ipnext.Extension, 0, len(h.allExtensions))
-	h.extensionsByName = make(map[string]ipnext.Extension, len(h.allExtensions))
-	h.mu.Unlock()
 	for _, ext := range h.allExtensions {
 		// Do not hold the lock while calling [ipnext.Extension.Init].
 		// Extensions call back into the host to register their callbacks,
@@ -228,7 +256,6 @@ func (h *ExtensionHost) init() {
 		// We'd like to make them visible to other extensions that are initialized later.
 		h.mu.Lock()
 		h.activeExtensions = append(h.activeExtensions, ext)
-		h.extensionsByName[ext.Name()] = ext
 		h.mu.Unlock()
 	}
 
@@ -275,6 +302,29 @@ func (h *ExtensionHost) FindExtensionByName(name string) any {
 
 // extensionIfaceType is the runtime type of the [ipnext.Extension] interface.
 var extensionIfaceType = reflect.TypeFor[ipnext.Extension]()
+
+// GetExt returns the extension of type T registered with lb.
+// If lb is nil or the extension is not found, it returns zero, false.
+func GetExt[T ipnext.Extension](lb *LocalBackend) (_ T, ok bool) {
+	var zero T
+	if lb == nil {
+		return zero, false
+	}
+	if ext, ok := lb.extHost.extensionOfType(reflect.TypeFor[T]()); ok {
+		return ext.(T), true
+	}
+	return zero, false
+}
+
+func (h *ExtensionHost) extensionOfType(t reflect.Type) (_ ipnext.Extension, ok bool) {
+	if h == nil {
+		return nil, false
+	}
+	if v, ok := h.extByType.Load(t); ok {
+		return v.(ipnext.Extension), true
+	}
+	return nil, false
+}
 
 // FindMatchingExtension implements [ipnext.ExtensionServices]
 // and is also used by the [LocalBackend].

@@ -452,13 +452,7 @@ func (s *idpServer) newMux() *http.ServeMux {
 	mux.HandleFunc("/userinfo", s.serveUserInfo)
 	mux.HandleFunc("/token", s.serveToken)
 	mux.HandleFunc("/clients/", s.serveClients)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			io.WriteString(w, "<html><body><h1>Tailscale OIDC IdP</h1>")
-			return
-		}
-		http.Error(w, "tsidp: not found", http.StatusNotFound)
-	})
+	mux.HandleFunc("/", s.handleUI)
 	return mux
 }
 
@@ -795,7 +789,7 @@ type oidcTokenResponse struct {
 	IDToken      string `json:"id_token"`
 	TokenType    string `json:"token_type"`
 	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
 	ExpiresIn    int    `json:"expires_in"`
 }
 

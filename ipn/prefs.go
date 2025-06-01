@@ -235,6 +235,11 @@ type Prefs struct {
 
 	// PostureChecking enables the collection of information used for device
 	// posture checks.
+	//
+	// Note: this should be named ReportPosture, but it was shipped as
+	// PostureChecking in some early releases and this JSON field is written to
+	// disk, so we just keep its old name. (akin to CorpDNS which is an internal
+	// pref name that doesn't match the public interface)
 	PostureChecking bool
 
 	// NetfilterKind specifies what netfilter implementation to use.
@@ -716,9 +721,10 @@ func (p *Prefs) ControlURLOrDefault() string {
 // of the platform it's running on.
 func (p *Prefs) DefaultRouteAll(goos string) bool {
 	switch goos {
-	case "windows":
+	case "windows", "android", "ios":
 		return true
 	case "darwin":
+		// Only true for macAppStore and macsys, false for darwin tailscaled.
 		return version.IsSandboxedMacOS()
 	default:
 		return false
