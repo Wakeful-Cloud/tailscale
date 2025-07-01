@@ -5,9 +5,11 @@ package ipnlocal
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -22,6 +24,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	memro "go4.org/mem"
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc"
@@ -74,6 +77,18 @@ func inRemove(ip netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+func makeNodeKeyFromID(nodeID tailcfg.NodeID) key.NodePublic {
+	raw := make([]byte, 32)
+	binary.BigEndian.PutUint64(raw[24:], uint64(nodeID))
+	return key.NodePublicFromRaw32(memro.B(raw))
+}
+
+func makeDiscoKeyFromID(nodeID tailcfg.NodeID) (ret key.DiscoPublic) {
+	raw := make([]byte, 32)
+	binary.BigEndian.PutUint64(raw[24:], uint64(nodeID))
+	return key.DiscoPublicFromRaw32(memro.B(raw))
 }
 
 func TestShrinkDefaultRoute(t *testing.T) {
@@ -793,6 +808,7 @@ func TestStatusPeerCapabilities(t *testing.T) {
 				(&tailcfg.Node{
 					ID:              1,
 					StableID:        "foo",
+					Key:             makeNodeKeyFromID(1),
 					IsWireGuardOnly: true,
 					Hostinfo:        (&tailcfg.Hostinfo{}).View(),
 					Capabilities:    []tailcfg.NodeCapability{tailcfg.CapabilitySSH},
@@ -803,6 +819,7 @@ func TestStatusPeerCapabilities(t *testing.T) {
 				(&tailcfg.Node{
 					ID:           2,
 					StableID:     "bar",
+					Key:          makeNodeKeyFromID(2),
 					Hostinfo:     (&tailcfg.Hostinfo{}).View(),
 					Capabilities: []tailcfg.NodeCapability{tailcfg.CapabilityAdmin},
 					CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
@@ -829,12 +846,14 @@ func TestStatusPeerCapabilities(t *testing.T) {
 				(&tailcfg.Node{
 					ID:              1,
 					StableID:        "foo",
+					Key:             makeNodeKeyFromID(1),
 					IsWireGuardOnly: true,
 					Hostinfo:        (&tailcfg.Hostinfo{}).View(),
 				}).View(),
 				(&tailcfg.Node{
 					ID:       2,
 					StableID: "bar",
+					Key:      makeNodeKeyFromID(2),
 					Hostinfo: (&tailcfg.Hostinfo{}).View(),
 				}).View(),
 			},
@@ -926,7 +945,11 @@ func TestUpdateNetmapDelta(t *testing.T) {
 
 	nm := &netmap.NetworkMap{}
 	for i := range 5 {
-		nm.Peers = append(nm.Peers, (&tailcfg.Node{ID: (tailcfg.NodeID(i) + 1)}).View())
+		id := tailcfg.NodeID(i + 1)
+		nm.Peers = append(nm.Peers, (&tailcfg.Node{
+			ID:  id,
+			Key: makeNodeKeyFromID(id),
+		}).View())
 	}
 	b.currentNode().SetNetMap(nm)
 
@@ -962,23 +985,27 @@ func TestUpdateNetmapDelta(t *testing.T) {
 	wants := []*tailcfg.Node{
 		{
 			ID:       1,
+			Key:      makeNodeKeyFromID(1),
 			HomeDERP: 1,
 		},
 		{
 			ID:     2,
+			Key:    makeNodeKeyFromID(2),
 			Online: ptr.To(true),
 		},
 		{
 			ID:     3,
+			Key:    makeNodeKeyFromID(3),
 			Online: ptr.To(false),
 		},
 		{
 			ID:       4,
+			Key:      makeNodeKeyFromID(4),
 			LastSeen: ptr.To(someTime),
 		},
 	}
 	for _, want := range wants {
-		gotv, ok := b.currentNode().PeerByID(want.ID)
+		gotv, ok := b.currentNode().NodeByID(want.ID)
 		if !ok {
 			t.Errorf("netmap.Peer %v missing from b.profile.Peers", want.ID)
 			continue
@@ -997,12 +1024,14 @@ func TestWhoIs(t *testing.T) {
 		SelfNode: (&tailcfg.Node{
 			ID:        1,
 			User:      10,
+			Key:       makeNodeKeyFromID(1),
 			Addresses: []netip.Prefix{netip.MustParsePrefix("100.101.102.103/32")},
 		}).View(),
 		Peers: []tailcfg.NodeView{
 			(&tailcfg.Node{
 				ID:        2,
 				User:      20,
+				Key:       makeNodeKeyFromID(2),
 				Addresses: []netip.Prefix{netip.MustParsePrefix("100.200.200.200/32")},
 			}).View(),
 		},
@@ -1592,6 +1621,7 @@ func dnsResponse(domain, address string) []byte {
 }
 
 func TestSetExitNodeIDPolicy(t *testing.T) {
+	zeroValHostinfoView := new(tailcfg.Hostinfo).View()
 	pfx := netip.MustParsePrefix
 	tests := []struct {
 		name                  string
@@ -1668,14 +1698,18 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				}).View(),
 				Peers: []tailcfg.NodeView{
 					(&tailcfg.Node{
+						ID:   201,
 						Name: "a.tailnet",
+						Key:  makeNodeKeyFromID(201),
 						Addresses: []netip.Prefix{
 							pfx("100.0.0.201/32"),
 							pfx("100::201/128"),
 						},
 					}).View(),
 					(&tailcfg.Node{
+						ID:   202,
 						Name: "b.tailnet",
+						Key:  makeNodeKeyFromID(202),
 						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
@@ -1701,18 +1735,24 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				}).View(),
 				Peers: []tailcfg.NodeView{
 					(&tailcfg.Node{
+						ID:       123,
 						Name:     "a.tailnet",
 						StableID: tailcfg.StableNodeID("123"),
+						Key:      makeNodeKeyFromID(123),
 						Addresses: []netip.Prefix{
 							pfx("127.0.0.1/32"),
 							pfx("100::201/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 					(&tailcfg.Node{
+						ID:   202,
 						Name: "b.tailnet",
+						Key:  makeNodeKeyFromID(202),
 						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 				},
 			},
@@ -1733,18 +1773,24 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				}).View(),
 				Peers: []tailcfg.NodeView{
 					(&tailcfg.Node{
+						ID:       123,
 						Name:     "a.tailnet",
 						StableID: tailcfg.StableNodeID("123"),
+						Key:      makeNodeKeyFromID(123),
 						Addresses: []netip.Prefix{
 							pfx("127.0.0.1/32"),
 							pfx("100::201/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 					(&tailcfg.Node{
+						ID:   202,
 						Name: "b.tailnet",
+						Key:  makeNodeKeyFromID(202),
 						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 				},
 			},
@@ -1767,18 +1813,24 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 				}).View(),
 				Peers: []tailcfg.NodeView{
 					(&tailcfg.Node{
+						ID:       123,
 						Name:     "a.tailnet",
 						StableID: tailcfg.StableNodeID("123"),
+						Key:      makeNodeKeyFromID(123),
 						Addresses: []netip.Prefix{
 							pfx("100.64.5.6/32"),
 							pfx("100::201/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 					(&tailcfg.Node{
+						ID:   202,
 						Name: "b.tailnet",
+						Key:  makeNodeKeyFromID(202),
 						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
+						Hostinfo: zeroValHostinfoView,
 					}).View(),
 				},
 			},
@@ -1826,7 +1878,6 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 			b.currentNode().SetNetMap(test.nm)
 			b.pm = pm
 			b.lastSuggestedExitNode = test.lastSuggestedExitNode
-
 			prefs := b.pm.prefs.AsStruct()
 			if changed := applySysPolicy(prefs, test.lastSuggestedExitNode, false) || setExitNodeID(prefs, test.nm); changed != test.prefsChanged {
 				t.Errorf("wanted prefs changed %v, got prefs changed %v", test.prefsChanged, changed)
@@ -3217,6 +3268,7 @@ type peerOptFunc func(*tailcfg.Node)
 func makePeer(id tailcfg.NodeID, opts ...peerOptFunc) tailcfg.NodeView {
 	node := &tailcfg.Node{
 		ID:       id,
+		Key:      makeNodeKeyFromID(id),
 		StableID: tailcfg.StableNodeID(fmt.Sprintf("stable%d", id)),
 		Name:     fmt.Sprintf("peer%d", id),
 		HomeDERP: int(id),
@@ -5134,10 +5186,17 @@ func TestUpdatePrefsOnSysPolicyChange(t *testing.T) {
 	}
 }
 
-func TestUpdateIngressLocked(t *testing.T) {
+func TestUpdateIngressAndServiceHashLocked(t *testing.T) {
+	prefs := ipn.NewPrefs().View()
+	previousSC := &ipn.ServeConfig{
+		Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			"svc:abc": {Tun: true},
+		},
+	}
 	tests := []struct {
 		name              string
 		hi                *tailcfg.Hostinfo
+		hasPreviousSC     bool // whether to overwrite the ServeConfig hash in the Hostinfo using previousSC
 		sc                *ipn.ServeConfig
 		wantIngress       bool
 		wantWireIngress   bool
@@ -5164,6 +5223,16 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantControlUpdate: true,
 		},
 		{
+			name: "empty_hostinfo_service_configured",
+			hi:   &tailcfg.Hostinfo{},
+			sc: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
+			wantControlUpdate: true,
+		},
+		{
 			name: "empty_hostinfo_funnel_disabled",
 			hi:   &tailcfg.Hostinfo{},
 			sc: &ipn.ServeConfig{
@@ -5175,7 +5244,7 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantControlUpdate: true,
 		},
 		{
-			name: "empty_hostinfo_no_funnel",
+			name: "empty_hostinfo_no_funnel_no_service",
 			hi:   &tailcfg.Hostinfo{},
 			sc: &ipn.ServeConfig{
 				TCP: map[uint16]*ipn.TCPPortHandler{
@@ -5197,6 +5266,16 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantWireIngress: false, // implied by wantIngress
 		},
 		{
+			name:          "service_hash_no_change",
+			hi:            &tailcfg.Hostinfo{},
+			hasPreviousSC: true,
+			sc: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
+		},
+		{
 			name: "funnel_disabled_no_change",
 			hi: &tailcfg.Hostinfo{
 				WireIngress: true,
@@ -5207,6 +5286,13 @@ func TestUpdateIngressLocked(t *testing.T) {
 				},
 			},
 			wantWireIngress: true, // true if there is any AllowFunnel block
+		},
+		{
+			name:              "service_got_removed",
+			hi:                &tailcfg.Hostinfo{},
+			hasPreviousSC:     true,
+			sc:                &ipn.ServeConfig{},
+			wantControlUpdate: true,
 		},
 		{
 			name: "funnel_changes_to_disabled",
@@ -5235,12 +5321,35 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantWireIngress:   false, // implied by wantIngress
 			wantControlUpdate: true,
 		},
+		{
+			name: "both_funnel_and_service_changes",
+			hi: &tailcfg.Hostinfo{
+				IngressEnabled: true,
+			},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": false,
+				},
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
+			wantWireIngress:   true, // true if there is any AllowFunnel block
+			wantControlUpdate: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			b := newTestLocalBackend(t)
 			b.hostinfo = tt.hi
+			if tt.hasPreviousSC {
+				b.mu.Lock()
+				b.serveConfig = previousSC.View()
+				b.hostinfo.ServicesHash = b.vipServiceHash(b.vipServicesFromPrefsLocked(prefs))
+				b.mu.Unlock()
+			}
 			b.serveConfig = tt.sc.View()
 			allDone := make(chan bool, 1)
 			defer b.goTracker.AddDoneCallback(func() {
@@ -5256,7 +5365,7 @@ func TestUpdateIngressLocked(t *testing.T) {
 			})()
 
 			was := b.goTracker.StartedGoroutines()
-			b.updateIngressLocked()
+			b.updateIngressAndServiceHashLocked(prefs)
 
 			if tt.hi != nil {
 				if tt.hi.IngressEnabled != tt.wantIngress {
@@ -5264,6 +5373,12 @@ func TestUpdateIngressLocked(t *testing.T) {
 				}
 				if tt.hi.WireIngress != tt.wantWireIngress {
 					t.Errorf("WireIngress = %v, want %v", tt.hi.WireIngress, tt.wantWireIngress)
+				}
+				b.mu.Lock()
+				svcHash := b.vipServiceHash(b.vipServicesFromPrefsLocked(prefs))
+				b.mu.Unlock()
+				if tt.hi.ServicesHash != svcHash {
+					t.Errorf("ServicesHash = %v, want %v", tt.hi.ServicesHash, svcHash)
 				}
 			}
 
@@ -5348,6 +5463,8 @@ func TestDisplayMessages(t *testing.T) {
 	ht.SetIPNState("NeedsLogin", true)
 	ht.GotStreamedMapResponse()
 
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.setNetMapLocked(&netmap.NetworkMap{
 		DisplayMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
 			"test-message": {
@@ -5357,10 +5474,11 @@ func TestDisplayMessages(t *testing.T) {
 	})
 
 	state := ht.CurrentState()
-	_, ok := state.Warnings["test-message"]
+	wantID := health.WarnableCode("control-health.test-message")
+	_, ok := state.Warnings[wantID]
 
 	if !ok {
-		t.Error("no warning found with id 'test-message'")
+		t.Errorf("no warning found with id %q", wantID)
 	}
 }
 
@@ -5374,6 +5492,8 @@ func TestDisplayMessagesURLFilter(t *testing.T) {
 	ht.SetIPNState("NeedsLogin", true)
 	ht.GotStreamedMapResponse()
 
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.setNetMapLocked(&netmap.NetworkMap{
 		DisplayMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
 			"test-message": {
@@ -5388,19 +5508,126 @@ func TestDisplayMessagesURLFilter(t *testing.T) {
 	})
 
 	state := ht.CurrentState()
-	got, ok := state.Warnings["test-message"]
+	wantID := health.WarnableCode("control-health.test-message")
+	got, ok := state.Warnings[wantID]
 
 	if !ok {
-		t.Fatal("no warning found with id 'test-message'")
+		t.Fatalf("no warning found with id %q", wantID)
 	}
 
 	want := health.UnhealthyState{
-		WarnableCode: "test-message",
+		WarnableCode: wantID,
 		Title:        "Testing",
 		Severity:     health.SeverityHigh,
 	}
 
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("Unexpected message content (-want/+got):\n%s", diff)
+	}
+}
+
+// TestDisplayMessageIPNBus checks that we send health messages appropriately
+// based on whether the watcher has sent the [ipn.NotifyHealthActions] watch
+// option or not.
+func TestDisplayMessageIPNBus(t *testing.T) {
+	type test struct {
+		name        string
+		mask        ipn.NotifyWatchOpt
+		wantWarning health.UnhealthyState
+	}
+
+	msgs := map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+		"test-message": {
+			Title:    "Message title",
+			Text:     "Message text.",
+			Severity: tailcfg.SeverityMedium,
+			PrimaryAction: &tailcfg.DisplayMessageAction{
+				URL:   "https://example.com",
+				Label: "Learn more",
+			},
+		},
+	}
+
+	wantID := health.WarnableCode("control-health.test-message")
+
+	for _, tt := range []test{
+		{
+			name: "older-client-no-actions",
+			mask: 0,
+			wantWarning: health.UnhealthyState{
+				WarnableCode:  wantID,
+				Severity:      health.SeverityMedium,
+				Title:         "Message title",
+				Text:          "Message text. Learn more: https://example.com", // PrimaryAction appended to text
+				PrimaryAction: nil,                                             // PrimaryAction not included
+			},
+		},
+		{
+			name: "new-client-with-actions",
+			mask: ipn.NotifyHealthActions,
+			wantWarning: health.UnhealthyState{
+				WarnableCode: wantID,
+				Severity:     health.SeverityMedium,
+				Title:        "Message title",
+				Text:         "Message text.",
+				PrimaryAction: &health.UnhealthyStateAction{
+					URL:   "https://example.com",
+					Label: "Learn more",
+				},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+				return newClient(tb, opts)
+			})
+
+			ipnWatcher := newNotificationWatcher(t, lb, nil)
+			ipnWatcher.watch(tt.mask, []wantedNotification{{
+				name: fmt.Sprintf("warning with ID %q", wantID),
+				cond: func(_ testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+					if n.Health == nil {
+						return false
+					}
+					got, ok := n.Health.Warnings[wantID]
+					if ok {
+						if diff := cmp.Diff(tt.wantWarning, got); diff != "" {
+							t.Errorf("unexpected warning details (-want/+got):\n%s", diff)
+							return true // we failed the test so tell the watcher we've seen what we need to to stop it waiting
+						}
+					} else {
+						got := slices.Collect(maps.Keys(n.Health.Warnings))
+						t.Logf("saw warnings: %v", got)
+					}
+					return ok
+				},
+			}})
+
+			lb.SetPrefsForTest(&ipn.Prefs{
+				ControlURL:  "https://localhost:1/",
+				WantRunning: true,
+				LoggedOut:   false,
+			})
+			if err := lb.Start(ipn.Options{}); err != nil {
+				t.Fatalf("(*LocalBackend).Start(): %v", err)
+			}
+
+			cc := lb.cc.(*mockControl)
+
+			// Assert that we are logged in and authorized, and also send our DisplayMessages
+			cc.send(nil, "", true, &netmap.NetworkMap{
+				SelfNode:        (&tailcfg.Node{MachineAuthorized: true}).View(),
+				DisplayMessages: msgs,
+			})
+
+			// Tell the health tracker that we are in a map poll because
+			// mockControl doesn't tell it
+			lb.HealthTracker().GotStreamedMapResponse()
+
+			// Assert that we got the expected notification
+			ipnWatcher.check()
+		})
 	}
 }

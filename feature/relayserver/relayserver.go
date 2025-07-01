@@ -8,10 +8,11 @@ package relayserver
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
-	"net/netip"
 	"sync"
+	"time"
 
 	"tailscale.com/envknob"
 	"tailscale.com/feature"
@@ -136,7 +137,7 @@ func (e *extension) relayServerOrInit() (relayServer, error) {
 		return nil, errors.New("TAILSCALE_USE_WIP_CODE envvar is not set")
 	}
 	var err error
-	e.server, _, err = udprelay.NewServer(*e.port, []netip.Addr{netip.MustParseAddr("127.0.0.1")})
+	e.server, _, err = udprelay.NewServer(e.logf, *e.port, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -185,6 +186,12 @@ func handlePeerAPIRelayAllocateEndpoint(h ipnlocal.PeerAPIHandler, w http.Respon
 	}
 	ep, err := rs.AllocateEndpoint(allocateEndpointReq.DiscoKeys[0], allocateEndpointReq.DiscoKeys[1])
 	if err != nil {
+		var notReady udprelay.ErrServerNotReady
+		if errors.As(err, &notReady) {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", notReady.RetryAfter.Round(time.Second)/time.Second))
+			httpErrAndLog(err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		httpErrAndLog(err.Error(), http.StatusInternalServerError)
 		return
 	}

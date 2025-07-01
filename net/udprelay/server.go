@@ -8,6 +8,7 @@ package udprelay
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -19,11 +20,18 @@ import (
 	"time"
 
 	"go4.org/mem"
+	"tailscale.com/client/local"
 	"tailscale.com/disco"
+	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/stun"
 	"tailscale.com/net/udprelay/endpoint"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
+	"tailscale.com/util/eventbus"
+	"tailscale.com/util/set"
 )
 
 const (
@@ -42,29 +50,27 @@ const (
 
 // Server implements an experimental UDP relay server.
 type Server struct {
-	// disco keypair used as part of 3-way bind handshake
-	disco       key.DiscoPrivate
-	discoPublic key.DiscoPublic
-
+	// The following fields are initialized once and never mutated.
+	logf                logger.Logf
+	disco               key.DiscoPrivate
+	discoPublic         key.DiscoPublic
 	bindLifetime        time.Duration
 	steadyStateLifetime time.Duration
+	bus                 *eventbus.Bus
+	uc                  *net.UDPConn
+	closeOnce           sync.Once
+	wg                  sync.WaitGroup
+	closeCh             chan struct{}
+	netChecker          *netcheck.Client
 
-	// addrPorts contains the ip:port pairs returned as candidate server
-	// endpoints in response to an allocation request.
-	addrPorts []netip.AddrPort
-
-	uc *net.UDPConn
-
-	closeOnce sync.Once
-	wg        sync.WaitGroup
-	closeCh   chan struct{}
-	closed    bool
-
-	mu        sync.Mutex // guards the following fields
-	lamportID uint64
-	vniPool   []uint32 // the pool of available VNIs
-	byVNI     map[uint32]*serverEndpoint
-	byDisco   map[pairOfDiscoPubKeys]*serverEndpoint
+	mu                sync.Mutex       // guards the following fields
+	addrDiscoveryOnce bool             // addrDiscovery completed once (successfully or unsuccessfully)
+	addrPorts         []netip.AddrPort // the ip:port pairs returned as candidate endpoints
+	closed            bool
+	lamportID         uint64
+	vniPool           []uint32 // the pool of available VNIs
+	byVNI             map[uint32]*serverEndpoint
+	byDisco           map[pairOfDiscoPubKeys]*serverEndpoint
 }
 
 // pairOfDiscoPubKeys is a pair of key.DiscoPublic. It must be constructed via
@@ -90,12 +96,13 @@ type serverEndpoint struct {
 	// indexing of this array aligns with the following fields, e.g.
 	// discoSharedSecrets[0] is the shared secret to use when sealing
 	// Disco protocol messages for transmission towards discoPubKeys[0].
-	discoPubKeys       pairOfDiscoPubKeys
-	discoSharedSecrets [2]key.DiscoShared
-	handshakeState     [2]disco.BindUDPRelayHandshakeState
-	addrPorts          [2]netip.AddrPort
-	lastSeen           [2]time.Time // TODO(jwhited): consider using mono.Time
-	challenge          [2][disco.BindUDPRelayEndpointChallengeLen]byte
+	discoPubKeys        pairOfDiscoPubKeys
+	discoSharedSecrets  [2]key.DiscoShared
+	handshakeGeneration [2]uint32         // or zero if a handshake has never started for that relay leg
+	handshakeAddrPorts  [2]netip.AddrPort // or zero value if a handshake has never started for that relay leg
+	boundAddrPorts      [2]netip.AddrPort // or zero value if a handshake has never completed for that relay leg
+	lastSeen            [2]time.Time      // TODO(jwhited): consider using mono.Time
+	challenge           [2][disco.BindUDPRelayChallengeLen]byte
 
 	lamportID   uint64
 	vni         uint32
@@ -106,69 +113,77 @@ func (e *serverEndpoint) handleDiscoControlMsg(from netip.AddrPort, senderIndex 
 	if senderIndex != 0 && senderIndex != 1 {
 		return
 	}
-	handshakeState := e.handshakeState[senderIndex]
-	if handshakeState == disco.BindUDPRelayHandshakeStateAnswerReceived {
-		// this sender is already bound
-		return
+
+	otherSender := 0
+	if senderIndex == 0 {
+		otherSender = 1
 	}
+
+	validateVNIAndRemoteKey := func(common disco.BindUDPRelayEndpointCommon) error {
+		if common.VNI != e.vni {
+			return errors.New("mismatching VNI")
+		}
+		if common.RemoteKey.Compare(e.discoPubKeys[otherSender]) != 0 {
+			return errors.New("mismatching RemoteKey")
+		}
+		return nil
+	}
+
 	switch discoMsg := discoMsg.(type) {
 	case *disco.BindUDPRelayEndpoint:
-		switch handshakeState {
-		case disco.BindUDPRelayHandshakeStateInit:
-			// set sender addr
-			e.addrPorts[senderIndex] = from
-			fallthrough
-		case disco.BindUDPRelayHandshakeStateChallengeSent:
-			if from != e.addrPorts[senderIndex] {
-				// this is a later arriving bind from a different source, or
-				// a retransmit and the sender's source has changed, discard
-				return
-			}
-			m := new(disco.BindUDPRelayEndpointChallenge)
-			copy(m.Challenge[:], e.challenge[senderIndex][:])
-			reply := make([]byte, packet.GeneveFixedHeaderLength, 512)
-			gh := packet.GeneveHeader{Control: true, VNI: e.vni, Protocol: packet.GeneveProtocolDisco}
-			err := gh.Encode(reply)
-			if err != nil {
-				return
-			}
-			reply = append(reply, disco.Magic...)
-			reply = serverDisco.AppendTo(reply)
-			box := e.discoSharedSecrets[senderIndex].Seal(m.AppendMarshal(nil))
-			reply = append(reply, box...)
-			uw.WriteMsgUDPAddrPort(reply, nil, from)
-			// set new state
-			e.handshakeState[senderIndex] = disco.BindUDPRelayHandshakeStateChallengeSent
-			return
-		default:
-			// disco.BindUDPRelayEndpoint is unexpected in all other handshake states
+		err := validateVNIAndRemoteKey(discoMsg.BindUDPRelayEndpointCommon)
+		if err != nil {
+			// silently drop
 			return
 		}
+		if discoMsg.Generation == 0 {
+			// Generation must be nonzero, silently drop
+			return
+		}
+		if e.handshakeGeneration[senderIndex] == discoMsg.Generation {
+			// we've seen this generation before, silently drop
+			return
+		}
+		e.handshakeGeneration[senderIndex] = discoMsg.Generation
+		e.handshakeAddrPorts[senderIndex] = from
+		m := new(disco.BindUDPRelayEndpointChallenge)
+		m.VNI = e.vni
+		m.Generation = discoMsg.Generation
+		m.RemoteKey = e.discoPubKeys[otherSender]
+		rand.Read(e.challenge[senderIndex][:])
+		copy(m.Challenge[:], e.challenge[senderIndex][:])
+		reply := make([]byte, packet.GeneveFixedHeaderLength, 512)
+		gh := packet.GeneveHeader{Control: true, VNI: e.vni, Protocol: packet.GeneveProtocolDisco}
+		err = gh.Encode(reply)
+		if err != nil {
+			return
+		}
+		reply = append(reply, disco.Magic...)
+		reply = serverDisco.AppendTo(reply)
+		box := e.discoSharedSecrets[senderIndex].Seal(m.AppendMarshal(nil))
+		reply = append(reply, box...)
+		uw.WriteMsgUDPAddrPort(reply, nil, from)
+		return
 	case *disco.BindUDPRelayEndpointAnswer:
-		switch handshakeState {
-		case disco.BindUDPRelayHandshakeStateChallengeSent:
-			if from != e.addrPorts[senderIndex] {
-				// sender source has changed
-				return
-			}
-			if !bytes.Equal(discoMsg.Answer[:], e.challenge[senderIndex][:]) {
-				// bad answer
-				return
-			}
-			// sender is now bound
-			// TODO: Consider installing a fast path via netfilter or similar to
-			// relay (NAT) data packets for this serverEndpoint.
-			e.handshakeState[senderIndex] = disco.BindUDPRelayHandshakeStateAnswerReceived
-			// record last seen as bound time
-			e.lastSeen[senderIndex] = time.Now()
-			return
-		default:
-			// disco.BindUDPRelayEndpointAnswer is unexpected in all other handshake
-			// states, or we've already handled it
+		err := validateVNIAndRemoteKey(discoMsg.BindUDPRelayEndpointCommon)
+		if err != nil {
+			// silently drop
 			return
 		}
+		generation := e.handshakeGeneration[senderIndex]
+		if generation == 0 || // we have no active handshake
+			generation != discoMsg.Generation || // mismatching generation for the active handshake
+			e.handshakeAddrPorts[senderIndex] != from || // mismatching source for the active handshake
+			!bytes.Equal(e.challenge[senderIndex][:], discoMsg.Challenge[:]) { // mismatching answer for the active handshake
+			// silently drop
+			return
+		}
+		// Handshake complete. Update the binding for this sender.
+		e.boundAddrPorts[senderIndex] = from
+		e.lastSeen[senderIndex] = time.Now() // record last seen as bound time
+		return
 	default:
-		// unexpected Disco message type
+		// unexpected message types, silently drop
 		return
 	}
 }
@@ -219,23 +234,18 @@ func (e *serverEndpoint) handlePacket(from netip.AddrPort, gh packet.GeneveHeade
 		}
 		var to netip.AddrPort
 		switch {
-		case from == e.addrPorts[0]:
+		case from == e.boundAddrPorts[0]:
 			e.lastSeen[0] = time.Now()
-			to = e.addrPorts[1]
-		case from == e.addrPorts[1]:
+			to = e.boundAddrPorts[1]
+		case from == e.boundAddrPorts[1]:
 			e.lastSeen[1] = time.Now()
-			to = e.addrPorts[0]
+			to = e.boundAddrPorts[0]
 		default:
 			// unrecognized source
 			return
 		}
 		// relay packet
 		uw.WriteMsgUDPAddrPort(b, nil, to)
-		return
-	}
-
-	if e.isBound() {
-		// control packet, but serverEndpoint is already bound
 		return
 	}
 
@@ -261,23 +271,22 @@ func (e *serverEndpoint) isExpired(now time.Time, bindLifetime, steadyStateLifet
 	return false
 }
 
-// isBound returns true if both clients have completed their 3-way handshake,
+// isBound returns true if both clients have completed a 3-way handshake,
 // otherwise false.
 func (e *serverEndpoint) isBound() bool {
-	return e.handshakeState[0] == disco.BindUDPRelayHandshakeStateAnswerReceived &&
-		e.handshakeState[1] == disco.BindUDPRelayHandshakeStateAnswerReceived
+	return e.boundAddrPorts[0].IsValid() &&
+		e.boundAddrPorts[1].IsValid()
 }
 
 // NewServer constructs a [Server] listening on 0.0.0.0:'port'. IPv6 is not yet
 // supported. Port may be 0, and what ultimately gets bound is returned as
-// 'boundPort'. Supplied 'addrs' are joined with 'boundPort' and returned as
-// [endpoint.ServerEndpoint.AddrPorts] in response to Server.AllocateEndpoint()
-// requests.
+// 'boundPort'. If len(overrideAddrs) > 0 these will be used in place of dynamic
+// discovery, which is useful to override in tests.
 //
 // TODO: IPv6 support
-// TODO: dynamic addrs:port discovery
-func NewServer(port int, addrs []netip.Addr) (s *Server, boundPort int, err error) {
+func NewServer(logf logger.Logf, port int, overrideAddrs []netip.Addr) (s *Server, boundPort uint16, err error) {
 	s = &Server{
+		logf:                logger.WithPrefix(logf, "relayserver"),
 		disco:               key.NewDisco(),
 		bindLifetime:        defaultBindLifetime,
 		steadyStateLifetime: defaultSteadyStateLifetime,
@@ -292,26 +301,119 @@ func NewServer(port int, addrs []netip.Addr) (s *Server, boundPort int, err erro
 	for i := 1; i < 1<<24; i++ {
 		s.vniPool = append(s.vniPool, uint32(i))
 	}
+
+	bus := eventbus.New()
+	s.bus = bus
+	netMon, err := netmon.New(s.bus, logf)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.netChecker = &netcheck.Client{
+		NetMon: netMon,
+		Logf:   logger.WithPrefix(logf, "relayserver: netcheck:"),
+		SendPacket: func(b []byte, addrPort netip.AddrPort) (int, error) {
+			return s.uc.WriteToUDPAddrPort(b, addrPort)
+		},
+	}
+
 	boundPort, err = s.listenOn(port)
 	if err != nil {
 		return nil, 0, err
 	}
-	addrPorts := make([]netip.AddrPort, 0, len(addrs))
-	for _, addr := range addrs {
-		addrPort, err := netip.ParseAddrPort(net.JoinHostPort(addr.String(), strconv.Itoa(boundPort)))
-		if err != nil {
-			return nil, 0, err
-		}
-		addrPorts = append(addrPorts, addrPort)
-	}
-	s.addrPorts = addrPorts
-	s.wg.Add(2)
+
+	s.wg.Add(1)
 	go s.packetReadLoop()
+	s.wg.Add(1)
 	go s.endpointGCLoop()
+	if len(overrideAddrs) > 0 {
+		addrPorts := make(set.Set[netip.AddrPort], len(overrideAddrs))
+		for _, addr := range overrideAddrs {
+			if addr.IsValid() {
+				addrPorts.Add(netip.AddrPortFrom(addr, boundPort))
+			}
+		}
+		s.addrPorts = addrPorts.Slice()
+	} else {
+		s.wg.Add(1)
+		go s.addrDiscoveryLoop()
+	}
 	return s, boundPort, nil
 }
 
-func (s *Server) listenOn(port int) (int, error) {
+func (s *Server) addrDiscoveryLoop() {
+	defer s.wg.Done()
+
+	timer := time.NewTimer(0) // fire immediately
+	defer timer.Stop()
+
+	getAddrPorts := func() ([]netip.AddrPort, error) {
+		var addrPorts set.Set[netip.AddrPort]
+		addrPorts.Make()
+
+		// get local addresses
+		localPort := s.uc.LocalAddr().(*net.UDPAddr).Port
+		ips, _, err := netmon.LocalAddresses()
+		if err != nil {
+			return nil, err
+		}
+		for _, ip := range ips {
+			if ip.IsValid() {
+				addrPorts.Add(netip.AddrPortFrom(ip, uint16(localPort)))
+			}
+		}
+
+		// fetch DERPMap to feed to netcheck
+		derpMapCtx, derpMapCancel := context.WithTimeout(context.Background(), time.Second)
+		defer derpMapCancel()
+		localClient := &local.Client{}
+		// TODO(jwhited): We are in-process so use eventbus or similar.
+		//  local.Client gets us going.
+		dm, err := localClient.CurrentDERPMap(derpMapCtx)
+		if err != nil {
+			return nil, err
+		}
+
+		// get addrPorts as visible from DERP
+		netCheckerCtx, netCheckerCancel := context.WithTimeout(context.Background(), netcheck.ReportTimeout)
+		defer netCheckerCancel()
+		rep, err := s.netChecker.GetReport(netCheckerCtx, dm, &netcheck.GetReportOpts{
+			OnlySTUN: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if rep.GlobalV4.IsValid() {
+			addrPorts.Add(rep.GlobalV4)
+		}
+		if rep.GlobalV6.IsValid() {
+			addrPorts.Add(rep.GlobalV6)
+		}
+		// TODO(jwhited): consider logging if rep.MappingVariesByDestIP as
+		//  that's a hint we are not well-positioned to operate as a UDP relay.
+		return addrPorts.Slice(), nil
+	}
+
+	for {
+		select {
+		case <-timer.C:
+			// Mirror magicsock behavior for duration between STUN. We consider
+			// 30s a min bound for NAT timeout.
+			timer.Reset(tstime.RandomDurationBetween(20*time.Second, 26*time.Second))
+			addrPorts, err := getAddrPorts()
+			if err != nil {
+				s.logf("error discovering IP:port candidates: %v", err)
+			}
+			s.mu.Lock()
+			s.addrPorts = addrPorts
+			s.addrDiscoveryOnce = true
+			s.mu.Unlock()
+		case <-s.closeCh:
+			return
+		}
+	}
+}
+
+func (s *Server) listenOn(port int) (uint16, error) {
 	uc, err := net.ListenUDP("udp4", &net.UDPAddr{Port: port})
 	if err != nil {
 		return 0, err
@@ -322,13 +424,13 @@ func (s *Server) listenOn(port int) (int, error) {
 		s.uc.Close()
 		return 0, err
 	}
-	boundPort, err := strconv.Atoi(boundPortStr)
+	boundPort, err := strconv.ParseUint(boundPortStr, 10, 16)
 	if err != nil {
 		s.uc.Close()
 		return 0, err
 	}
 	s.uc = uc
-	return boundPort, nil
+	return uint16(boundPort), nil
 }
 
 // Close closes the server.
@@ -343,6 +445,7 @@ func (s *Server) Close() error {
 		clear(s.byDisco)
 		s.vniPool = nil
 		s.closed = true
+		s.bus.Close()
 	})
 	return nil
 }
@@ -378,6 +481,13 @@ func (s *Server) endpointGCLoop() {
 }
 
 func (s *Server) handlePacket(from netip.AddrPort, b []byte, uw udpWriter) {
+	if stun.Is(b) && b[1] == 0x01 {
+		// A b[1] value of 0x01 (STUN method binding) is sufficiently
+		// non-overlapping with the Geneve header where the LSB is always 0
+		// (part of 6 "reserved" bits).
+		s.netChecker.ReceiveSTUNPacket(b, from)
+		return
+	}
 	gh := packet.GeneveHeader{}
 	err := gh.Decode(b)
 	if err != nil {
@@ -415,15 +525,34 @@ func (s *Server) packetReadLoop() {
 
 var ErrServerClosed = errors.New("server closed")
 
+// ErrServerNotReady indicates the server is not ready. Allocation should be
+// requested after waiting for at least RetryAfter duration.
+type ErrServerNotReady struct {
+	RetryAfter time.Duration
+}
+
+func (e ErrServerNotReady) Error() string {
+	return fmt.Sprintf("server not ready, retry after %v", e.RetryAfter)
+}
+
 // AllocateEndpoint allocates an [endpoint.ServerEndpoint] for the provided pair
 // of [key.DiscoPublic]'s. If an allocation already exists for discoA and discoB
 // it is returned without modification/reallocation. AllocateEndpoint returns
-// [ErrServerClosed] if the server has been closed.
+// the following notable errors:
+//  1. [ErrServerClosed] if the server has been closed.
+//  2. [ErrServerNotReady] if the server is not ready.
 func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.ServerEndpoint, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return endpoint.ServerEndpoint{}, ErrServerClosed
+	}
+
+	if len(s.addrPorts) == 0 {
+		if !s.addrDiscoveryOnce {
+			return endpoint.ServerEndpoint{}, ErrServerNotReady{RetryAfter: 3 * time.Second}
+		}
+		return endpoint.ServerEndpoint{}, errors.New("server addrPorts are not yet known")
 	}
 
 	if discoA.Compare(s.discoPublic) == 0 || discoB.Compare(s.discoPublic) == 0 {
@@ -439,8 +568,13 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 		// TODO: consider ServerEndpoint.BindLifetime -= time.Now()-e.allocatedAt
 		// to give the client a more accurate picture of the bind window.
 		return endpoint.ServerEndpoint{
-			ServerDisco:         s.discoPublic,
-			AddrPorts:           s.addrPorts,
+			ServerDisco: s.discoPublic,
+			// Returning the "latest" addrPorts for an existing allocation is
+			// the simple choice. It may not be the best depending on client
+			// behaviors and endpoint state (bound or not). We might want to
+			// consider storing them (maybe interning) in the [*serverEndpoint]
+			// at allocation time.
+			AddrPorts:           slices.Clone(s.addrPorts),
 			VNI:                 e.vni,
 			LamportID:           e.lamportID,
 			BindLifetime:        tstime.GoDuration{Duration: s.bindLifetime},
@@ -461,15 +595,13 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 	e.discoSharedSecrets[0] = s.disco.Shared(e.discoPubKeys[0])
 	e.discoSharedSecrets[1] = s.disco.Shared(e.discoPubKeys[1])
 	e.vni, s.vniPool = s.vniPool[0], s.vniPool[1:]
-	rand.Read(e.challenge[0][:])
-	rand.Read(e.challenge[1][:])
 
 	s.byDisco[pair] = e
 	s.byVNI[e.vni] = e
 
 	return endpoint.ServerEndpoint{
 		ServerDisco:         s.discoPublic,
-		AddrPorts:           s.addrPorts,
+		AddrPorts:           slices.Clone(s.addrPorts),
 		VNI:                 e.vni,
 		LamportID:           e.lamportID,
 		BindLifetime:        tstime.GoDuration{Duration: s.bindLifetime},

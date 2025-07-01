@@ -7,9 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"sync"
 	"time"
 
@@ -24,6 +27,12 @@ import (
 // relayManager manages allocation, handshaking, and initial probing (disco
 // ping/pong) of [tailscale.com/net/udprelay.Server] endpoints. The zero value
 // is ready for use.
+//
+// [relayManager] methods can be called by [Conn] and [endpoint] while their .mu
+// mutexes are held. Therefore, in order to avoid deadlocks, [relayManager] must
+// never attempt to acquire those mutexes synchronously from its runLoop(),
+// including synchronous calls back towards [Conn] or [endpoint] methods that
+// acquire them.
 type relayManager struct {
 	initOnce sync.Once
 
@@ -36,16 +45,18 @@ type relayManager struct {
 	handshakeWorkByServerDiscoVNI        map[serverDiscoVNI]*relayHandshakeWork
 	handshakeWorkAwaitingPong            map[*relayHandshakeWork]addrPortVNI
 	addrPortVNIToHandshakeWork           map[addrPortVNI]*relayHandshakeWork
+	handshakeGeneration                  uint32
 
 	// ===================================================================
 	// The following chan fields serve event inputs to a single goroutine,
 	// runLoop().
-	allocateHandshakeCh   chan *endpoint
+	startDiscoveryCh      chan endpointWithLastBest
 	allocateWorkDoneCh    chan relayEndpointAllocWorkDoneEvent
 	handshakeWorkDoneCh   chan relayEndpointHandshakeWorkDoneEvent
 	cancelWorkCh          chan *endpoint
 	newServerEndpointCh   chan newRelayServerEndpointEvent
 	rxHandshakeDiscoMsgCh chan relayHandshakeDiscoMsgEvent
+	serversCh             chan set.Set[netip.AddrPort]
 
 	discoInfoMu            sync.Mutex // guards the following field
 	discoInfoByServerDisco map[key.DiscoPublic]*relayHandshakeDiscoInfo
@@ -66,8 +77,8 @@ type serverDiscoVNI struct {
 // relayHandshakeWork serves to track in-progress relay handshake work for a
 // [udprelay.ServerEndpoint]. This structure is immutable once initialized.
 type relayHandshakeWork struct {
-	ep *endpoint
-	se udprelay.ServerEndpoint
+	wlb endpointWithLastBest
+	se  udprelay.ServerEndpoint
 
 	// handshakeServerEndpoint() always writes to doneCh (len 1) when it
 	// returns. It may end up writing the same event afterward to
@@ -86,7 +97,7 @@ type relayHandshakeWork struct {
 // [disco.CallMeMaybeVia] reception. This structure is immutable once
 // initialized.
 type newRelayServerEndpointEvent struct {
-	ep     *endpoint
+	wlb    endpointWithLastBest
 	se     udprelay.ServerEndpoint
 	server netip.AddrPort // zero value if learned via [disco.CallMeMaybeVia]
 }
@@ -107,10 +118,19 @@ type relayEndpointHandshakeWorkDoneEvent struct {
 	latency          time.Duration  // only relevant if pongReceivedFrom.IsValid()
 }
 
-// activeWorkRunLoop returns true if there is outstanding allocation or
-// handshaking work, otherwise it returns false.
-func (r *relayManager) activeWorkRunLoop() bool {
+// hasActiveWorkRunLoop returns true if there is outstanding allocation or
+// handshaking work for any endpoint, otherwise it returns false.
+func (r *relayManager) hasActiveWorkRunLoop() bool {
 	return len(r.allocWorkByEndpoint) > 0 || len(r.handshakeWorkByEndpointByServerDisco) > 0
+}
+
+// hasActiveWorkForEndpointRunLoop returns true if there is outstanding
+// allocation or handshaking work for the provided endpoint, otherwise it
+// returns false.
+func (r *relayManager) hasActiveWorkForEndpointRunLoop(ep *endpoint) bool {
+	_, handshakeWork := r.handshakeWorkByEndpointByServerDisco[ep]
+	_, allocWork := r.allocWorkByEndpoint[ep]
+	return handshakeWork || allocWork
 }
 
 // runLoop is a form of event loop. It ensures exclusive access to most of
@@ -122,48 +142,72 @@ func (r *relayManager) runLoop() {
 
 	for {
 		select {
-		case ep := <-r.allocateHandshakeCh:
-			r.stopWorkRunLoop(ep, stopHandshakeWorkOnlyKnownServers)
-			r.allocateAllServersRunLoop(ep)
-			if !r.activeWorkRunLoop() {
+		case startDiscovery := <-r.startDiscoveryCh:
+			if !r.hasActiveWorkForEndpointRunLoop(startDiscovery.ep) {
+				r.allocateAllServersRunLoop(startDiscovery)
+			}
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case done := <-r.allocateWorkDoneCh:
 			work, ok := r.allocWorkByEndpoint[done.work.ep]
 			if ok && work == done.work {
 				// Verify the work in the map is the same as the one that we're
-				// cleaning up. New events on r.allocateHandshakeCh can
+				// cleaning up. New events on r.startDiscoveryCh can
 				// overwrite pre-existing keys.
 				delete(r.allocWorkByEndpoint, done.work.ep)
 			}
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case ep := <-r.cancelWorkCh:
-			r.stopWorkRunLoop(ep, stopHandshakeWorkAllServers)
-			if !r.activeWorkRunLoop() {
+			r.stopWorkRunLoop(ep)
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case newServerEndpoint := <-r.newServerEndpointCh:
 			r.handleNewServerEndpointRunLoop(newServerEndpoint)
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case done := <-r.handshakeWorkDoneCh:
 			r.handleHandshakeWorkDoneRunLoop(done)
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case discoMsgEvent := <-r.rxHandshakeDiscoMsgCh:
 			r.handleRxHandshakeDiscoMsgRunLoop(discoMsgEvent)
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkRunLoop() {
+				return
+			}
+		case serversUpdate := <-r.serversCh:
+			r.handleServersUpdateRunLoop(serversUpdate)
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		}
 	}
 }
 
+func (r *relayManager) handleServersUpdateRunLoop(update set.Set[netip.AddrPort]) {
+	for k, v := range r.serversByAddrPort {
+		if !update.Contains(k) {
+			delete(r.serversByAddrPort, k)
+			delete(r.serversByDisco, v)
+		}
+	}
+	for _, v := range update.Slice() {
+		_, ok := r.serversByAddrPort[v]
+		if ok {
+			// don't zero known disco keys
+			continue
+		}
+		r.serversByAddrPort[v] = key.DiscoPublic{}
+	}
+}
+
 type relayHandshakeDiscoMsgEvent struct {
+	conn  *Conn // for access to [Conn] if there is no associated [relayHandshakeWork]
 	msg   disco.Message
 	disco key.DiscoPublic
 	from  netip.AddrPort
@@ -193,14 +237,15 @@ func (r *relayManager) init() {
 		r.handshakeWorkByServerDiscoVNI = make(map[serverDiscoVNI]*relayHandshakeWork)
 		r.handshakeWorkAwaitingPong = make(map[*relayHandshakeWork]addrPortVNI)
 		r.addrPortVNIToHandshakeWork = make(map[addrPortVNI]*relayHandshakeWork)
-		r.allocateHandshakeCh = make(chan *endpoint)
+		r.startDiscoveryCh = make(chan endpointWithLastBest)
 		r.allocateWorkDoneCh = make(chan relayEndpointAllocWorkDoneEvent)
 		r.handshakeWorkDoneCh = make(chan relayEndpointHandshakeWorkDoneEvent)
 		r.cancelWorkCh = make(chan *endpoint)
 		r.newServerEndpointCh = make(chan newRelayServerEndpointEvent)
 		r.rxHandshakeDiscoMsgCh = make(chan relayHandshakeDiscoMsgEvent)
+		r.serversCh = make(chan set.Set[netip.AddrPort])
 		r.runLoopStoppedCh = make(chan struct{}, 1)
-		go r.runLoop()
+		r.runLoopStoppedCh <- struct{}{}
 	})
 }
 
@@ -228,7 +273,7 @@ func (r *relayManager) ensureDiscoInfoFor(work *relayHandshakeWork) {
 		di.di = &discoInfo{
 			discoKey:   work.se.ServerDisco,
 			discoShort: work.se.ServerDisco.ShortString(),
-			sharedKey:  work.ep.c.discoPrivate.Shared(work.se.ServerDisco),
+			sharedKey:  work.wlb.ep.c.discoPrivate.Shared(work.se.ServerDisco),
 		}
 	}
 }
@@ -261,7 +306,7 @@ func (r *relayManager) discoInfo(serverDisco key.DiscoPublic) (_ *discoInfo, ok 
 	return nil, false
 }
 
-func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, dm *disco.CallMeMaybeVia) {
+func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, lastBest addrQuality, lastBestIsTrusted bool, dm *disco.CallMeMaybeVia) {
 	se := udprelay.ServerEndpoint{
 		ServerDisco: dm.ServerDisco,
 		LamportID:   dm.LamportID,
@@ -271,7 +316,11 @@ func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, dm *disco.CallMeMaybeV
 	se.BindLifetime.Duration = dm.BindLifetime
 	se.SteadyStateLifetime.Duration = dm.SteadyStateLifetime
 	relayManagerInputEvent(r, nil, &r.newServerEndpointCh, newRelayServerEndpointEvent{
-		ep: ep,
+		wlb: endpointWithLastBest{
+			ep:                ep,
+			lastBest:          lastBest,
+			lastBestIsTrusted: lastBestIsTrusted,
+		},
 		se: se,
 	})
 }
@@ -279,8 +328,13 @@ func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, dm *disco.CallMeMaybeV
 // handleGeneveEncapDiscoMsgNotBestAddr handles reception of Geneve-encapsulated
 // disco messages if they are not associated with any known
 // [*endpoint.bestAddr].
-func (r *relayManager) handleGeneveEncapDiscoMsgNotBestAddr(dm disco.Message, di *discoInfo, src netip.AddrPort, vni uint32) {
-	relayManagerInputEvent(r, nil, &r.rxHandshakeDiscoMsgCh, relayHandshakeDiscoMsgEvent{msg: dm, disco: di.discoKey, from: src, vni: vni, at: time.Now()})
+func (r *relayManager) handleGeneveEncapDiscoMsgNotBestAddr(conn *Conn, dm disco.Message, di *discoInfo, src epAddr) {
+	relayManagerInputEvent(r, nil, &r.rxHandshakeDiscoMsgCh, relayHandshakeDiscoMsgEvent{conn: conn, msg: dm, disco: di.discoKey, from: src.ap, vni: src.vni.get(), at: time.Now()})
+}
+
+// handleRelayServersSet handles an update of the complete relay server set.
+func (r *relayManager) handleRelayServersSet(servers set.Set[netip.AddrPort]) {
+	relayManagerInputEvent(r, nil, &r.serversCh, servers)
 }
 
 // relayManagerInputEvent initializes [relayManager] if necessary, starts
@@ -310,11 +364,19 @@ func relayManagerInputEvent[T any](r *relayManager, ctx context.Context, eventCh
 	}
 }
 
-// allocateAndHandshakeAllServers kicks off allocation and handshaking of relay
-// endpoints for 'ep' on all known relay servers, canceling any existing
-// in-progress work.
-func (r *relayManager) allocateAndHandshakeAllServers(ep *endpoint) {
-	relayManagerInputEvent(r, nil, &r.allocateHandshakeCh, ep)
+// endpointWithLastBest represents an [*endpoint], its last bestAddr, and if
+// the last bestAddr was trusted (see endpoint.trustBestAddrUntil) at the time
+// of init. This structure is immutable once initialized.
+type endpointWithLastBest struct {
+	ep                *endpoint
+	lastBest          addrQuality
+	lastBestIsTrusted bool
+}
+
+// startUDPRelayPathDiscoveryFor starts UDP relay path discovery for ep on all
+// known relay servers if ep has no in-progress work.
+func (r *relayManager) startUDPRelayPathDiscoveryFor(ep *endpoint, lastBest addrQuality, lastBestIsTrusted bool) {
+	relayManagerInputEvent(r, nil, &r.startDiscoveryCh, endpointWithLastBest{ep, lastBest, lastBestIsTrusted})
 }
 
 // stopWork stops all outstanding allocation & handshaking work for 'ep'.
@@ -322,18 +384,9 @@ func (r *relayManager) stopWork(ep *endpoint) {
 	relayManagerInputEvent(r, nil, &r.cancelWorkCh, ep)
 }
 
-// stopHandshakeWorkFilter represents filters for handshake work cancellation
-type stopHandshakeWorkFilter bool
-
-const (
-	stopHandshakeWorkAllServers       stopHandshakeWorkFilter = false
-	stopHandshakeWorkOnlyKnownServers                         = true
-)
-
 // stopWorkRunLoop cancels & clears outstanding allocation and handshaking
-// work for 'ep'. Handshake work cancellation is subject to the filter supplied
-// in 'f'.
-func (r *relayManager) stopWorkRunLoop(ep *endpoint, f stopHandshakeWorkFilter) {
+// work for 'ep'.
+func (r *relayManager) stopWorkRunLoop(ep *endpoint) {
 	allocWork, ok := r.allocWorkByEndpoint[ep]
 	if ok {
 		allocWork.cancel()
@@ -342,13 +395,10 @@ func (r *relayManager) stopWorkRunLoop(ep *endpoint, f stopHandshakeWorkFilter) 
 	}
 	byServerDisco, ok := r.handshakeWorkByEndpointByServerDisco[ep]
 	if ok {
-		for disco, handshakeWork := range byServerDisco {
-			_, knownServer := r.serversByDisco[disco]
-			if knownServer || f == stopHandshakeWorkAllServers {
-				handshakeWork.cancel()
-				done := <-handshakeWork.doneCh
-				r.handleHandshakeWorkDoneRunLoop(done)
-			}
+		for _, handshakeWork := range byServerDisco {
+			handshakeWork.cancel()
+			done := <-handshakeWork.doneCh
+			r.handleHandshakeWorkDoneRunLoop(done)
 		}
 	}
 }
@@ -366,7 +416,7 @@ func (r *relayManager) handleRxHandshakeDiscoMsgRunLoop(event relayHandshakeDisc
 		ok   bool
 	)
 	apv := addrPortVNI{event.from, event.vni}
-	switch event.msg.(type) {
+	switch msg := event.msg.(type) {
 	case *disco.BindUDPRelayEndpointChallenge:
 		work, ok = r.handshakeWorkByServerDiscoVNI[serverDiscoVNI{event.disco, event.vni}]
 		if !ok {
@@ -392,7 +442,29 @@ func (r *relayManager) handleRxHandshakeDiscoMsgRunLoop(event relayHandshakeDisc
 		// Update state so that future ping/pong will route to 'work'.
 		r.handshakeWorkAwaitingPong[work] = apv
 		r.addrPortVNIToHandshakeWork[apv] = work
-	case *disco.Ping, *disco.Pong:
+	case *disco.Ping:
+		// Always TX a pong. We might not have any associated work if ping
+		// reception raced with our call to [endpoint.udpRelayEndpointReady()], so
+		// err on the side of enabling the remote side to use this path.
+		//
+		// Conn.handlePingLocked() makes efforts to suppress duplicate pongs
+		// where the same ping can be received both via raw socket and UDP
+		// socket on Linux. We make no such efforts here as the raw socket BPF
+		// program does not support Geneve-encapsulated disco, and is also
+		// disabled by default.
+		vni := virtualNetworkID{}
+		vni.set(event.vni)
+		go event.conn.sendDiscoMessage(epAddr{ap: event.from, vni: vni}, key.NodePublic{}, event.disco, &disco.Pong{
+			TxID: msg.TxID,
+			Src:  event.from,
+		}, discoVerboseLog)
+
+		work, ok = r.addrPortVNIToHandshakeWork[apv]
+		if !ok {
+			// No outstanding work tied to this [addrPortVNI], return early.
+			return
+		}
+	case *disco.Pong:
 		work, ok = r.addrPortVNIToHandshakeWork[apv]
 		if !ok {
 			// No outstanding work tied to this [addrPortVNI], discard.
@@ -413,7 +485,7 @@ func (r *relayManager) handleRxHandshakeDiscoMsgRunLoop(event relayHandshakeDisc
 }
 
 func (r *relayManager) handleHandshakeWorkDoneRunLoop(done relayEndpointHandshakeWorkDoneEvent) {
-	byServerDisco, ok := r.handshakeWorkByEndpointByServerDisco[done.work.ep]
+	byServerDisco, ok := r.handshakeWorkByEndpointByServerDisco[done.work.wlb.ep]
 	if !ok {
 		return
 	}
@@ -423,7 +495,7 @@ func (r *relayManager) handleHandshakeWorkDoneRunLoop(done relayEndpointHandshak
 	}
 	delete(byServerDisco, done.work.se.ServerDisco)
 	if len(byServerDisco) == 0 {
-		delete(r.handshakeWorkByEndpointByServerDisco, done.work.ep)
+		delete(r.handshakeWorkByEndpointByServerDisco, done.work.wlb.ep)
 	}
 	delete(r.handshakeWorkByServerDiscoVNI, serverDiscoVNI{done.work.se.ServerDisco, done.work.se.VNI})
 	apv, ok := r.handshakeWorkAwaitingPong[work]
@@ -436,7 +508,18 @@ func (r *relayManager) handleHandshakeWorkDoneRunLoop(done relayEndpointHandshak
 		return
 	}
 	// This relay endpoint is functional.
-	// TODO(jwhited): Set it on done.work.ep.bestAddr if it is a betterAddr().
+	vni := virtualNetworkID{}
+	vni.set(done.work.se.VNI)
+	addr := epAddr{ap: done.pongReceivedFrom, vni: vni}
+	// ep.udpRelayEndpointReady() must be called in a new goroutine to prevent
+	// deadlocks as it acquires [endpoint] & [Conn] mutexes. See [relayManager]
+	// docs for details.
+	go done.work.wlb.ep.udpRelayEndpointReady(addrQuality{
+		epAddr:           addr,
+		relayServerDisco: done.work.se.ServerDisco,
+		latency:          done.latency,
+		wireMTU:          pingSizeToPktLen(0, addr),
+	})
 }
 
 func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelayServerEndpointEvent) {
@@ -459,7 +542,7 @@ func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelay
 	}
 
 	// Check for duplicate work by [*endpoint] + server disco.
-	byServerDisco, ok := r.handshakeWorkByEndpointByServerDisco[newServerEndpoint.ep]
+	byServerDisco, ok := r.handshakeWorkByEndpointByServerDisco[newServerEndpoint.wlb.ep]
 	if ok {
 		existingWork, ok := byServerDisco[newServerEndpoint.se.ServerDisco]
 		if ok {
@@ -503,26 +586,85 @@ func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelay
 		}
 	}
 
+	if newServerEndpoint.server.IsValid() {
+		// Send a [disco.CallMeMaybeVia] to the remote peer if we allocated this
+		// endpoint, regardless of if we start a handshake below.
+		go r.sendCallMeMaybeVia(newServerEndpoint.wlb.ep, newServerEndpoint.se)
+	}
+
+	lastBestMatchingServer := newServerEndpoint.se.ServerDisco.Compare(newServerEndpoint.wlb.lastBest.relayServerDisco) == 0
+	if lastBestMatchingServer && newServerEndpoint.wlb.lastBestIsTrusted {
+		// This relay server endpoint is the same as [endpoint]'s bestAddr at
+		// the time UDP relay path discovery was started, and it was also a
+		// trusted path (see endpoint.trustBestAddrUntil), so return early.
+		//
+		// If we were to start a new handshake, there is a chance that we
+		// cause [endpoint] to blackhole some packets on its bestAddr if we end
+		// up shifting to a new address family or src, e.g. IPv4 to IPv6, due to
+		// the window of time between the handshake completing, and our call to
+		// udpRelayEndpointReady(). The relay server can only forward packets
+		// from us on a single [epAddr].
+		return
+	}
+
+	// TODO(jwhited): if lastBest is untrusted, consider some strategies
+	//  to reduce the chance we blackhole if it were to transition to
+	//  trusted during/before the new handshake:
+	//    1. Start by attempting a handshake with only lastBest.epAddr. If
+	//       that fails then try the remaining [epAddr]s.
+	//    2. Signal bestAddr trust transitions between [endpoint] and
+	//       [relayManager] in order to prevent a handshake from starting
+	//       and/or stop one that is running.
+
 	// We're ready to start a new handshake.
 	ctx, cancel := context.WithCancel(context.Background())
 	work := &relayHandshakeWork{
-		ep:     newServerEndpoint.ep,
-		se:     newServerEndpoint.se,
-		doneCh: make(chan relayEndpointHandshakeWorkDoneEvent, 1),
-		ctx:    ctx,
-		cancel: cancel,
+		wlb:          newServerEndpoint.wlb,
+		se:           newServerEndpoint.se,
+		rxDiscoMsgCh: make(chan relayHandshakeDiscoMsgEvent),
+		doneCh:       make(chan relayEndpointHandshakeWorkDoneEvent, 1),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 	if byServerDisco == nil {
 		byServerDisco = make(map[key.DiscoPublic]*relayHandshakeWork)
-		r.handshakeWorkByEndpointByServerDisco[newServerEndpoint.ep] = byServerDisco
+		r.handshakeWorkByEndpointByServerDisco[newServerEndpoint.wlb.ep] = byServerDisco
 	}
 	byServerDisco[newServerEndpoint.se.ServerDisco] = work
 	r.handshakeWorkByServerDiscoVNI[sdv] = work
 
-	go r.handshakeServerEndpoint(work)
+	r.handshakeGeneration++
+	if r.handshakeGeneration == 0 { // generation must be nonzero
+		r.handshakeGeneration++
+	}
+
+	go r.handshakeServerEndpoint(work, r.handshakeGeneration)
 }
 
-func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
+// sendCallMeMaybeVia sends a [disco.CallMeMaybeVia] to ep over DERP. It must be
+// called as part of a goroutine independent from runLoop(), for 2 reasons:
+//  1. it acquires ep.mu (refer to [relayManager] docs for reasoning)
+//  2. it makes a networking syscall, which can introduce unwanted backpressure
+func (r *relayManager) sendCallMeMaybeVia(ep *endpoint, se udprelay.ServerEndpoint) {
+	ep.mu.Lock()
+	derpAddr := ep.derpAddr
+	ep.mu.Unlock()
+	epDisco := ep.disco.Load()
+	if epDisco == nil || !derpAddr.IsValid() {
+		return
+	}
+	callMeMaybeVia := &disco.CallMeMaybeVia{
+		ServerDisco:         se.ServerDisco,
+		LamportID:           se.LamportID,
+		VNI:                 se.VNI,
+		BindLifetime:        se.BindLifetime.Duration,
+		SteadyStateLifetime: se.SteadyStateLifetime.Duration,
+		AddrPorts:           se.AddrPorts,
+	}
+	ep.c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, epDisco.key, callMeMaybeVia, discoVerboseLog)
+}
+
+func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork, generation uint32) {
 	done := relayEndpointHandshakeWorkDoneEvent{work: work}
 	r.ensureDiscoInfoFor(work)
 
@@ -533,14 +675,28 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 		work.cancel()
 	}()
 
+	ep := work.wlb.ep
+	epDisco := ep.disco.Load()
+	if epDisco == nil {
+		return
+	}
+
+	common := disco.BindUDPRelayEndpointCommon{
+		VNI:        work.se.VNI,
+		Generation: generation,
+		RemoteKey:  epDisco.key,
+	}
+
 	sentBindAny := false
-	bind := &disco.BindUDPRelayEndpoint{}
+	bind := &disco.BindUDPRelayEndpoint{
+		BindUDPRelayEndpointCommon: common,
+	}
 	vni := virtualNetworkID{}
 	vni.set(work.se.VNI)
 	for _, addrPort := range work.se.AddrPorts {
 		if addrPort.IsValid() {
 			sentBindAny = true
-			go work.ep.c.sendDiscoMessage(addrPort, vni, key.NodePublic{}, work.se.ServerDisco, bind, discoVerboseLog)
+			go ep.c.sendDiscoMessage(epAddr{ap: addrPort, vni: vni}, key.NodePublic{}, work.se.ServerDisco, bind, discoVerboseLog)
 		}
 	}
 	if !sentBindAny {
@@ -567,23 +723,30 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 		if len(sentPingAt) == limitPings {
 			return
 		}
-		epDisco := work.ep.disco.Load()
-		if epDisco == nil {
-			return
-		}
 		txid := stun.NewTxID()
 		sentPingAt[txid] = time.Now()
 		ping := &disco.Ping{
 			TxID:    txid,
-			NodeKey: work.ep.c.publicKeyAtomic.Load(),
+			NodeKey: ep.c.publicKeyAtomic.Load(),
 		}
 		go func() {
 			if withAnswer != nil {
-				answer := &disco.BindUDPRelayEndpointAnswer{Answer: *withAnswer}
-				work.ep.c.sendDiscoMessage(to, vni, key.NodePublic{}, work.se.ServerDisco, answer, discoVerboseLog)
+				answer := &disco.BindUDPRelayEndpointAnswer{BindUDPRelayEndpointCommon: common}
+				answer.Challenge = *withAnswer
+				ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, work.se.ServerDisco, answer, discoVerboseLog)
 			}
-			work.ep.c.sendDiscoMessage(to, vni, key.NodePublic{}, epDisco.key, ping, discoVerboseLog)
+			ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, epDisco.key, ping, discoVerboseLog)
 		}()
+	}
+
+	validateVNIAndRemoteKey := func(common disco.BindUDPRelayEndpointCommon) error {
+		if common.VNI != work.se.VNI {
+			return errors.New("mismatching VNI")
+		}
+		if common.RemoteKey.Compare(epDisco.key) != 0 {
+			return errors.New("mismatching RemoteKey")
+		}
+		return nil
 	}
 
 	// This for{select{}} is responsible for handshaking and tx'ing ping/pong
@@ -595,6 +758,10 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 		case msgEvent := <-work.rxDiscoMsgCh:
 			switch msg := msgEvent.msg.(type) {
 			case *disco.BindUDPRelayEndpointChallenge:
+				err := validateVNIAndRemoteKey(msg.BindUDPRelayEndpointCommon)
+				if err != nil {
+					continue
+				}
 				if handshakeState >= disco.BindUDPRelayHandshakeStateAnswerSent {
 					continue
 				}
@@ -611,6 +778,9 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 				// latency, so send another ping. Since the handshake is
 				// complete we do not need to send an answer in front of this
 				// one.
+				//
+				// We don't need to TX a pong, that was already handled for us
+				// in handleRxHandshakeDiscoMsgRunLoop().
 				txPing(msgEvent.from, nil)
 			case *disco.Pong:
 				at, ok := sentPingAt[msg.TxID]
@@ -626,7 +796,6 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 				// unexpected message type, silently discard
 				continue
 			}
-			return
 		case <-timer.C:
 			// The handshake timed out.
 			return
@@ -634,64 +803,104 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 	}
 }
 
-func (r *relayManager) allocateAllServersRunLoop(ep *endpoint) {
+func (r *relayManager) allocateAllServersRunLoop(wlb endpointWithLastBest) {
 	if len(r.serversByAddrPort) == 0 {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	started := &relayEndpointAllocWork{ep: ep, cancel: cancel, wg: &sync.WaitGroup{}}
+	started := &relayEndpointAllocWork{ep: wlb.ep, cancel: cancel, wg: &sync.WaitGroup{}}
 	for k := range r.serversByAddrPort {
 		started.wg.Add(1)
-		go r.allocateSingleServer(ctx, started.wg, k, ep)
+		go r.allocateSingleServer(ctx, started.wg, k, wlb)
 	}
-	r.allocWorkByEndpoint[ep] = started
+	r.allocWorkByEndpoint[wlb.ep] = started
 	go func() {
 		started.wg.Wait()
-		started.cancel()
 		relayManagerInputEvent(r, ctx, &r.allocateWorkDoneCh, relayEndpointAllocWorkDoneEvent{work: started})
+		// cleanup context cancellation must come after the
+		// relayManagerInputEvent call, otherwise it returns early without
+		// writing the event to runLoop().
+		started.cancel()
 	}()
 }
 
-func (r *relayManager) allocateSingleServer(ctx context.Context, wg *sync.WaitGroup, server netip.AddrPort, ep *endpoint) {
-	// TODO(jwhited): introduce client metrics counters for notable failures
-	defer wg.Done()
-	var b bytes.Buffer
-	remoteDisco := ep.disco.Load()
-	if remoteDisco == nil {
-		return
-	}
+type errNotReady struct{ retryAfter time.Duration }
+
+func (e errNotReady) Error() string {
+	return fmt.Sprintf("server not ready, retry after %v", e.retryAfter)
+}
+
+const reqTimeout = time.Second * 10
+
+func doAllocate(ctx context.Context, server netip.AddrPort, discoKeys [2]key.DiscoPublic) (udprelay.ServerEndpoint, error) {
+	var reqBody bytes.Buffer
 	type allocateRelayEndpointReq struct {
 		DiscoKeys []key.DiscoPublic
 	}
 	a := &allocateRelayEndpointReq{
-		DiscoKeys: []key.DiscoPublic{ep.c.discoPublic, remoteDisco.key},
+		DiscoKeys: []key.DiscoPublic{discoKeys[0], discoKeys[1]},
 	}
-	err := json.NewEncoder(&b).Encode(a)
+	err := json.NewEncoder(&reqBody).Encode(a)
 	if err != nil {
-		return
+		return udprelay.ServerEndpoint{}, err
 	}
-	const reqTimeout = time.Second * 10
 	reqCtx, cancel := context.WithTimeout(ctx, reqTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, httpm.POST, "http://"+server.String()+"/relay/endpoint", &b)
+	req, err := http.NewRequestWithContext(reqCtx, httpm.POST, "http://"+server.String()+"/v0/relay/endpoint", &reqBody)
 	if err != nil {
-		return
+		return udprelay.ServerEndpoint{}, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return
+		return udprelay.ServerEndpoint{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var se udprelay.ServerEndpoint
+		err = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&se)
+		return se, err
+	case http.StatusServiceUnavailable:
+		raHeader := resp.Header.Get("Retry-After")
+		raSeconds, err := strconv.ParseUint(raHeader, 10, 32)
+		if err == nil {
+			return udprelay.ServerEndpoint{}, errNotReady{retryAfter: time.Second * time.Duration(raSeconds)}
+		}
+		fallthrough
+	default:
+		return udprelay.ServerEndpoint{}, fmt.Errorf("non-200 status: %d", resp.StatusCode)
+	}
+}
+
+func (r *relayManager) allocateSingleServer(ctx context.Context, wg *sync.WaitGroup, server netip.AddrPort, wlb endpointWithLastBest) {
+	// TODO(jwhited): introduce client metrics counters for notable failures
+	defer wg.Done()
+	remoteDisco := wlb.ep.disco.Load()
+	if remoteDisco == nil {
 		return
 	}
-	var se udprelay.ServerEndpoint
-	err = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&se)
-	if err != nil {
+	firstTry := true
+	for {
+		se, err := doAllocate(ctx, server, [2]key.DiscoPublic{wlb.ep.c.discoPublic, remoteDisco.key})
+		if err == nil {
+			relayManagerInputEvent(r, ctx, &r.newServerEndpointCh, newRelayServerEndpointEvent{
+				wlb:    wlb,
+				se:     se,
+				server: server, // we allocated this endpoint (vs CallMeMaybeVia reception), mark it as such
+			})
+			return
+		}
+		wlb.ep.c.logf("[v1] magicsock: relayManager: error allocating endpoint on %v for %v: %v", server, wlb.ep.discoShort(), err)
+		var notReady errNotReady
+		if firstTry && errors.As(err, &notReady) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(min(notReady.retryAfter, reqTimeout)):
+				firstTry = false
+				continue
+			}
+		}
 		return
 	}
-	relayManagerInputEvent(r, ctx, &r.newServerEndpointCh, newRelayServerEndpointEvent{
-		ep: ep,
-		se: se,
-	})
 }
