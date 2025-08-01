@@ -27,6 +27,7 @@ import (
 	"k8s.io/apiserver/pkg/storage/names"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
+
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
@@ -101,6 +102,8 @@ const (
 	defaultLocalAddrPort  = 9002 // metrics and health check port
 
 	letsEncryptStagingEndpoint = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+	mainContainerName = "tailscale"
 )
 
 var (
@@ -138,6 +141,9 @@ type tailscaleSTSConfig struct {
 	ProxyClassName string // name of ProxyClass if one needs to be applied to the proxy
 
 	ProxyClass *tsapi.ProxyClass // ProxyClass that needs to be applied to the proxy (if there is one)
+
+	// LoginServer denotes the URL of the control plane that should be used by the proxy.
+	LoginServer string
 }
 
 type connector struct {
@@ -162,6 +168,7 @@ type tailscaleSTSReconciler struct {
 	proxyImage             string
 	proxyPriorityClassName string
 	tsFirewallMode         string
+	loginServer            string
 }
 
 func (sts tailscaleSTSReconciler) validate() error {
@@ -754,14 +761,21 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, 
 			enableEndpoints(ss, metricsEnabled, debugEnabled)
 		}
 	}
-	if pc.Spec.UseLetsEncryptStagingEnvironment && (stsCfg.proxyType == proxyTypeIngressResource || stsCfg.proxyType == string(tsapi.ProxyGroupTypeIngress)) {
-		for i, c := range ss.Spec.Template.Spec.Containers {
-			if c.Name == "tailscale" {
-				ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env, corev1.EnvVar{
-					Name:  "TS_DEBUG_ACME_DIRECTORY_URL",
-					Value: letsEncryptStagingEndpoint,
-				})
-				break
+
+	if stsCfg != nil {
+		usesLetsEncrypt := stsCfg.proxyType == proxyTypeIngressResource ||
+			stsCfg.proxyType == string(tsapi.ProxyGroupTypeIngress) ||
+			stsCfg.proxyType == string(tsapi.ProxyGroupTypeKubernetesAPIServer)
+
+		if pc.Spec.UseLetsEncryptStagingEnvironment && usesLetsEncrypt {
+			for i, c := range ss.Spec.Template.Spec.Containers {
+				if isMainContainer(&c) {
+					ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env, corev1.EnvVar{
+						Name:  "TS_DEBUG_ACME_DIRECTORY_URL",
+						Value: letsEncryptStagingEndpoint,
+					})
+					break
+				}
 			}
 		}
 	}
@@ -824,7 +838,7 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, 
 		return base
 	}
 	for i, c := range ss.Spec.Template.Spec.Containers {
-		if c.Name == "tailscale" {
+		if isMainContainer(&c) {
 			ss.Spec.Template.Spec.Containers[i] = updateContainer(wantsPod.TailscaleContainer, ss.Spec.Template.Spec.Containers[i])
 			break
 		}
@@ -842,7 +856,7 @@ func applyProxyClassToStatefulSet(pc *tsapi.ProxyClass, ss *appsv1.StatefulSet, 
 
 func enableEndpoints(ss *appsv1.StatefulSet, metrics, debug bool) {
 	for i, c := range ss.Spec.Template.Spec.Containers {
-		if c.Name == "tailscale" {
+		if isMainContainer(&c) {
 			if debug {
 				ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env,
 					// Serve tailscaled's debug metrics on on
@@ -897,6 +911,10 @@ func enableEndpoints(ss *appsv1.StatefulSet, metrics, debug bool) {
 	}
 }
 
+func isMainContainer(c *corev1.Container) bool {
+	return c.Name == mainContainerName
+}
+
 // tailscaledConfig takes a proxy config, a newly generated auth key if generated and a Secret with the previous proxy
 // state and auth key and returns tailscaled config files for currently supported proxy versions.
 func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *corev1.Secret) (tailscaledConfigs, error) {
@@ -908,6 +926,10 @@ func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *co
 		Hostname:            &stsC.Hostname,
 		NoStatefulFiltering: "true", // Explicitly enforce default value, see #14216
 		AppConnector:        &ipn.AppConnectorPrefs{Advertise: false},
+	}
+
+	if stsC.LoginServer != "" {
+		conf.ServerURL = &stsC.LoginServer
 	}
 
 	if stsC.Connector != nil {

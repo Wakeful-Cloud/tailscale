@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -203,6 +204,23 @@ func (s *Store) ReadTLSCertAndKey(domain string) (cert, key []byte, err error) {
 			// that wraps ipn.ErrStateNotExist here.
 			return nil, nil, ipn.ErrStateNotExist
 		}
+		st, ok := err.(*kubeapi.Status)
+		if ok && st.Code == http.StatusForbidden && (s.certShareMode == "ro" || s.certShareMode == "rw") {
+			// In cert share mode, we read from a dedicated Secret per domain.
+			// To get here, we already had a cache miss from our in-memory
+			// store. For write replicas, that means it wasn't available on
+			// start and it wasn't written since. For read replicas, that means
+			// it wasn't available on start and it hasn't been reloaded in the
+			// background. So getting a "forbidden" error is an expected
+			// "not found" case where we've been asked for a cert we don't
+			// expect to issue, and so the forbidden error reflects that the
+			// operator didn't assign permission for a Secret for that domain.
+			//
+			// This code path gets triggered by the admin UI's machine page,
+			// which queries for the node's own TLS cert existing via the
+			// "tls-cert-status" c2n API.
+			return nil, nil, ipn.ErrStateNotExist
+		}
 		return nil, nil, fmt.Errorf("getting TLS Secret %q: %w", domain, err)
 	}
 	cert = secret.Data[keyTLSCert]
@@ -394,8 +412,8 @@ func (s *Store) canPatchSecret(secret string) bool {
 // certSecretSelector returns a label selector that can be used to list all
 // Secrets that aren't Tailscale state Secrets and contain TLS certificates for
 // HTTPS endpoints that this node serves.
-// Currently (3/2025) this only applies to the Kubernetes Operator's ingress
-// ProxyGroup.
+// Currently (7/2025) this only applies to the Kubernetes Operator's ProxyGroup
+// when spec.Type is "ingress" or "kube-apiserver".
 func (s *Store) certSecretSelector() map[string]string {
 	if s.podName == "" {
 		return map[string]string{}
@@ -406,7 +424,7 @@ func (s *Store) certSecretSelector() map[string]string {
 	}
 	pgName := s.podName[:p]
 	return map[string]string{
-		kubetypes.LabelSecretType:   "certs",
+		kubetypes.LabelSecretType:   kubetypes.LabelSecretTypeCerts,
 		kubetypes.LabelManaged:      "true",
 		"tailscale.com/proxy-group": pgName,
 	}

@@ -40,6 +40,7 @@ func TestPrefsEqual(t *testing.T) {
 		"RouteAll",
 		"ExitNodeID",
 		"ExitNodeIP",
+		"AutoExitNode",
 		"InternalExitNodePrior",
 		"ExitNodeAllowLANAccess",
 		"CorpDNS",
@@ -147,6 +148,17 @@ func TestPrefsEqual(t *testing.T) {
 		{
 			&Prefs{ExitNodeIP: netip.MustParseAddr("1.2.3.4")},
 			&Prefs{ExitNodeIP: netip.MustParseAddr("1.2.3.4")},
+			true,
+		},
+
+		{
+			&Prefs{AutoExitNode: ""},
+			&Prefs{AutoExitNode: "auto:any"},
+			false,
+		},
+		{
+			&Prefs{AutoExitNode: "auto:any"},
+			&Prefs{AutoExitNode: "auto:any"},
 			true,
 		},
 
@@ -1115,5 +1127,64 @@ func TestPrefsDowngrade(t *testing.T) {
 	}
 	if !op.AllowSingleHosts {
 		t.Fatal("AllowSingleHosts should be true")
+	}
+}
+
+func TestParseAutoExitNodeString(t *testing.T) {
+	tests := []struct {
+		name       string
+		exitNodeID string
+		wantOk     bool
+		wantExpr   ExitNodeExpression
+	}{
+		{
+			name:       "empty expr",
+			exitNodeID: "",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "no auto prefix",
+			exitNodeID: "foo",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "auto:any",
+			exitNodeID: "auto:any",
+			wantOk:     true,
+			wantExpr:   AnyExitNode,
+		},
+		{
+			name:       "auto:foo",
+			exitNodeID: "auto:foo",
+			wantOk:     true,
+			wantExpr:   "foo",
+		},
+		{
+			name:       "auto prefix but empty suffix",
+			exitNodeID: "auto:",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+		{
+			name:       "auto prefix no colon",
+			exitNodeID: "auto",
+			wantOk:     false,
+			wantExpr:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotExpr, gotOk := ParseAutoExitNodeString(tt.exitNodeID)
+			if gotOk != tt.wantOk || gotExpr != tt.wantExpr {
+				if tt.wantOk {
+					t.Fatalf("got %v (%q); want %v (%q)", gotOk, gotExpr, tt.wantOk, tt.wantExpr)
+				} else {
+					t.Fatalf("got %v (%q); want false", gotOk, gotExpr)
+				}
+			}
+		})
 	}
 }

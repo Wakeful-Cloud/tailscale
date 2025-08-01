@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -98,7 +99,6 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/deephash"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/eventbus"
 	"tailscale.com/util/goroutines"
 	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
@@ -178,6 +178,10 @@ var (
 	// It is used as a context cancellation cause for the old context
 	// and can be returned when an operation is performed on it.
 	errNodeContextChanged = errors.New("profile changed")
+
+	// errManagedByPolicy indicates the operation is blocked
+	// because the target state is managed by a GP/MDM policy.
+	errManagedByPolicy = errors.New("managed by policy")
 )
 
 // LocalBackend is the glue between the major pieces of the Tailscale
@@ -410,6 +414,19 @@ type LocalBackend struct {
 	// reconnectTimer is used to schedule a reconnect by setting [ipn.Prefs.WantRunning]
 	// to true after a delay, or nil if no reconnect is scheduled.
 	reconnectTimer tstime.TimerController
+
+	// overrideExitNodePolicy is whether the user has overridden the exit node policy
+	// by manually selecting an exit node, as allowed by [syspolicy.AllowExitNodeOverride].
+	//
+	// If true, the [syspolicy.ExitNodeID] and [syspolicy.ExitNodeIP] policy settings are ignored,
+	// and the suggested exit node is not applied automatically.
+	//
+	// It is cleared when the user switches back to the state required by policy (typically, auto:any),
+	// or when switching profiles, connecting/disconnecting Tailscale, restarting the client,
+	// or on similar events.
+	//
+	// See tailscale/corp#29969.
+	overrideExitNodePolicy bool
 }
 
 // HealthTracker returns the health tracker for the backend.
@@ -600,15 +617,7 @@ func (b *LocalBackend) currentNode() *nodeBackend {
 	if v := b.currentNodeAtomic.Load(); v != nil || !testenv.InTest() {
 		return v
 	}
-	// Auto-init [nodeBackend] in tests for LocalBackend created without the
-	// NewLocalBackend() constructor. Same reasoning for checking b.sys.
-	var bus *eventbus.Bus
-	if b.sys == nil {
-		bus = eventbus.New()
-	} else {
-		bus = b.sys.Bus.Get()
-	}
-	v := newNodeBackend(cmp.Or(b.ctx, context.Background()), bus)
+	v := newNodeBackend(cmp.Or(b.ctx, context.Background()), b.sys.Bus.Get())
 	if b.currentNodeAtomic.CompareAndSwap(nil, v) {
 		v.ready()
 	}
@@ -912,13 +921,14 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	hadPAC := b.prevIfState.HasPAC()
 	b.prevIfState = ifst
 	b.pauseOrResumeControlClientLocked()
-	if delta.Major && shouldAutoExitNode() {
+	prefs := b.pm.CurrentPrefs()
+	if delta.Major && prefs.AutoExitNode().IsSet() {
 		b.refreshAutoExitNode = true
 	}
 
 	var needReconfig bool
 	// If the network changed and we're using an exit node and allowing LAN access, we may need to reconfigure.
-	if delta.Major && b.pm.CurrentPrefs().ExitNodeID() != "" && b.pm.CurrentPrefs().ExitNodeAllowLANAccess() {
+	if delta.Major && prefs.ExitNodeID() != "" && prefs.ExitNodeAllowLANAccess() {
 		b.logf("linkChange: in state %v; updating LAN routes", b.state)
 		needReconfig = true
 	}
@@ -941,8 +951,8 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 
 	// If the local network configuration has changed, our filter may
 	// need updating to tweak default routes.
-	b.updateFilterLocked(b.pm.CurrentPrefs())
-	updateExitNodeUsageWarning(b.pm.CurrentPrefs(), delta.New, b.health)
+	b.updateFilterLocked(prefs)
+	updateExitNodeUsageWarning(prefs, delta.New, b.health)
 
 	cn := b.currentNode()
 	nm := cn.NetMap()
@@ -1072,7 +1082,7 @@ func (b *LocalBackend) Shutdown() {
 		ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
 		defer cancel()
 		t0 := time.Now()
-		err := b.Logout(ctx) // best effort
+		err := b.Logout(ctx, ipnauth.Self) // best effort
 		td := time.Since(t0).Round(time.Millisecond)
 		if err != nil {
 			b.logf("failed to log out ephemeral node on shutdown after %v: %v", td, err)
@@ -1623,17 +1633,11 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 			prefsChanged = true
 		}
 	}
-	if shouldAutoExitNode() {
-		// Re-evaluate exit node suggestion in case circumstances have changed.
-		_, err := b.suggestExitNodeLocked(curNetMap)
-		if err != nil && !errors.Is(err, ErrNoPreferredDERP) {
-			b.logf("SetControlClientStatus failed to select auto exit node: %v", err)
-		}
-	}
-	if applySysPolicy(prefs, b.lastSuggestedExitNode, b.overrideAlwaysOn) {
-		prefsChanged = true
-	}
-	if setExitNodeID(prefs, curNetMap) {
+	// We primarily need this to apply syspolicy to the prefs if an implicit profile
+	// switch is about to happen.
+	// TODO(nickkhyl): remove this once we improve handling of implicit profile switching
+	// in tailscale/corp#28014 and we apply syspolicy when the switch actually happens.
+	if b.reconcilePrefsLocked(prefs) {
 		prefsChanged = true
 	}
 
@@ -1652,6 +1656,8 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 		}); err != nil {
 			b.logf("Failed to save new controlclient state: %v", err)
 		}
+
+		b.sendToLocked(ipn.Notify{Prefs: ptr.To(prefs.View())}, allClients)
 	}
 
 	// initTKALocked is dependent on CurrentProfile.ID, which is initialized
@@ -1694,16 +1700,14 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 	b.mu.Unlock()
 
 	// Now complete the lock-free parts of what we started while locked.
-	if prefsChanged {
-		b.send(ipn.Notify{Prefs: ptr.To(prefs.View())})
-	}
-
 	if st.NetMap != nil {
 		if envknob.NoLogsNoSupport() && st.NetMap.HasCap(tailcfg.CapabilityDataPlaneAuditLogs) {
 			msg := "tailnet requires logging to be enabled. Remove --no-logs-no-support from tailscaled command line."
 			b.health.SetLocalLogConfigHealth(errors.New(msg))
 			// Connecting to this tailnet without logging is forbidden; boot us outta here.
 			b.mu.Lock()
+			// Get the current prefs again, since we unlocked above.
+			prefs := b.pm.CurrentPrefs().AsStruct()
 			prefs.WantRunning = false
 			p := prefs.View()
 			if err := b.pm.SetPrefs(p, ipn.NetworkProfile{
@@ -1736,6 +1740,16 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 		b.health.SetDERPMap(st.NetMap.DERPMap)
 
 		b.send(ipn.Notify{NetMap: st.NetMap})
+
+		// Check and update the exit node if needed, now that we have a new netmap.
+		//
+		// This must happen after the netmap change is sent via [ipn.Notify],
+		// so the GUI can correctly display the exit node if it has changed
+		// since the last netmap was sent.
+		//
+		// Otherwise, it might briefly show the exit node as offline and display a warning,
+		// if the node wasn't online or wasn't advertising default routes in the previous netmap.
+		b.RefreshExitNode()
 	}
 	if st.URL != "" {
 		b.logf("Received auth URL: %.20v...", st.URL)
@@ -1798,9 +1812,11 @@ var preferencePolicies = []preferencePolicyInfo{
 	},
 }
 
-// applySysPolicy overwrites configured preferences with policies that may be
+// applySysPolicyLocked overwrites configured preferences with policies that may be
 // configured by the system administrator in an OS-specific way.
-func applySysPolicy(prefs *ipn.Prefs, lastSuggestedExitNode tailcfg.StableNodeID, overrideAlwaysOn bool) (anyChange bool) {
+//
+// b.mu must be held.
+func (b *LocalBackend) applySysPolicyLocked(prefs *ipn.Prefs) (anyChange bool) {
 	if controlURL, err := syspolicy.GetString(syspolicy.ControlURL, prefs.ControlURL); err == nil && prefs.ControlURL != controlURL {
 		prefs.ControlURL = controlURL
 		anyChange = true
@@ -1837,32 +1853,12 @@ func applySysPolicy(prefs *ipn.Prefs, lastSuggestedExitNode tailcfg.StableNodeID
 		}
 	}
 
-	if exitNodeIDStr, _ := syspolicy.GetString(syspolicy.ExitNodeID, ""); exitNodeIDStr != "" {
-		exitNodeID := tailcfg.StableNodeID(exitNodeIDStr)
-		if shouldAutoExitNode() && lastSuggestedExitNode != "" {
-			exitNodeID = lastSuggestedExitNode
-		}
-		// Note: when exitNodeIDStr == "auto" && lastSuggestedExitNode == "",
-		// then exitNodeID is now "auto" which will never match a peer's node ID.
-		// When there is no a peer matching the node ID, traffic will blackhole,
-		// preventing accidental non-exit-node usage when a policy is in effect that requires an exit node.
-		if prefs.ExitNodeID != exitNodeID || prefs.ExitNodeIP.IsValid() {
-			anyChange = true
-		}
-		prefs.ExitNodeID = exitNodeID
-		prefs.ExitNodeIP = netip.Addr{}
-	} else if exitNodeIPStr, _ := syspolicy.GetString(syspolicy.ExitNodeIP, ""); exitNodeIPStr != "" {
-		exitNodeIP, err := netip.ParseAddr(exitNodeIPStr)
-		if exitNodeIP.IsValid() && err == nil {
-			if prefs.ExitNodeID != "" || prefs.ExitNodeIP != exitNodeIP {
-				anyChange = true
-			}
-			prefs.ExitNodeID = ""
-			prefs.ExitNodeIP = exitNodeIP
-		}
+	// Only apply the exit node policy if the user hasn't overridden it.
+	if !b.overrideExitNodePolicy && b.applyExitNodeSysPolicyLocked(prefs) {
+		anyChange = true
 	}
 
-	if alwaysOn, _ := syspolicy.GetBoolean(syspolicy.AlwaysOn, false); alwaysOn && !overrideAlwaysOn && !prefs.WantRunning {
+	if alwaysOn, _ := syspolicy.GetBoolean(syspolicy.AlwaysOn, false); alwaysOn && !b.overrideAlwaysOn && !prefs.WantRunning {
 		prefs.WantRunning = true
 		anyChange = true
 	}
@@ -1881,27 +1877,90 @@ func applySysPolicy(prefs *ipn.Prefs, lastSuggestedExitNode tailcfg.StableNodeID
 	return anyChange
 }
 
+// applyExitNodeSysPolicyLocked applies the exit node policy settings to prefs
+// and reports whether any change was made.
+//
+// b.mu must be held.
+func (b *LocalBackend) applyExitNodeSysPolicyLocked(prefs *ipn.Prefs) (anyChange bool) {
+	if exitNodeIDStr, _ := syspolicy.GetString(syspolicy.ExitNodeID, ""); exitNodeIDStr != "" {
+		exitNodeID := tailcfg.StableNodeID(exitNodeIDStr)
+
+		// Try to parse the policy setting value as an "auto:"-prefixed [ipn.ExitNodeExpression],
+		// and update prefs if it differs from the current one.
+		// This includes cases where it was previously an expression but no longer is,
+		// or where it wasn't before but now is.
+		autoExitNode, useAutoExitNode := ipn.ParseAutoExitNodeString(exitNodeID)
+		if prefs.AutoExitNode != autoExitNode {
+			prefs.AutoExitNode = autoExitNode
+			anyChange = true
+		}
+		// Additionally, if the specified exit node ID is an expression,
+		// meaning an exit node is required but we don't yet have a valid exit node ID,
+		// we should set exitNodeID to a value that is never a valid [tailcfg.StableNodeID],
+		// to install a blackhole route and prevent accidental non-exit-node usage
+		// until the expression is evaluated and an actual exit node is selected.
+		// We use "auto:any" for this purpose, primarily for compatibility with
+		// older clients (in case a user downgrades to an earlier version)
+		// and GUIs/CLIs that have special handling for it.
+		if useAutoExitNode {
+			exitNodeID = unresolvedExitNodeID
+		}
+
+		// If the current exit node ID doesn't match the one enforced by the policy setting,
+		// and the policy either requires a specific exit node ID,
+		// or requires an auto exit node ID and the current one isn't allowed,
+		// then update the exit node ID.
+		if prefs.ExitNodeID != exitNodeID {
+			if !useAutoExitNode || !isAllowedAutoExitNodeID(prefs.ExitNodeID) {
+				prefs.ExitNodeID = exitNodeID
+				anyChange = true
+			}
+		}
+
+		// If the exit node IP is set, clear it. When ExitNodeIP is set in the prefs,
+		// it takes precedence over the ExitNodeID.
+		if prefs.ExitNodeIP.IsValid() {
+			prefs.ExitNodeIP = netip.Addr{}
+			anyChange = true
+		}
+	} else if exitNodeIPStr, _ := syspolicy.GetString(syspolicy.ExitNodeIP, ""); exitNodeIPStr != "" {
+		if prefs.AutoExitNode != "" {
+			prefs.AutoExitNode = "" // mutually exclusive with ExitNodeIP
+			anyChange = true
+		}
+		if exitNodeIP, err := netip.ParseAddr(exitNodeIPStr); err == nil {
+			if prefs.ExitNodeID != "" || prefs.ExitNodeIP != exitNodeIP {
+				anyChange = true
+			}
+			prefs.ExitNodeID = ""
+			prefs.ExitNodeIP = exitNodeIP
+		}
+	}
+
+	return anyChange
+}
+
 // registerSysPolicyWatch subscribes to syspolicy change notifications
 // and immediately applies the effective syspolicy settings to the current profile.
 func (b *LocalBackend) registerSysPolicyWatch() (unregister func(), err error) {
 	if unregister, err = syspolicy.RegisterChangeCallback(b.sysPolicyChanged); err != nil {
 		return nil, fmt.Errorf("syspolicy: LocalBacked failed to register policy change callback: %v", err)
 	}
-	if prefs, anyChange := b.applySysPolicy(); anyChange {
+	if prefs, anyChange := b.reconcilePrefs(); anyChange {
 		b.logf("syspolicy: changed initial profile prefs: %v", prefs.Pretty())
 	}
 	b.refreshAllowedSuggestions()
 	return unregister, nil
 }
 
-// applySysPolicy overwrites the current profile's preferences with policies
+// reconcilePrefs overwrites the current profile's preferences with policies
 // that may be configured by the system administrator in an OS-specific way.
 //
 // b.mu must not be held.
-func (b *LocalBackend) applySysPolicy() (_ ipn.PrefsView, anyChange bool) {
+func (b *LocalBackend) reconcilePrefs() (_ ipn.PrefsView, anyChange bool) {
 	unlock := b.lockAndGetUnlock()
 	prefs := b.pm.CurrentPrefs().AsStruct()
-	if !applySysPolicy(prefs, b.lastSuggestedExitNode, b.overrideAlwaysOn) {
+	if !b.reconcilePrefsLocked(prefs) {
 		unlock.UnlockEarly()
 		return prefs.View(), false
 	}
@@ -1911,7 +1970,7 @@ func (b *LocalBackend) applySysPolicy() (_ ipn.PrefsView, anyChange bool) {
 // sysPolicyChanged is a callback triggered by syspolicy when it detects
 // a change in one or more syspolicy settings.
 func (b *LocalBackend) sysPolicyChanged(policy *rsop.PolicyChange) {
-	if policy.HasChanged(syspolicy.AlwaysOn) || policy.HasChanged(syspolicy.AlwaysOnOverrideWithReason) {
+	if policy.HasChangedAnyOf(syspolicy.AlwaysOn, syspolicy.AlwaysOnOverrideWithReason) {
 		// If the AlwaysOn or the AlwaysOnOverrideWithReason policy has changed,
 		// we should reset the overrideAlwaysOn flag, as the override might
 		// no longer be valid.
@@ -1920,20 +1979,25 @@ func (b *LocalBackend) sysPolicyChanged(policy *rsop.PolicyChange) {
 		b.mu.Unlock()
 	}
 
+	if policy.HasChangedAnyOf(syspolicy.ExitNodeID, syspolicy.ExitNodeIP, syspolicy.AllowExitNodeOverride) {
+		// Reset the exit node override if a policy that enforces exit node usage
+		// or allows the user to override automatic exit node selection has changed.
+		b.mu.Lock()
+		b.overrideExitNodePolicy = false
+		b.mu.Unlock()
+	}
+
 	if policy.HasChanged(syspolicy.AllowedSuggestedExitNodes) {
 		b.refreshAllowedSuggestions()
 		// Re-evaluate exit node suggestion now that the policy setting has changed.
-		b.mu.Lock()
-		_, err := b.suggestExitNodeLocked(nil)
-		b.mu.Unlock()
-		if err != nil && !errors.Is(err, ErrNoPreferredDERP) {
+		if _, err := b.SuggestExitNode(); err != nil && !errors.Is(err, ErrNoPreferredDERP) {
 			b.logf("failed to select auto exit node: %v", err)
 		}
 		// If [syspolicy.ExitNodeID] is set to `auto:any`, the suggested exit node ID
 		// will be used when [applySysPolicy] updates the current profile's prefs.
 	}
 
-	if prefs, anyChange := b.applySysPolicy(); anyChange {
+	if prefs, anyChange := b.reconcilePrefs(); anyChange {
 		b.logf("syspolicy: changed profile prefs: %v", prefs.Pretty())
 	}
 }
@@ -1957,8 +2021,8 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	// If auto exit nodes are enabled and our exit node went offline,
 	// we need to schedule picking a new one.
 	// TODO(nickkhyl): move the auto exit node logic to a feature package.
-	if shouldAutoExitNode() {
-		exitNodeID := b.pm.prefs.ExitNodeID()
+	if prefs := b.pm.CurrentPrefs(); prefs.AutoExitNode().IsSet() {
+		exitNodeID := prefs.ExitNodeID()
 		for _, m := range muts {
 			mo, ok := m.(netmap.NodeMutationOnline)
 			if !ok || mo.Online {
@@ -1968,7 +2032,7 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 			if !ok || n.StableID() != exitNodeID {
 				continue
 			}
-			b.goTracker.Go(b.pickNewAutoExitNode)
+			b.goTracker.Go(b.RefreshExitNode)
 			break
 		}
 	}
@@ -2001,30 +2065,56 @@ func mutationsAreWorthyOfTellingIPNBus(muts []netmap.NodeMutation) bool {
 	return false
 }
 
-// pickNewAutoExitNode picks a new automatic exit node if needed.
-func (b *LocalBackend) pickNewAutoExitNode() {
-	unlock := b.lockAndGetUnlock()
-	defer unlock()
-
-	newPrefs := b.setAutoExitNodeIDLockedOnEntry(unlock)
-	if !newPrefs.Valid() {
-		// Unchanged.
-		return
-	}
-
-	b.send(ipn.Notify{Prefs: &newPrefs})
-}
-
-// setExitNodeID updates prefs to reference an exit node by ID, rather
-// than by IP. It returns whether prefs was mutated.
-func setExitNodeID(prefs *ipn.Prefs, nm *netmap.NetworkMap) (prefsChanged bool) {
-	if nm == nil {
-		// No netmap, can't resolve anything.
+// resolveAutoExitNodeLocked computes a suggested exit node and updates prefs
+// to use it if AutoExitNode is enabled, and reports whether prefs was mutated.
+//
+// b.mu must be held.
+func (b *LocalBackend) resolveAutoExitNodeLocked(prefs *ipn.Prefs) (prefsChanged bool) {
+	// As of 2025-07-08, the only supported auto exit node expression is [ipn.AnyExitNode].
+	//
+	// However, to maintain forward compatibility with future auto exit node expressions,
+	// we treat any non-empty AutoExitNode as [ipn.AnyExitNode].
+	//
+	// If and when we support additional auto exit node expressions, this method should be updated
+	// to handle them appropriately, while still falling back to [ipn.AnyExitNode] or a more appropriate
+	// default for unknown (or partially supported) expressions.
+	if !prefs.AutoExitNode.IsSet() {
 		return false
 	}
+	if _, err := b.suggestExitNodeLocked(); err != nil && !errors.Is(err, ErrNoPreferredDERP) {
+		b.logf("failed to select auto exit node: %v", err) // non-fatal, see below
+	}
+	var newExitNodeID tailcfg.StableNodeID
+	if !b.lastSuggestedExitNode.IsZero() {
+		// If we have a suggested exit node, use it.
+		newExitNodeID = b.lastSuggestedExitNode
+	} else if isAllowedAutoExitNodeID(prefs.ExitNodeID) {
+		// If we don't have a suggested exit node, but the prefs already
+		// specify an allowed auto exit node ID, retain it.
+		newExitNodeID = prefs.ExitNodeID
+	} else {
+		// Otherwise, use [unresolvedExitNodeID] to install a blackhole route,
+		// preventing traffic from leaking to the local network until an actual
+		// exit node is selected.
+		newExitNodeID = unresolvedExitNodeID
+	}
+	if prefs.ExitNodeID != newExitNodeID {
+		prefs.ExitNodeID = newExitNodeID
+		prefsChanged = true
+	}
+	if prefs.ExitNodeIP.IsValid() {
+		prefs.ExitNodeIP = netip.Addr{}
+		prefsChanged = true
+	}
+	return prefsChanged
+}
 
-	// If we have a desired IP on file, try to find the corresponding
-	// node.
+// resolveExitNodeIPLocked updates prefs to reference an exit node by ID, rather
+// than by IP. It returns whether prefs was mutated.
+//
+// b.mu must be held.
+func (b *LocalBackend) resolveExitNodeIPLocked(prefs *ipn.Prefs) (prefsChanged bool) {
+	// If we have a desired IP on file, try to find the corresponding node.
 	if !prefs.ExitNodeIP.IsValid() {
 		return false
 	}
@@ -2035,20 +2125,19 @@ func setExitNodeID(prefs *ipn.Prefs, nm *netmap.NetworkMap) (prefsChanged bool) 
 		prefsChanged = true
 	}
 
-	oldExitNodeID := prefs.ExitNodeID
-	for _, peer := range nm.Peers {
-		for _, addr := range peer.Addresses().All() {
-			if !addr.IsSingleIP() || addr.Addr() != prefs.ExitNodeIP {
-				continue
-			}
+	cn := b.currentNode()
+	if nid, ok := cn.NodeByAddr(prefs.ExitNodeIP); ok {
+		if node, ok := cn.NodeByID(nid); ok {
 			// Found the node being referenced, upgrade prefs to
 			// reference it directly for next time.
-			prefs.ExitNodeID = peer.StableID()
+			prefs.ExitNodeID = node.StableID()
 			prefs.ExitNodeIP = netip.Addr{}
-			return prefsChanged || oldExitNodeID != prefs.ExitNodeID
+			// Cleared ExitNodeIP, so prefs changed
+			// even if the ID stayed the same.
+			prefsChanged = true
+
 		}
 	}
-
 	return prefsChanged
 }
 
@@ -2077,7 +2166,7 @@ func (b *LocalBackend) setWgengineStatus(s *wgengine.Status, err error) {
 	es := b.parseWgStatusLocked(s)
 	cc := b.cc
 	b.engineStatus = es
-	needUpdateEndpoints := !endpointsEqual(s.LocalAddrs, b.endpoints)
+	needUpdateEndpoints := !slices.Equal(s.LocalAddrs, b.endpoints)
 	if needUpdateEndpoints {
 		b.endpoints = append([]tailcfg.Endpoint{}, s.LocalAddrs...)
 	}
@@ -2101,18 +2190,6 @@ func (b *LocalBackend) broadcastStatusChanged() {
 	b.statusLock.Lock()
 	b.statusChanged.Broadcast()
 	b.statusLock.Unlock()
-}
-
-func endpointsEqual(x, y []tailcfg.Endpoint) bool {
-	if len(x) != len(y) {
-		return false
-	}
-	for i := range x {
-		if x[i] != y[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // SetNotifyCallback sets the function to call when the backend has something to
@@ -2244,6 +2321,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	hostinfo.Userspace.Set(b.sys.IsNetstack())
 	hostinfo.UserspaceRouter.Set(b.sys.IsNetstackRouter())
 	hostinfo.AppConnector.Set(b.appConnector != nil)
+	hostinfo.StateEncrypted = b.stateEncrypted()
 	b.logf.JSON(1, "Hostinfo", hostinfo)
 
 	// TODO(apenwarr): avoid the need to reinit controlclient.
@@ -2263,26 +2341,32 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	b.setStateLocked(ipn.NoState)
 
 	cn := b.currentNode()
+
+	prefsChanged := false
+	newPrefs := b.pm.CurrentPrefs().AsStruct()
 	if opts.UpdatePrefs != nil {
-		oldPrefs := b.pm.CurrentPrefs()
-		newPrefs := opts.UpdatePrefs.Clone()
-		newPrefs.Persist = oldPrefs.Persist().AsStruct()
-		pv := newPrefs.View()
-		if err := b.pm.SetPrefs(pv, cn.NetworkProfile()); err != nil {
-			b.logf("failed to save UpdatePrefs state: %v", err)
+		newPrefs = opts.UpdatePrefs.Clone()
+		prefsChanged = true
+	}
+	// Apply any syspolicy overrides, resolve exit node ID, etc.
+	// As of 2025-07-03, this is primarily needed in two cases:
+	//  - when opts.UpdatePrefs is not nil
+	//  - when Always Mode is enabled and we need to set WantRunning to true
+	if b.reconcilePrefsLocked(newPrefs) {
+		prefsChanged = true
+	}
+	if prefsChanged {
+		// Neither opts.UpdatePrefs nor prefs reconciliation
+		// is allowed to modify Persist; retain the old value.
+		newPrefs.Persist = b.pm.CurrentPrefs().Persist().AsStruct()
+		if err := b.pm.SetPrefs(newPrefs.View(), cn.NetworkProfile()); err != nil {
+			b.logf("failed to save updated and reconciled prefs: %v", err)
 		}
 	}
+	prefs := newPrefs.View()
 
 	// Reset the always-on override whenever Start is called.
 	b.resetAlwaysOnOverrideLocked()
-	// And also apply syspolicy settings to the current profile.
-	// This is important in two cases: when opts.UpdatePrefs is not nil,
-	// and when Always Mode is enabled and we need to set WantRunning to true.
-	if newp := b.pm.CurrentPrefs().AsStruct(); applySysPolicy(newp, b.lastSuggestedExitNode, b.overrideAlwaysOn) {
-		setExitNodeID(newp, cn.NetMap())
-		b.pm.setPrefsNoPermCheck(newp.View())
-	}
-	prefs := b.pm.CurrentPrefs()
 	b.setAtomicValuesFromPrefsLocked(prefs)
 
 	wantRunning := prefs.WantRunning()
@@ -3428,12 +3512,14 @@ func (b *LocalBackend) onTailnetDefaultAutoUpdate(au bool) {
 		b.logf("using tailnet default auto-update setting: %v", au)
 		prefsClone := prefs.AsStruct()
 		prefsClone.AutoUpdate.Apply = opt.NewBool(au)
-		_, err := b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
-			Prefs: *prefsClone,
-			AutoUpdateSet: ipn.AutoUpdatePrefsMask{
-				ApplySet: true,
-			},
-		}, unlock)
+		_, err := b.editPrefsLockedOnEntry(
+			ipnauth.Self,
+			&ipn.MaskedPrefs{
+				Prefs: *prefsClone,
+				AutoUpdateSet: ipn.AutoUpdatePrefsMask{
+					ApplySet: true,
+				},
+			}, unlock)
 		if err != nil {
 			b.logf("failed to apply tailnet-wide default for auto-updates (%v): %v", au, err)
 			return
@@ -4175,7 +4261,7 @@ func (b *LocalBackend) checkAutoUpdatePrefsLocked(p *ipn.Prefs) error {
 // On success, it returns the resulting prefs (or current prefs, in the case of no change).
 // Setting the value to false when use of an exit node is already false is not an error,
 // nor is true when the exit node is already in use.
-func (b *LocalBackend) SetUseExitNodeEnabled(v bool) (ipn.PrefsView, error) {
+func (b *LocalBackend) SetUseExitNodeEnabled(actor ipnauth.Actor, v bool) (ipn.PrefsView, error) {
 	unlock := b.lockAndGetUnlock()
 	defer unlock()
 
@@ -4200,14 +4286,25 @@ func (b *LocalBackend) SetUseExitNodeEnabled(v bool) (ipn.PrefsView, error) {
 	mp := &ipn.MaskedPrefs{}
 	if v {
 		mp.ExitNodeIDSet = true
-		mp.ExitNodeID = tailcfg.StableNodeID(p0.InternalExitNodePrior())
+		mp.ExitNodeID = p0.InternalExitNodePrior()
+		if expr, ok := ipn.ParseAutoExitNodeString(mp.ExitNodeID); ok {
+			mp.AutoExitNodeSet = true
+			mp.AutoExitNode = expr
+			mp.ExitNodeID = unresolvedExitNodeID
+		}
 	} else {
 		mp.ExitNodeIDSet = true
 		mp.ExitNodeID = ""
+		mp.AutoExitNodeSet = true
+		mp.AutoExitNode = ""
 		mp.InternalExitNodePriorSet = true
-		mp.InternalExitNodePrior = p0.ExitNodeID()
+		if p0.AutoExitNode().IsSet() {
+			mp.InternalExitNodePrior = tailcfg.StableNodeID(ipn.AutoExitNodePrefix + p0.AutoExitNode())
+		} else {
+			mp.InternalExitNodePrior = p0.ExitNodeID()
+		}
 	}
-	return b.editPrefsLockedOnEntry(mp, unlock)
+	return b.editPrefsLockedOnEntry(actor, mp, unlock)
 }
 
 // MaybeClearAppConnector clears the routes from any AppConnector if
@@ -4236,23 +4333,138 @@ func (b *LocalBackend) EditPrefsAs(mp *ipn.MaskedPrefs, actor ipnauth.Actor) (ip
 		return ipn.PrefsView{}, errors.New("can't set Internal fields")
 	}
 
-	// Zeroing the ExitNodeId via localAPI must also zero the prior exit node.
-	if mp.ExitNodeIDSet && mp.ExitNodeID == "" {
+	return b.editPrefsLockedOnEntry(actor, mp, b.lockAndGetUnlock())
+}
+
+// checkEditPrefsAccessLocked checks whether the current user has access
+// to apply the changes in mp to the given prefs.
+//
+// It returns an error if the user is not allowed, or nil otherwise.
+//
+// b.mu must be held.
+func (b *LocalBackend) checkEditPrefsAccessLocked(actor ipnauth.Actor, prefs ipn.PrefsView, mp *ipn.MaskedPrefs) error {
+	var errs []error
+
+	if mp.RunSSHSet && mp.RunSSH && !envknob.CanSSHD() {
+		errs = append(errs, errors.New("Tailscale SSH server administratively disabled"))
+	}
+
+	// Check if the user is allowed to disconnect Tailscale.
+	if mp.WantRunningSet && !mp.WantRunning && b.pm.CurrentPrefs().WantRunning() {
+		if err := actor.CheckProfileAccess(b.pm.CurrentProfile(), ipnauth.Disconnect, b.extHost.AuditLogger()); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// Prevent users from changing exit node preferences
+	// when exit node usage is managed by policy.
+	if mp.ExitNodeIDSet || mp.ExitNodeIPSet || mp.AutoExitNodeSet {
+		isManaged, err := syspolicy.HasAnyOf(syspolicy.ExitNodeID, syspolicy.ExitNodeIP)
+		if err != nil {
+			err = fmt.Errorf("policy check failed: %w", err)
+		} else if isManaged {
+			// Allow users to override ExitNode policy settings and select an exit node manually
+			// if permitted by [syspolicy.AllowExitNodeOverride].
+			//
+			// Disabling exit node usage entirely is not allowed.
+			allowExitNodeOverride, _ := syspolicy.GetBoolean(syspolicy.AllowExitNodeOverride, false)
+			if !allowExitNodeOverride || b.changeDisablesExitNodeLocked(prefs, mp) {
+				err = errManagedByPolicy
+			}
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("exit node cannot be changed: %w", err))
+		}
+	}
+
+	return multierr.New(errs...)
+}
+
+// changeDisablesExitNodeLocked reports whether applying the change
+// to the given prefs would disable exit node usage.
+//
+// In other words, it returns true if prefs.ExitNodeID is non-empty
+// initially, but would become empty after applying the given change.
+//
+// It applies the same adjustments and resolves the exit node in the prefs
+// as done during actual edits. While not optimal performance-wise,
+// changing the exit node via LocalAPI isn't a hot path, and reusing
+// the same logic ensures consistency and simplifies maintenance.
+//
+// b.mu must be held.
+func (b *LocalBackend) changeDisablesExitNodeLocked(prefs ipn.PrefsView, change *ipn.MaskedPrefs) bool {
+	if !change.AutoExitNodeSet && !change.ExitNodeIDSet && !change.ExitNodeIPSet {
+		// The change does not affect exit node usage.
+		return false
+	}
+
+	if prefs.ExitNodeID() == "" {
+		// Exit node usage is already disabled.
+		// Note that we do not check for ExitNodeIP here.
+		// If ExitNodeIP hasn't been resolved to a node,
+		// it's not enabled yet.
+		return false
+	}
+
+	// First, apply the adjustments to a copy of the changes,
+	// e.g., clear AutoExitNode if ExitNodeID is set.
+	tmpChange := ptr.To(*change)
+	tmpChange.Prefs = *change.Prefs.Clone()
+	b.adjustEditPrefsLocked(prefs, tmpChange)
+
+	// Then apply the adjusted changes to a copy of the current prefs,
+	// and resolve the exit node in the prefs.
+	tmpPrefs := prefs.AsStruct()
+	tmpPrefs.ApplyEdits(tmpChange)
+	b.resolveExitNodeInPrefsLocked(tmpPrefs)
+
+	// If ExitNodeID is empty after applying the changes,
+	// but wasn't empty before, then the change disables
+	// exit node usage.
+	return tmpPrefs.ExitNodeID == ""
+
+}
+
+// adjustEditPrefsLocked applies additional changes to mp if necessary,
+// such as zeroing out mutually exclusive fields.
+//
+// It must not assume that the changes in mp will actually be applied.
+//
+// b.mu must be held.
+func (b *LocalBackend) adjustEditPrefsLocked(prefs ipn.PrefsView, mp *ipn.MaskedPrefs) {
+	// Zeroing the ExitNodeID via localAPI must also zero the prior exit node.
+	if mp.ExitNodeIDSet && mp.ExitNodeID == "" && !mp.InternalExitNodePriorSet {
 		mp.InternalExitNodePrior = ""
 		mp.InternalExitNodePriorSet = true
 	}
 
-	// Acquire the lock before checking the profile access to prevent
-	// TOCTOU issues caused by the current profile changing between the
-	// check and the actual edit.
-	unlock := b.lockAndGetUnlock()
-	defer unlock()
-	if mp.WantRunningSet && !mp.WantRunning && b.pm.CurrentPrefs().WantRunning() {
-		if err := actor.CheckProfileAccess(b.pm.CurrentProfile(), ipnauth.Disconnect, b.extHost.AuditLogger()); err != nil {
-			b.logf("check profile access failed: %v", err)
-			return ipn.PrefsView{}, err
-		}
+	// Clear ExitNodeID if AutoExitNode is disabled and ExitNodeID is still unresolved.
+	if mp.AutoExitNodeSet && mp.AutoExitNode == "" && prefs.ExitNodeID() == unresolvedExitNodeID {
+		mp.ExitNodeIDSet = true
+		mp.ExitNodeID = ""
+	}
 
+	// Disable automatic exit node selection if the user explicitly sets
+	// ExitNodeID or ExitNodeIP.
+	if (mp.ExitNodeIDSet || mp.ExitNodeIPSet) && !mp.AutoExitNodeSet {
+		mp.AutoExitNodeSet = true
+		mp.AutoExitNode = ""
+	}
+}
+
+// onEditPrefsLocked is called when prefs are edited (typically, via LocalAPI),
+// just before the changes in newPrefs are set for the current profile.
+//
+// The changes in mp have been allowed, but the resulting [ipn.Prefs]
+// have not yet been applied and may be subject to reconciliation
+// by [LocalBackend.reconcilePrefsLocked], either before or after being set.
+//
+// This method handles preference edits, typically initiated by the user,
+// as opposed to reconfiguring the backend when the final prefs are set.
+//
+// b.mu must be held; mp must not be mutated by this method.
+func (b *LocalBackend) onEditPrefsLocked(_ ipnauth.Actor, mp *ipn.MaskedPrefs, oldPrefs, newPrefs ipn.PrefsView) {
+	if mp.WantRunningSet && !mp.WantRunning && oldPrefs.WantRunning() {
 		// If a user has enough rights to disconnect, such as when [syspolicy.AlwaysOn]
 		// is disabled, or [syspolicy.AlwaysOnOverrideWithReason] is also set and the user
 		// provides a reason for disconnecting, then we should not force the "always on"
@@ -4264,7 +4476,34 @@ func (b *LocalBackend) EditPrefsAs(mp *ipn.MaskedPrefs, actor ipnauth.Actor) (ip
 		}
 	}
 
-	return b.editPrefsLockedOnEntry(mp, unlock)
+	if oldPrefs.WantRunning() != newPrefs.WantRunning() {
+		// Connecting to or disconnecting from Tailscale clears the override,
+		// unless the user is also explicitly changing the exit node (see below).
+		b.overrideExitNodePolicy = false
+	}
+	if mp.AutoExitNodeSet || mp.ExitNodeIDSet || mp.ExitNodeIPSet {
+		if allowExitNodeOverride, _ := syspolicy.GetBoolean(syspolicy.AllowExitNodeOverride, false); allowExitNodeOverride {
+			// If applying exit node policy settings to the new prefs results in no change,
+			// the user is not overriding the policy. Otherwise, it is an override.
+			b.overrideExitNodePolicy = b.applyExitNodeSysPolicyLocked(newPrefs.AsStruct())
+		} else {
+			// Overrides are not allowed; clear the override flag.
+			b.overrideExitNodePolicy = false
+		}
+	}
+
+	// This is recorded here in the EditPrefs path, not the setPrefs path on purpose.
+	// recordForEdit records metrics related to edits and changes, not the final state.
+	// If, in the future, we want to record gauge-metrics related to the state of prefs,
+	// that should be done in the setPrefs path.
+	e := prefsMetricsEditEvent{
+		change:                mp,
+		pNew:                  newPrefs,
+		pOld:                  oldPrefs,
+		node:                  b.currentNode(),
+		lastSuggestedExitNode: b.lastSuggestedExitNode,
+	}
+	e.record()
 }
 
 // startReconnectTimerLocked sets a timer to automatically set WantRunning to true
@@ -4301,7 +4540,7 @@ func (b *LocalBackend) startReconnectTimerLocked(d time.Duration) {
 		}
 
 		mp := &ipn.MaskedPrefs{WantRunningSet: true, Prefs: ipn.Prefs{WantRunning: true}}
-		if _, err := b.editPrefsLockedOnEntry(mp, unlock); err != nil {
+		if _, err := b.editPrefsLockedOnEntry(ipnauth.Self, mp, unlock); err != nil {
 			b.logf("failed to automatically reconnect as %q after %v: %v", cp.Name(), d, err)
 		} else {
 			b.logf("automatically reconnected as %q after %v", cp.Name(), d)
@@ -4332,8 +4571,20 @@ func (b *LocalBackend) stopReconnectTimerLocked() {
 
 // Warning: b.mu must be held on entry, but it unlocks it on the way out.
 // TODO(bradfitz): redo the locking on all these weird methods like this.
-func (b *LocalBackend) editPrefsLockedOnEntry(mp *ipn.MaskedPrefs, unlock unlockOnce) (ipn.PrefsView, error) {
+func (b *LocalBackend) editPrefsLockedOnEntry(actor ipnauth.Actor, mp *ipn.MaskedPrefs, unlock unlockOnce) (ipn.PrefsView, error) {
 	defer unlock() // for error paths
+
+	p0 := b.pm.CurrentPrefs()
+
+	// Check if the changes in mp are allowed.
+	if err := b.checkEditPrefsAccessLocked(actor, p0, mp); err != nil {
+		b.logf("EditPrefs(%v): %v", mp.Pretty(), err)
+		return ipn.PrefsView{}, err
+	}
+
+	// Apply additional changes to mp if necessary,
+	// such as clearing mutually exclusive fields.
+	b.adjustEditPrefsLocked(p0, mp)
 
 	if mp.EggSet {
 		mp.EggSet = false
@@ -4341,7 +4592,6 @@ func (b *LocalBackend) editPrefsLockedOnEntry(mp *ipn.MaskedPrefs, unlock unlock
 		b.goTracker.Go(b.doSetHostinfoFilterServices)
 	}
 
-	p0 := b.pm.CurrentPrefs()
 	p1 := b.pm.CurrentPrefs().AsStruct()
 	p1.ApplyEdits(mp)
 
@@ -4349,29 +4599,18 @@ func (b *LocalBackend) editPrefsLockedOnEntry(mp *ipn.MaskedPrefs, unlock unlock
 		b.logf("EditPrefs check error: %v", err)
 		return ipn.PrefsView{}, err
 	}
-	if p1.RunSSH && !envknob.CanSSHD() {
-		b.logf("EditPrefs requests SSH, but disabled by envknob; returning error")
-		return ipn.PrefsView{}, errors.New("Tailscale SSH server administratively disabled.")
-	}
+
 	if p1.View().Equals(p0) {
 		return stripKeysFromPrefs(p0), nil
 	}
 
 	b.logf("EditPrefs: %v", mp.Pretty())
-	newPrefs := b.setPrefsLockedOnEntry(p1, unlock)
 
-	// This is recorded here in the EditPrefs path, not the setPrefs path on purpose.
-	// recordForEdit records metrics related to edits and changes, not the final state.
-	// If, in the future, we want to record gauge-metrics related to the state of prefs,
-	// that should be done in the setPrefs path.
-	e := prefsMetricsEditEvent{
-		change:                mp,
-		pNew:                  p1.View(),
-		pOld:                  p0,
-		node:                  b.currentNode(),
-		lastSuggestedExitNode: b.lastSuggestedExitNode,
-	}
-	e.record()
+	// Perform any actions required when prefs are edited (typically by a user),
+	// before the modified prefs are actually set for the current profile.
+	b.onEditPrefsLocked(actor, mp, p0, p1.View())
+
+	newPrefs := b.setPrefsLockedOnEntry(p1, unlock)
 
 	// Note: don't perform any actions for the new prefs here. Not
 	// every prefs change goes through EditPrefs. Put your actions
@@ -4438,12 +4677,11 @@ func (b *LocalBackend) setPrefsLockedOnEntry(newp *ipn.Prefs, unlock unlockOnce)
 	if oldp.Valid() {
 		newp.Persist = oldp.Persist().AsStruct() // caller isn't allowed to override this
 	}
-	// applySysPolicy returns whether it updated newp,
-	// but everything in this function treats b.prefs as completely new
+	// Apply reconciliation to the prefs, such as policy overrides,
+	// exit node resolution, and so on. The call returns whether it updated
+	// newp, but everything in this function treats newp as completely new
 	// anyway, so its return value can be ignored here.
-	applySysPolicy(newp, b.lastSuggestedExitNode, b.overrideAlwaysOn)
-	// setExitNodeID does likewise. No-op if no exit node resolution is needed.
-	setExitNodeID(newp, netMap)
+	b.reconcilePrefsLocked(newp)
 
 	// We do this to avoid holding the lock while doing everything else.
 
@@ -5353,6 +5591,24 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 	// WireIngress.
 	hi.WireIngress = b.shouldWireInactiveIngressLocked()
 	hi.AppConnector.Set(prefs.AppConnector().Advertise)
+
+	// The [tailcfg.Hostinfo.ExitNodeID] field tells control which exit node
+	// was selected, if any.
+	//
+	// If auto exit node is enabled (via [ipn.Prefs.AutoExitNode] or
+	// [syspolicy.ExitNodeID]), or an exit node is specified by ExitNodeIP
+	// instead of ExitNodeID , and we don't yet have enough info to resolve
+	// it (usually due to missing netmap or net report), then ExitNodeID in
+	// the prefs may be invalid (typically, [unresolvedExitNodeID]) until
+	// the netmap is available.
+	//
+	// In this case, we shouldn't update the Hostinfo with the bogus
+	// ExitNodeID here; [LocalBackend.ResolveExitNode] will be called once
+	// the netmap and/or net report have been received to both pick the exit
+	// node and notify control of the change.
+	if sid := prefs.ExitNodeID(); sid != unresolvedExitNodeID {
+		hi.ExitNodeID = prefs.ExitNodeID()
+	}
 }
 
 // enterState transitions the backend into newState, updating internal
@@ -5749,7 +6005,7 @@ func (b *LocalBackend) ShouldHandleViaIP(ip netip.Addr) bool {
 
 // Logout logs out the current profile, if any, and waits for the logout to
 // complete.
-func (b *LocalBackend) Logout(ctx context.Context) error {
+func (b *LocalBackend) Logout(ctx context.Context, actor ipnauth.Actor) error {
 	unlock := b.lockAndGetUnlock()
 	defer unlock()
 
@@ -5763,11 +6019,13 @@ func (b *LocalBackend) Logout(ctx context.Context) error {
 	// delete it later.
 	profile := b.pm.CurrentProfile()
 
-	_, err := b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
-		WantRunningSet: true,
-		LoggedOutSet:   true,
-		Prefs:          ipn.Prefs{WantRunning: false, LoggedOut: true},
-	}, unlock)
+	_, err := b.editPrefsLockedOnEntry(
+		actor,
+		&ipn.MaskedPrefs{
+			WantRunningSet: true,
+			LoggedOutSet:   true,
+			Prefs:          ipn.Prefs{WantRunning: false, LoggedOut: true},
+		}, unlock)
 	if err != nil {
 		return err
 	}
@@ -5839,40 +6097,94 @@ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
 	}
 	cc.SetNetInfo(ni)
 	if refresh {
-		unlock := b.lockAndGetUnlock()
-		defer unlock()
-		b.setAutoExitNodeIDLockedOnEntry(unlock)
+		b.RefreshExitNode()
 	}
 }
 
-func (b *LocalBackend) setAutoExitNodeIDLockedOnEntry(unlock unlockOnce) (newPrefs ipn.PrefsView) {
-	var zero ipn.PrefsView
-	defer unlock()
+// RefreshExitNode determines which exit node to use based on the current
+// prefs and netmap and switches to it if needed.
+func (b *LocalBackend) RefreshExitNode() {
+	if b.resolveExitNode() {
+		b.authReconfig()
+	}
+}
 
-	prefs := b.pm.CurrentPrefs()
-	if !prefs.Valid() {
-		b.logf("[unexpected]: received tailnet exit node ID pref change callback but current prefs are nil")
-		return zero
+// resolveExitNode determines which exit node to use based on the current prefs
+// and netmap. It updates the exit node ID in the prefs if needed, updates the
+// exit node ID in the hostinfo if needed, sends a notification to clients, and
+// returns true if the exit node has changed.
+//
+// It is the caller's responsibility to reconfigure routes and actually
+// start using the selected exit node, if needed.
+//
+// b.mu must not be held.
+func (b *LocalBackend) resolveExitNode() (changed bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	nm := b.currentNode().NetMap()
+	prefs := b.pm.CurrentPrefs().AsStruct()
+	if !b.resolveExitNodeInPrefsLocked(prefs) {
+		return
 	}
-	prefsClone := prefs.AsStruct()
-	newSuggestion, err := b.suggestExitNodeLocked(nil)
-	if err != nil {
-		b.logf("setAutoExitNodeID: %v", err)
-		return zero
+
+	if err := b.pm.SetPrefs(prefs.View(), ipn.NetworkProfile{
+		MagicDNSName: nm.MagicDNSSuffix(),
+		DomainName:   nm.DomainName(),
+	}); err != nil {
+		b.logf("failed to save exit node changes: %v", err)
 	}
-	if prefsClone.ExitNodeID == newSuggestion.ID {
-		return zero
+
+	// Send the resolved exit node to control via [tailcfg.Hostinfo].
+	// [LocalBackend.applyPrefsToHostinfoLocked] usually sets the Hostinfo,
+	// but it deferred until this point because there was a bogus ExitNodeID
+	// in the prefs.
+	//
+	// TODO(sfllaw): Mutating b.hostinfo here is undesirable, mutating
+	// in-place doubly so.
+	sid := prefs.ExitNodeID
+	if sid != unresolvedExitNodeID && b.hostinfo.ExitNodeID != sid {
+		b.hostinfo.ExitNodeID = sid
+		b.goTracker.Go(b.doSetHostinfoFilterServices)
 	}
-	prefsClone.ExitNodeID = newSuggestion.ID
-	newPrefs, err = b.editPrefsLockedOnEntry(&ipn.MaskedPrefs{
-		Prefs:         *prefsClone,
-		ExitNodeIDSet: true,
-	}, unlock)
-	if err != nil {
-		b.logf("setAutoExitNodeID: failed to apply exit node ID preference: %v", err)
-		return zero
+
+	b.sendToLocked(ipn.Notify{Prefs: ptr.To(prefs.View())}, allClients)
+	return true
+}
+
+// reconcilePrefsLocked applies policy overrides, exit node resolution,
+// and other post-processing to the prefs, and reports whether the prefs
+// were modified as a result.
+//
+// It must not perform any reconfiguration, as the prefs are not yet effective.
+//
+// b.mu must be held.
+func (b *LocalBackend) reconcilePrefsLocked(prefs *ipn.Prefs) (changed bool) {
+	if b.applySysPolicyLocked(prefs) {
+		changed = true
 	}
-	return newPrefs
+	if b.resolveExitNodeInPrefsLocked(prefs) {
+		changed = true
+	}
+	if changed {
+		b.logf("prefs reconciled: %v", prefs.Pretty())
+	}
+	return changed
+}
+
+// resolveExitNodeInPrefsLocked determines which exit node to use
+// based on the specified prefs and netmap. It updates the exit node ID
+// in the prefs if needed, and returns true if the exit node has changed.
+//
+// b.mu must be held.
+func (b *LocalBackend) resolveExitNodeInPrefsLocked(prefs *ipn.Prefs) (changed bool) {
+	if b.resolveAutoExitNodeLocked(prefs) {
+		changed = true
+	}
+	if b.resolveExitNodeIPLocked(prefs) {
+		changed = true
+	}
+	return changed
 }
 
 // setNetMapLocked updates the LocalBackend state to reflect the newly
@@ -6657,6 +6969,10 @@ func (b *LocalBackend) DebugReSTUN() error {
 	return nil
 }
 
+func (b *LocalBackend) DebugPeerRelayServers() set.Set[netip.Addr] {
+	return b.MagicConn().PeerRelays()
+}
+
 // ControlKnobs returns the node's control knobs.
 func (b *LocalBackend) ControlKnobs() *controlknobs.Knobs {
 	return b.sys.ControlKnobs()
@@ -7041,6 +7357,7 @@ func (b *LocalBackend) resetForProfileChangeLockedOnEntry(unlock unlockOnce) err
 	b.serveConfig = ipn.ServeConfigView{}
 	b.lastSuggestedExitNode = ""
 	b.keyExpired = false
+	b.overrideExitNodePolicy = false
 	b.resetAlwaysOnOverrideLocked()
 	b.extHost.NotifyProfileChange(b.pm.CurrentProfile(), b.pm.CurrentPrefs(), false)
 	b.setAtomicValuesFromPrefsLocked(b.pm.CurrentPrefs())
@@ -7375,27 +7692,17 @@ func allowedAutoRoute(ipp netip.Prefix) bool {
 
 var ErrNoPreferredDERP = errors.New("no preferred DERP, try again later")
 
-// suggestExitNodeLocked computes a suggestion based on the current netmap and last netcheck report. If
-// there are multiple equally good options, one is selected at random, so the result is not stable. To be
-// eligible for consideration, the peer must have NodeAttrSuggestExitNode in its CapMap.
-//
-// Currently, peers with a DERP home are preferred over those without (typically this means Mullvad).
-// Peers are selected based on having a DERP home that is the lowest latency to this device. For peers
-// without a DERP home, we look for geographic proximity to this device's DERP home.
-//
-// netMap is an optional netmap to use that overrides b.netMap (needed for SetControlClientStatus before b.netMap is updated).
-// If netMap is nil, then b.netMap is used.
+// suggestExitNodeLocked computes a suggestion based on the current netmap and
+// other optional factors. If there are multiple equally good options, one may
+// be selected at random, so the result is not stable. To be eligible for
+// consideration, the peer must have NodeAttrSuggestExitNode in its CapMap.
 //
 // b.mu.lock() must be held.
-func (b *LocalBackend) suggestExitNodeLocked(netMap *netmap.NetworkMap) (response apitype.ExitNodeSuggestionResponse, err error) {
-	// netMap is an optional netmap to use that overrides b.netMap (needed for SetControlClientStatus before b.netMap is updated). If netMap is nil, then b.netMap is used.
-	if netMap == nil {
-		netMap = b.NetMap()
-	}
+func (b *LocalBackend) suggestExitNodeLocked() (response apitype.ExitNodeSuggestionResponse, err error) {
 	lastReport := b.MagicConn().GetLastNetcheckReport(b.ctx)
 	prevSuggestion := b.lastSuggestedExitNode
 
-	res, err := suggestExitNode(lastReport, netMap, prevSuggestion, randomRegion, randomNode, b.getAllowedSuggestions())
+	res, err := suggestExitNode(lastReport, b.currentNode(), prevSuggestion, randomRegion, randomNode, b.getAllowedSuggestions())
 	if err != nil {
 		return res, err
 	}
@@ -7406,7 +7713,7 @@ func (b *LocalBackend) suggestExitNodeLocked(netMap *netmap.NetworkMap) (respons
 func (b *LocalBackend) SuggestExitNode() (response apitype.ExitNodeSuggestionResponse, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.suggestExitNodeLocked(nil)
+	return b.suggestExitNodeLocked()
 }
 
 // getAllowedSuggestions returns a set of exit nodes permitted by the most recent
@@ -7450,22 +7757,48 @@ func fillAllowedSuggestions() set.Set[tailcfg.StableNodeID] {
 	return s
 }
 
-func suggestExitNode(report *netcheck.Report, netMap *netmap.NetworkMap, prevSuggestion tailcfg.StableNodeID, selectRegion selectRegionFunc, selectNode selectNodeFunc, allowList set.Set[tailcfg.StableNodeID]) (res apitype.ExitNodeSuggestionResponse, err error) {
+// suggestExitNode returns a suggestion for reasonably good exit node based on
+// the current netmap and the previous suggestion.
+func suggestExitNode(report *netcheck.Report, nb *nodeBackend, prevSuggestion tailcfg.StableNodeID, selectRegion selectRegionFunc, selectNode selectNodeFunc, allowList set.Set[tailcfg.StableNodeID]) (res apitype.ExitNodeSuggestionResponse, err error) {
+	switch {
+	case nb.SelfHasCap(tailcfg.NodeAttrTrafficSteering):
+		// The traffic-steering feature flag is enabled on this tailnet.
+		return suggestExitNodeUsingTrafficSteering(nb, allowList)
+	default:
+		return suggestExitNodeUsingDERP(report, nb, prevSuggestion, selectRegion, selectNode, allowList)
+	}
+}
+
+// suggestExitNodeUsingDERP is the classic algorithm used to suggest exit nodes,
+// before traffic steering was implemented. This handles the plain failover
+// case, in addition to the optional Regional Routing.
+//
+// It computes a suggestion based on the current netmap and last netcheck
+// report. If there are multiple equally good options, one is selected at
+// random, so the result is not stable. To be eligible for consideration, the
+// peer must have NodeAttrSuggestExitNode in its CapMap.
+//
+// Currently, peers with a DERP home are preferred over those without (typically
+// this means Mullvad). Peers are selected based on having a DERP home that is
+// the lowest latency to this device. For peers without a DERP home, we look for
+// geographic proximity to this device's DERP home.
+func suggestExitNodeUsingDERP(report *netcheck.Report, nb *nodeBackend, prevSuggestion tailcfg.StableNodeID, selectRegion selectRegionFunc, selectNode selectNodeFunc, allowList set.Set[tailcfg.StableNodeID]) (res apitype.ExitNodeSuggestionResponse, err error) {
+	netMap := nb.NetMap()
 	if report == nil || report.PreferredDERP == 0 || netMap == nil || netMap.DERPMap == nil {
 		return res, ErrNoPreferredDERP
 	}
-	candidates := make([]tailcfg.NodeView, 0, len(netMap.Peers))
-	for _, peer := range netMap.Peers {
-		if !peer.Valid() {
-			continue
+	// Use [nodeBackend.AppendMatchingPeers] instead of the netmap directly,
+	// since the netmap doesn't include delta updates (e.g., home DERP or Online
+	// status changes) from the control plane since the last full update.
+	candidates := nb.AppendMatchingPeers(nil, func(peer tailcfg.NodeView) bool {
+		if !peer.Valid() || !peer.Online().Get() {
+			return false
 		}
 		if allowList != nil && !allowList.Contains(peer.StableID()) {
-			continue
+			return false
 		}
-		if peer.CapMap().Contains(tailcfg.NodeAttrSuggestExitNode) && tsaddr.ContainsExitRoutes(peer.AllowedIPs()) {
-			candidates = append(candidates, peer)
-		}
-	}
+		return peer.CapMap().Contains(tailcfg.NodeAttrSuggestExitNode) && tsaddr.ContainsExitRoutes(peer.AllowedIPs())
+	})
 	if len(candidates) == 0 {
 		return res, nil
 	}
@@ -7570,6 +7903,103 @@ func suggestExitNode(report *netcheck.Report, netMap *netmap.NetworkMap, prevSug
 	return res, nil
 }
 
+var ErrNoNetMap = errors.New("no network map, try again later")
+
+// suggestExitNodeUsingTrafficSteering uses traffic steering priority scores to
+// pick one of the best exit nodes. These priorities are provided by Control in
+// the node’s [tailcfg.Location]. To be eligible for consideration, the node
+// must have NodeAttrSuggestExitNode in its CapMap.
+func suggestExitNodeUsingTrafficSteering(nb *nodeBackend, allowed set.Set[tailcfg.StableNodeID]) (apitype.ExitNodeSuggestionResponse, error) {
+	nm := nb.NetMap()
+	if nm == nil {
+		return apitype.ExitNodeSuggestionResponse{}, ErrNoNetMap
+	}
+
+	self := nb.Self()
+	if !self.Valid() {
+		return apitype.ExitNodeSuggestionResponse{}, ErrNoNetMap
+	}
+
+	if !nb.SelfHasCap(tailcfg.NodeAttrTrafficSteering) {
+		panic("missing traffic-steering capability")
+	}
+
+	var force tailcfg.NodeView
+	nodes := nb.AppendMatchingPeers(nil, func(p tailcfg.NodeView) bool {
+		if !p.Valid() {
+			return false
+		}
+		if !p.Online().Get() {
+			return false
+		}
+		if allowed != nil && !allowed.Contains(p.StableID()) {
+			return false
+		}
+		if !p.CapMap().Contains(tailcfg.NodeAttrSuggestExitNode) {
+			return false
+		}
+		if !tsaddr.ContainsExitRoutes(p.AllowedIPs()) {
+			return false
+		}
+		return true
+	})
+	if force.Valid() {
+		nodes = append(nodes[:0], force)
+	}
+
+	scores := make(map[tailcfg.NodeID]int, len(nodes))
+	score := func(n tailcfg.NodeView) int {
+		id := n.ID()
+		s, ok := scores[id]
+		if !ok {
+			s = 0 // score of zero means incomparable
+			if hi := n.Hostinfo(); hi.Valid() {
+				if loc := hi.Location(); loc.Valid() {
+					s = loc.Priority()
+				}
+			}
+			scores[id] = s
+		}
+		return s
+	}
+	rdvHash := makeRendezvousHasher(self.ID())
+
+	var pick tailcfg.NodeView
+	if len(nodes) == 1 {
+		pick = nodes[0]
+	}
+	if len(nodes) > 1 {
+		// Find the highest scoring exit nodes.
+		slices.SortFunc(nodes, func(a, b tailcfg.NodeView) int {
+			c := cmp.Compare(score(b), score(a)) // Highest score first.
+			if c == 0 {
+				// Rendezvous hashing for reliably picking the
+				// same node from a list: tailscale/tailscale#16551.
+				return cmp.Compare(rdvHash(b.ID()), rdvHash(a.ID()))
+			}
+			return c
+		})
+
+		// TODO(sfllaw): add a temperature knob so that this client has
+		// a chance of picking the next best option.
+		pick = nodes[0]
+	}
+
+	if !pick.Valid() {
+		return apitype.ExitNodeSuggestionResponse{}, nil
+	}
+	res := apitype.ExitNodeSuggestionResponse{
+		ID:   pick.StableID(),
+		Name: pick.Name(),
+	}
+	if hi := pick.Hostinfo(); hi.Valid() {
+		if loc := hi.Location(); loc.Valid() {
+			res.Location = loc
+		}
+	}
+	return res, nil
+}
+
 // pickWeighted chooses the node with highest priority given a list of mullvad nodes.
 func pickWeighted(candidates []tailcfg.NodeView) []tailcfg.NodeView {
 	maxWeight := 0
@@ -7653,10 +8083,39 @@ func longLatDistance(fromLat, fromLong, toLat, toLong float64) float64 {
 	return earthRadiusMeters * c
 }
 
-// shouldAutoExitNode checks for the auto exit node MDM policy.
-func shouldAutoExitNode() bool {
-	exitNodeIDStr, _ := syspolicy.GetString(syspolicy.ExitNodeID, "")
-	return exitNodeIDStr == "auto:any"
+// makeRendezvousHasher returns a function that hashes a node ID to a uint64.
+// https://en.wikipedia.org/wiki/Rendezvous_hashing
+func makeRendezvousHasher(seed tailcfg.NodeID) func(tailcfg.NodeID) uint64 {
+	en := binary.BigEndian
+	return func(n tailcfg.NodeID) uint64 {
+		var b [16]byte
+		en.PutUint64(b[:], uint64(seed))
+		en.PutUint64(b[8:], uint64(n))
+		v := sha256.Sum256(b[:])
+		return en.Uint64(v[:])
+	}
+}
+
+const (
+	// unresolvedExitNodeID is a special [tailcfg.StableNodeID] value
+	// used as an exit node ID to install a blackhole route, preventing
+	// accidental non-exit-node usage until the [ipn.ExitNodeExpression]
+	// is evaluated and an actual exit node is selected.
+	//
+	// We use "auto:any" for compatibility with older, pre-[ipn.ExitNodeExpression]
+	// clients that have been using "auto:any" for this purpose for a long time.
+	unresolvedExitNodeID tailcfg.StableNodeID = "auto:any"
+)
+
+func isAllowedAutoExitNodeID(exitNodeID tailcfg.StableNodeID) bool {
+	if exitNodeID == "" {
+		return false // an exit node is required
+	}
+	if nodes, _ := syspolicy.GetStringArray(syspolicy.AllowedSuggestedExitNodes, nil); nodes != nil {
+		return slices.Contains(nodes, string(exitNodeID))
+
+	}
+	return true // no policy configured; allow all exit nodes
 }
 
 // startAutoUpdate triggers an auto-update attempt. The actual update happens
@@ -7801,3 +8260,29 @@ func (b *LocalBackend) vipServicesFromPrefsLocked(prefs ipn.PrefsView) []*tailcf
 var (
 	metricCurrentWatchIPNBus = clientmetric.NewGauge("localbackend_current_watch_ipn_bus")
 )
+
+func (b *LocalBackend) stateEncrypted() opt.Bool {
+	switch runtime.GOOS {
+	case "android", "ios":
+		return opt.NewBool(true)
+	case "darwin":
+		switch {
+		case version.IsMacAppStore():
+			return opt.NewBool(true)
+		case version.IsMacSysExt():
+			// MacSys still stores its state in plaintext on disk in addition to
+			// the Keychain. A future release will clean up the on-disk state
+			// files.
+			// TODO(#15830): always return true here once MacSys is fully migrated.
+			sp, _ := syspolicy.GetBoolean(syspolicy.EncryptState, false)
+			return opt.NewBool(sp)
+		default:
+			// Probably self-compiled tailscaled, we don't use the Keychain
+			// there.
+			return opt.NewBool(false)
+		}
+	default:
+		_, ok := b.store.(ipn.EncryptedStateStore)
+		return opt.NewBool(ok)
+	}
+}

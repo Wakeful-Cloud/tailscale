@@ -44,8 +44,10 @@ func init() {
 func info() *tailcfg.TPMInfo {
 	tpm, err := open()
 	if err != nil {
+		log.Printf("TPM: error opening: %v", err)
 		return nil
 	}
+	log.Printf("TPM: successfully opened")
 	defer tpm.Close()
 
 	info := new(tailcfg.TPMInfo)
@@ -74,10 +76,12 @@ func info() *tailcfg.TPMInfo {
 			PropertyCount: 1,
 		}.Execute(tpm)
 		if err != nil {
+			log.Printf("TPM: GetCapability %v: %v", cap.prop, err)
 			continue
 		}
 		props, err := resp.CapabilityData.Data.TPMProperties()
 		if err != nil {
+			log.Printf("TPM: GetCapability %v: %v", cap.prop, err)
 			continue
 		}
 		if len(props.TPMProperty) == 0 {
@@ -159,6 +163,8 @@ func newStore(logf logger.Logf, path string) (ipn.StateStore, error) {
 // tpmStore is an ipn.StateStore that stores the state in a secretbox-encrypted
 // file using a TPM-sealed symmetric key.
 type tpmStore struct {
+	ipn.EncryptedStateStore
+
 	logf logger.Logf
 	path string
 	key  [32]byte

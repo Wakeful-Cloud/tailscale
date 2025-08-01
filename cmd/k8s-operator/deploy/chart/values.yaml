@@ -9,6 +9,9 @@ oauth: {}
   # clientId: ""
   # clientSecret: ""
 
+# URL of the control plane to be used by all resources managed by the operator.
+loginServer: ""
+
 # Secret volume.
 # If set it defines the volume the oauth secrets will be mounted from.
 # The volume needs to contain two files named `client_id` and `client_secret`.
@@ -74,6 +77,10 @@ operatorConfig:
 
 # In the case that you already have a tailscale ingressclass in your cluster (or vcluster), you can disable the creation here
 ingressClass:
+  # Allows for customization of the ingress class name used by the operator to identify ingresses to reconcile. This does
+  # not allow multiple operator instances to manage different ingresses, but provides an onboarding route for users that
+  # may have previously set up ingress classes named "tailscale" prior to using the operator.
+  name: "tailscale"
   enabled: true
 
 # proxyConfig contains configuraton that will be applied to any ingress/egress
@@ -85,6 +92,13 @@ ingressClass:
 # If you need more configuration options, take a look at ProxyClass:
 # https://tailscale.com/kb/1445/kubernetes-operator-customization#cluster-resource-customization-using-proxyclass-custom-resource
 proxyConfig:
+  # Configure the proxy image to use instead of the default tailscale/tailscale:latest.
+  # Applying a ProxyClass with `spec.statefulSet.pod.tailscaleContainer.image`
+  # set will override any defaults here.
+  #
+  # Note that ProxyGroups of type "kube-apiserver" use a different default image,
+  # tailscale/k8s-proxy:latest, and it is currently only possible to override
+  # that image via the same ProxyClass field.
   image:
     # Repository defaults to DockerHub, but images are also synced to ghcr.io/tailscale/tailscale.
     repository: tailscale/tailscale
@@ -108,6 +122,15 @@ proxyConfig:
 # Kubernetes API server.
 # https://tailscale.com/kb/1437/kubernetes-operator-api-server-proxy
 apiServerProxyConfig:
+  # Set to "true" to create the ClusterRole permissions required for the API
+  # server proxy's auth mode. In auth mode, the API server proxy impersonates
+  # groups and users based on tailnet ACL grants. Required for ProxyGroups of
+  # type "kube-apiserver" running in auth mode.
+  allowImpersonation: "false" # "true", "false"
+
+  # If true or noauth, the operator will run an in-process API server proxy.
+  # You can deploy a ProxyGroup of type "kube-apiserver" to run a high
+  # availability set of API server proxies instead.
   mode: "false" # "true", "false", "noauth"
 
 imagePullSecrets: []

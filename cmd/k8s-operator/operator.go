@@ -26,6 +26,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	klabels "k8s.io/apimachinery/pkg/labels"
@@ -43,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
@@ -76,11 +78,14 @@ func main() {
 		tsNamespace           = defaultEnv("OPERATOR_NAMESPACE", "")
 		tslogging             = defaultEnv("OPERATOR_LOGGING", "info")
 		image                 = defaultEnv("PROXY_IMAGE", "tailscale/tailscale:latest")
+		k8sProxyImage         = defaultEnv("K8S_PROXY_IMAGE", "tailscale/k8s-proxy:latest")
 		priorityClassName     = defaultEnv("PROXY_PRIORITY_CLASS_NAME", "")
 		tags                  = defaultEnv("PROXY_TAGS", "tag:k8s")
 		tsFirewallMode        = defaultEnv("PROXY_FIREWALL_MODE", "")
 		defaultProxyClass     = defaultEnv("PROXY_DEFAULT_CLASS", "")
 		isDefaultLoadBalancer = defaultBool("OPERATOR_DEFAULT_LOAD_BALANCER", false)
+		loginServer           = strings.TrimSuffix(defaultEnv("OPERATOR_LOGIN_SERVER", ""), "/")
+		ingressClassName      = defaultEnv("OPERATOR_INGRESS_CLASS_NAME", "tailscale")
 	)
 
 	var opts []kzap.Opts
@@ -107,17 +112,27 @@ func main() {
 	// The operator can run either as a plain operator or it can
 	// additionally act as api-server proxy
 	// https://tailscale.com/kb/1236/kubernetes-operator/?q=kubernetes#accessing-the-kubernetes-control-plane-using-an-api-server-proxy.
-	mode := apiproxy.ParseAPIProxyMode()
-	if mode == apiproxy.APIServerProxyModeDisabled {
+	mode := parseAPIProxyMode()
+	if mode == nil {
 		hostinfo.SetApp(kubetypes.AppOperator)
 	} else {
-		hostinfo.SetApp(kubetypes.AppAPIServerProxy)
+		hostinfo.SetApp(kubetypes.AppInProcessAPIServerProxy)
 	}
 
-	s, tsc := initTSNet(zlog)
+	s, tsc := initTSNet(zlog, loginServer)
 	defer s.Close()
 	restConfig := config.GetConfigOrDie()
-	apiproxy.MaybeLaunchAPIServerProxy(zlog, restConfig, s, mode)
+	if mode != nil {
+		ap, err := apiproxy.NewAPIServerProxy(zlog, restConfig, s, *mode, true)
+		if err != nil {
+			zlog.Fatalf("error creating API server proxy: %v", err)
+		}
+		go func() {
+			if err := ap.Run(context.Background()); err != nil {
+				zlog.Fatalf("error running API server proxy: %v", err)
+			}
+		}()
+	}
 	rOpts := reconcilerOpts{
 		log:                           zlog,
 		tsServer:                      s,
@@ -125,11 +140,14 @@ func main() {
 		tailscaleNamespace:            tsNamespace,
 		restConfig:                    restConfig,
 		proxyImage:                    image,
+		k8sProxyImage:                 k8sProxyImage,
 		proxyPriorityClassName:        priorityClassName,
 		proxyActAsDefaultLoadBalancer: isDefaultLoadBalancer,
 		proxyTags:                     tags,
 		proxyFirewallMode:             tsFirewallMode,
 		defaultProxyClass:             defaultProxyClass,
+		loginServer:                   loginServer,
+		ingressClassName:              ingressClassName,
 	}
 	runReconcilers(rOpts)
 }
@@ -137,7 +155,7 @@ func main() {
 // initTSNet initializes the tsnet.Server and logs in to Tailscale. It uses the
 // CLIENT_ID_FILE and CLIENT_SECRET_FILE environment variables to authenticate
 // with Tailscale.
-func initTSNet(zlog *zap.SugaredLogger) (*tsnet.Server, tsClient) {
+func initTSNet(zlog *zap.SugaredLogger, loginServer string) (*tsnet.Server, tsClient) {
 	var (
 		clientIDPath     = defaultEnv("CLIENT_ID_FILE", "")
 		clientSecretPath = defaultEnv("CLIENT_SECRET_FILE", "")
@@ -149,13 +167,14 @@ func initTSNet(zlog *zap.SugaredLogger) (*tsnet.Server, tsClient) {
 	if clientIDPath == "" || clientSecretPath == "" {
 		startlog.Fatalf("CLIENT_ID_FILE and CLIENT_SECRET_FILE must be set")
 	}
-	tsc, err := newTSClient(context.Background(), clientIDPath, clientSecretPath)
+	tsc, err := newTSClient(context.Background(), clientIDPath, clientSecretPath, loginServer)
 	if err != nil {
 		startlog.Fatalf("error creating Tailscale client: %v", err)
 	}
 	s := &tsnet.Server{
-		Hostname: hostname,
-		Logf:     zlog.Named("tailscaled").Debugf,
+		Hostname:   hostname,
+		Logf:       zlog.Named("tailscaled").Debugf,
+		ControlURL: loginServer,
 	}
 	if p := os.Getenv("TS_PORT"); p != "" {
 		port, err := strconv.ParseUint(p, 10, 16)
@@ -307,6 +326,7 @@ func runReconcilers(opts reconcilerOpts) {
 		proxyImage:             opts.proxyImage,
 		proxyPriorityClassName: opts.proxyPriorityClassName,
 		tsFirewallMode:         opts.proxyFirewallMode,
+		loginServer:            opts.tsServer.ControlURL,
 	}
 
 	err = builder.
@@ -338,7 +358,7 @@ func runReconcilers(opts reconcilerOpts) {
 	// ProxyClass's name.
 	proxyClassFilterForIngress := handler.EnqueueRequestsFromMapFunc(proxyClassHandlerForIngress(mgr.GetClient(), startlog))
 	// Enque Ingress if a managed Service or backend Service associated with a tailscale Ingress changes.
-	svcHandlerForIngress := handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngress(mgr.GetClient(), startlog))
+	svcHandlerForIngress := handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngress(mgr.GetClient(), startlog, opts.ingressClassName))
 	err = builder.
 		ControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
@@ -353,6 +373,7 @@ func runReconcilers(opts reconcilerOpts) {
 			Client:            mgr.GetClient(),
 			logger:            opts.log.Named("ingress-reconciler"),
 			defaultProxyClass: opts.defaultProxyClass,
+			ingressClassName:  opts.ingressClassName,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create ingress reconciler: %v", err)
@@ -374,19 +395,20 @@ func runReconcilers(opts reconcilerOpts) {
 		ControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{}).
 		Named("ingress-pg-reconciler").
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngressPG(mgr.GetClient(), startlog))).
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngressPG(mgr.GetClient(), startlog, opts.ingressClassName))).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(HAIngressesFromSecret(mgr.GetClient(), startlog))).
 		Watches(&tsapi.ProxyGroup{}, ingressProxyGroupFilter).
 		Complete(&HAIngressReconciler{
-			recorder:    eventRecorder,
-			tsClient:    opts.tsClient,
-			tsnetServer: opts.tsServer,
-			defaultTags: strings.Split(opts.proxyTags, ","),
-			Client:      mgr.GetClient(),
-			logger:      opts.log.Named("ingress-pg-reconciler"),
-			lc:          lc,
-			operatorID:  id,
-			tsNamespace: opts.tailscaleNamespace,
+			recorder:         eventRecorder,
+			tsClient:         opts.tsClient,
+			tsnetServer:      opts.tsServer,
+			defaultTags:      strings.Split(opts.proxyTags, ","),
+			Client:           mgr.GetClient(),
+			logger:           opts.log.Named("ingress-pg-reconciler"),
+			lc:               lc,
+			operatorID:       id,
+			tsNamespace:      opts.tailscaleNamespace,
+			ingressClassName: opts.ingressClassName,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create ingress-pg-reconciler: %v", err)
@@ -406,7 +428,6 @@ func runReconcilers(opts reconcilerOpts) {
 		Complete(&HAServiceReconciler{
 			recorder:    eventRecorder,
 			tsClient:    opts.tsClient,
-			tsnetServer: opts.tsServer,
 			defaultTags: strings.Split(opts.proxyTags, ","),
 			Client:      mgr.GetClient(),
 			logger:      opts.log.Named("service-pg-reconciler"),
@@ -606,22 +627,50 @@ func runReconcilers(opts reconcilerOpts) {
 			l:           opts.log.Named("recorder-reconciler"),
 			clock:       tstime.DefaultClock{},
 			tsClient:    opts.tsClient,
+			loginServer: opts.loginServer,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create Recorder reconciler: %v", err)
+	}
+
+	// kube-apiserver's Tailscale Service reconciler.
+	err = builder.
+		ControllerManagedBy(mgr).
+		For(&tsapi.ProxyGroup{}, builder.WithPredicates(
+			predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				pg, ok := obj.(*tsapi.ProxyGroup)
+				return ok && pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer
+			}),
+		)).
+		Named("kube-apiserver-ts-service-reconciler").
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(kubeAPIServerPGsFromSecret(mgr.GetClient(), startlog))).
+		Complete(&KubeAPIServerTSServiceReconciler{
+			Client:      mgr.GetClient(),
+			recorder:    eventRecorder,
+			logger:      opts.log.Named("kube-apiserver-ts-service-reconciler"),
+			tsClient:    opts.tsClient,
+			tsNamespace: opts.tailscaleNamespace,
+			lc:          lc,
+			defaultTags: strings.Split(opts.proxyTags, ","),
+			operatorID:  id,
+			clock:       tstime.DefaultClock{},
+		})
+	if err != nil {
+		startlog.Fatalf("could not create Kubernetes API server Tailscale Service reconciler: %v", err)
 	}
 
 	// ProxyGroup reconciler.
 	ownedByProxyGroupFilter := handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &tsapi.ProxyGroup{})
 	proxyClassFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(proxyClassHandlerForProxyGroup(mgr.GetClient(), startlog))
 	nodeFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(nodeHandlerForProxyGroup(mgr.GetClient(), opts.defaultProxyClass, startlog))
+	saFilterForProxyGroup := handler.EnqueueRequestsFromMapFunc(serviceAccountHandlerForProxyGroup(mgr.GetClient(), startlog))
 	err = builder.ControllerManagedBy(mgr).
 		For(&tsapi.ProxyGroup{}).
 		Named("proxygroup-reconciler").
 		Watches(&corev1.Service{}, ownedByProxyGroupFilter).
 		Watches(&appsv1.StatefulSet{}, ownedByProxyGroupFilter).
 		Watches(&corev1.ConfigMap{}, ownedByProxyGroupFilter).
-		Watches(&corev1.ServiceAccount{}, ownedByProxyGroupFilter).
+		Watches(&corev1.ServiceAccount{}, saFilterForProxyGroup).
 		Watches(&corev1.Secret{}, ownedByProxyGroupFilter).
 		Watches(&rbacv1.Role{}, ownedByProxyGroupFilter).
 		Watches(&rbacv1.RoleBinding{}, ownedByProxyGroupFilter).
@@ -635,10 +684,12 @@ func runReconcilers(opts reconcilerOpts) {
 			tsClient: opts.tsClient,
 
 			tsNamespace:       opts.tailscaleNamespace,
-			proxyImage:        opts.proxyImage,
+			tsProxyImage:      opts.proxyImage,
+			k8sProxyImage:     opts.k8sProxyImage,
 			defaultTags:       strings.Split(opts.proxyTags, ","),
 			tsFirewallMode:    opts.proxyFirewallMode,
 			defaultProxyClass: opts.defaultProxyClass,
+			loginServer:       opts.tsServer.ControlURL,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create ProxyGroup reconciler: %v", err)
@@ -657,6 +708,7 @@ type reconcilerOpts struct {
 	tailscaleNamespace string       // namespace in which operator resources will be deployed
 	restConfig         *rest.Config // config for connecting to the kube API server
 	proxyImage         string       // <proxy-image-repo>:<proxy-image-tag>
+	k8sProxyImage      string       // <k8s-proxy-image-repo>:<k8s-proxy-image-tag>
 	// proxyPriorityClassName isPriorityClass to be set for proxy Pods. This
 	// is a legacy mechanism for cluster resource configuration options -
 	// going forward use ProxyClass.
@@ -688,6 +740,11 @@ type reconcilerOpts struct {
 	// class for proxies that do not have a ProxyClass set.
 	// this is defined by an operator env variable.
 	defaultProxyClass string
+	// loginServer is the coordination server URL that should be used by managed resources.
+	loginServer string
+	// ingressClassName is the name of the ingress class used by reconcilers of Ingress resources. This defaults
+	// to "tailscale" but can be customised.
+	ingressClassName string
 }
 
 // enqueueAllIngressEgressProxySvcsinNS returns a reconcile request for each
@@ -980,8 +1037,8 @@ func nodeHandlerForProxyGroup(cl client.Client, defaultProxyClass string, logger
 }
 
 // proxyClassHandlerForProxyGroup returns a handler that, for a given ProxyClass,
-// returns a list of reconcile requests for all Connectors that have
-// .spec.proxyClass set.
+// returns a list of reconcile requests for all ProxyGroups that have
+// .spec.proxyClass set to that ProxyClass.
 func proxyClassHandlerForProxyGroup(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		pgList := new(tsapi.ProxyGroupList)
@@ -1000,13 +1057,44 @@ func proxyClassHandlerForProxyGroup(cl client.Client, logger *zap.SugaredLogger)
 	}
 }
 
+// serviceAccountHandlerForProxyGroup returns a handler that, for a given ServiceAccount,
+// returns a list of reconcile requests for all ProxyGroups that use that ServiceAccount.
+// For most ProxyGroups, this will be a dedicated ServiceAccount owned by a specific
+// ProxyGroup. But for kube-apiserver ProxyGroups running in auth mode, they use a shared
+// static ServiceAccount named "kube-apiserver-auth-proxy".
+func serviceAccountHandlerForProxyGroup(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		pgList := new(tsapi.ProxyGroupList)
+		if err := cl.List(ctx, pgList); err != nil {
+			logger.Debugf("error listing ProxyGroups for ServiceAccount: %v", err)
+			return nil
+		}
+		reqs := make([]reconcile.Request, 0)
+		saName := o.GetName()
+		for _, pg := range pgList.Items {
+			if saName == authAPIServerProxySAName && isAuthAPIServerProxy(&pg) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pg)})
+			}
+			expectedOwner := pgOwnerReference(&pg)[0]
+			saOwnerRefs := o.GetOwnerReferences()
+			for _, ref := range saOwnerRefs {
+				if apiequality.Semantic.DeepEqual(ref, expectedOwner) {
+					reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pg)})
+					break
+				}
+			}
+		}
+		return reqs
+	}
+}
+
 // serviceHandlerForIngress returns a handler for Service events for ingress
 // reconciler that ensures that if the Service associated with an event is of
 // interest to the reconciler, the associated Ingress(es) gets be reconciled.
 // The Services of interest are backend Services for tailscale Ingress and
 // managed Services for an StatefulSet for a proxy configured for tailscale
 // Ingress
-func serviceHandlerForIngress(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+func serviceHandlerForIngress(cl client.Client, logger *zap.SugaredLogger, ingressClassName string) handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		if isManagedByType(o, "ingress") {
 			ingName := parentFromObjectLabels(o)
@@ -1019,7 +1107,7 @@ func serviceHandlerForIngress(cl client.Client, logger *zap.SugaredLogger) handl
 		}
 		reqs := make([]reconcile.Request, 0)
 		for _, ing := range ingList.Items {
-			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != tailscaleIngressClassName {
+			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != ingressClassName {
 				return nil
 			}
 			if hasProxyGroupAnnotation(&ing) {
@@ -1152,7 +1240,7 @@ func egressEpsFromPGStateSecrets(cl client.Client, ns string) handler.MapFunc {
 		if parentType := o.GetLabels()[LabelParentType]; parentType != "proxygroup" {
 			return nil
 		}
-		if secretType := o.GetLabels()[kubetypes.LabelSecretType]; secretType != "state" {
+		if secretType := o.GetLabels()[kubetypes.LabelSecretType]; secretType != kubetypes.LabelSecretTypeState {
 			return nil
 		}
 		pg, ok := o.GetLabels()[LabelParentName]
@@ -1242,7 +1330,7 @@ func reconcileRequestsForPG(pg string, cl client.Client, ns string) []reconcile.
 func isTLSSecret(secret *corev1.Secret) bool {
 	return secret.Type == corev1.SecretTypeTLS &&
 		secret.ObjectMeta.Labels[kubetypes.LabelManaged] == "true" &&
-		secret.ObjectMeta.Labels[kubetypes.LabelSecretType] == "certs" &&
+		secret.ObjectMeta.Labels[kubetypes.LabelSecretType] == kubetypes.LabelSecretTypeCerts &&
 		secret.ObjectMeta.Labels[labelDomain] != "" &&
 		secret.ObjectMeta.Labels[labelProxyGroup] != ""
 }
@@ -1250,7 +1338,7 @@ func isTLSSecret(secret *corev1.Secret) bool {
 func isPGStateSecret(secret *corev1.Secret) bool {
 	return secret.ObjectMeta.Labels[kubetypes.LabelManaged] == "true" &&
 		secret.ObjectMeta.Labels[LabelParentType] == "proxygroup" &&
-		secret.ObjectMeta.Labels[kubetypes.LabelSecretType] == "state"
+		secret.ObjectMeta.Labels[kubetypes.LabelSecretType] == kubetypes.LabelSecretTypeState
 }
 
 // HAIngressesFromSecret returns a handler that returns reconcile requests for
@@ -1329,6 +1417,42 @@ func HAServicesFromSecret(cl client.Client, logger *zap.SugaredLogger) handler.M
 			})
 		}
 		return reqs
+	}
+}
+
+// kubeAPIServerPGsFromSecret finds ProxyGroups of type "kube-apiserver" that
+// need to be reconciled after a ProxyGroup-owned Secret is updated.
+func kubeAPIServerPGsFromSecret(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		secret, ok := o.(*corev1.Secret)
+		if !ok {
+			logger.Infof("[unexpected] Secret handler triggered for an object that is not a Secret")
+			return nil
+		}
+		if secret.ObjectMeta.Labels[kubetypes.LabelManaged] != "true" ||
+			secret.ObjectMeta.Labels[LabelParentType] != "proxygroup" {
+			return nil
+		}
+
+		var pg tsapi.ProxyGroup
+		if err := cl.Get(ctx, types.NamespacedName{Name: secret.ObjectMeta.Labels[LabelParentName]}, &pg); err != nil {
+			logger.Infof("error getting ProxyGroup %s: %v", secret.ObjectMeta.Labels[LabelParentName], err)
+			return nil
+		}
+
+		if pg.Spec.Type != tsapi.ProxyGroupTypeKubernetesAPIServer {
+			return nil
+		}
+
+		return []reconcile.Request{
+			{
+				NamespacedName: types.NamespacedName{
+					Namespace: secret.ObjectMeta.Labels[LabelParentNamespace],
+					Name:      secret.ObjectMeta.Labels[LabelParentName],
+				},
+			},
+		}
+
 	}
 }
 
@@ -1524,7 +1648,7 @@ func indexPGIngresses(o client.Object) []string {
 // serviceHandlerForIngressPG returns a handler for Service events that ensures that if the Service
 // associated with an event is a backend Service for a tailscale Ingress with ProxyGroup annotation,
 // the associated Ingress gets reconciled.
-func serviceHandlerForIngressPG(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+func serviceHandlerForIngressPG(cl client.Client, logger *zap.SugaredLogger, ingressClassName string) handler.MapFunc {
 	return func(ctx context.Context, o client.Object) []reconcile.Request {
 		ingList := networkingv1.IngressList{}
 		if err := cl.List(ctx, &ingList, client.InNamespace(o.GetNamespace())); err != nil {
@@ -1533,7 +1657,7 @@ func serviceHandlerForIngressPG(cl client.Client, logger *zap.SugaredLogger) han
 		}
 		reqs := make([]reconcile.Request, 0)
 		for _, ing := range ingList.Items {
-			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != tailscaleIngressClassName {
+			if ing.Spec.IngressClassName == nil || *ing.Spec.IngressClassName != ingressClassName {
 				continue
 			}
 			if !hasProxyGroupAnnotation(&ing) {

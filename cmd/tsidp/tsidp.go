@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
@@ -58,6 +60,9 @@ type ctxConn struct{}
 // funnelClientsFile is the file where client IDs and secrets for OIDC clients
 // accessing the IDP over Funnel are persisted.
 const funnelClientsFile = "oidc-funnel-clients.json"
+
+// oidcKeyFile is where the OIDC private key is persisted.
+const oidcKeyFile = "oidc-key.json"
 
 var (
 	flagVerbose            = flag.Bool("verbose", false, "be verbose")
@@ -79,12 +84,14 @@ func main() {
 	var (
 		lc          *local.Client
 		st          *ipnstate.Status
+		rootPath    string
 		err         error
 		watcherChan chan error
 		cleanup     func()
 
 		lns []net.Listener
 	)
+
 	if *flagUseLocalTailscaled {
 		lc = &local.Client{}
 		st, err = lc.StatusWithoutPeers(ctx)
@@ -109,6 +116,15 @@ func main() {
 			log.Fatalf("failed to listen on any of %v", st.TailscaleIPs)
 		}
 
+		if flagDir == nil || *flagDir == "" {
+			// use user config directory as storage for tsidp oidc key
+			configDir, err := os.UserConfigDir()
+			if err != nil {
+				log.Fatalf("getting user config directory: %v", err)
+			}
+			rootPath = filepath.Join(configDir, "tsidp")
+		}
+
 		// tailscaled needs to be setting an HTTP header for funneled requests
 		// that older versions don't provide.
 		// TODO(naman): is this the correct check?
@@ -121,10 +137,13 @@ func main() {
 		}
 		defer cleanup()
 	} else {
+		hostinfo.SetApp("tsidp")
 		ts := &tsnet.Server{
 			Hostname: *flagHostname,
 			Dir:      *flagDir,
 		}
+		rootPath = ts.GetRootPath()
+		log.Printf("tsidp root path: %s", rootPath)
 		if *flagVerbose {
 			ts.Logf = log.Printf
 		}
@@ -155,7 +174,9 @@ func main() {
 		lc:          lc,
 		funnel:      *flagFunnel,
 		localTSMode: *flagUseLocalTailscaled,
+		rootPath:    rootPath,
 	}
+
 	if *flagPort != 443 {
 		srv.serverURL = fmt.Sprintf("https://%s:%d", strings.TrimSuffix(st.Self.DNSName, "."), *flagPort)
 	} else {
@@ -268,7 +289,7 @@ func serveOnLocalTailscaled(ctx context.Context, lc *local.Client, st *ipnstate.
 	foregroundSc.SetFunnel(serverURL, dstPort, shouldFunnel)
 	foregroundSc.SetWebHandler(&ipn.HTTPHandler{
 		Proxy: fmt.Sprintf("https://%s", net.JoinHostPort(serverURL, strconv.Itoa(int(dstPort)))),
-	}, serverURL, uint16(*flagPort), "/", true)
+	}, serverURL, uint16(*flagPort), "/", true, st.CurrentTailnet.MagicDNSSuffix)
 	err = lc.SetServeConfig(ctx, sc)
 	if err != nil {
 		return nil, watcherChan, fmt.Errorf("could not set serve config: %v", err)
@@ -283,6 +304,7 @@ type idpServer struct {
 	serverURL   string // "https://foo.bar.ts.net"
 	funnel      bool
 	localTSMode bool
+	rootPath    string // root path, used for storing state files
 
 	lazyMux        lazy.SyncValue[*http.ServeMux]
 	lazySigningKey lazy.SyncValue[*signingKey]
@@ -817,8 +839,9 @@ func (s *idpServer) oidcSigner() (jose.Signer, error) {
 
 func (s *idpServer) oidcPrivateKey() (*signingKey, error) {
 	return s.lazySigningKey.GetErr(func() (*signingKey, error) {
+		keyPath := filepath.Join(s.rootPath, oidcKeyFile)
 		var sk signingKey
-		b, err := os.ReadFile("oidc-key.json")
+		b, err := os.ReadFile(keyPath)
 		if err == nil {
 			if err := sk.UnmarshalJSON(b); err == nil {
 				return &sk, nil
@@ -833,7 +856,7 @@ func (s *idpServer) oidcPrivateKey() (*signingKey, error) {
 		if err != nil {
 			log.Fatalf("Error marshaling key: %v", err)
 		}
-		if err := os.WriteFile("oidc-key.json", b, 0600); err != nil {
+		if err := os.WriteFile(keyPath, b, 0600); err != nil {
 			log.Fatalf("Error writing key: %v", err)
 		}
 		return &sk, nil
@@ -867,7 +890,6 @@ func (s *idpServer) serveJWKS(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-	return
 }
 
 // openIDProviderMetadata is a partial representation of

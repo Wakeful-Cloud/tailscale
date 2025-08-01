@@ -435,10 +435,7 @@ func (s *Server) Close() error {
 		ln.closeLocked()
 	}
 	wg.Wait()
-
-	if bus := s.sys.Bus.Get(); bus != nil {
-		bus.Close()
-	}
+	s.sys.Bus.Get().Close()
 	s.closed = true
 	return nil
 }
@@ -1269,6 +1266,12 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 	}
 	s.mu.Unlock()
 	return ln, nil
+}
+
+// GetRootPath returns the root path of the tsnet server.
+// This is where the state file and other data is stored.
+func (s *Server) GetRootPath() string {
+	return s.rootPath
 }
 
 // CapturePcap can be called by the application code compiled with tsnet to save a pcap

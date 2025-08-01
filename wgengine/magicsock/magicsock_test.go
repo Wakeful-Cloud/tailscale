@@ -19,7 +19,6 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
-	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -64,6 +63,7 @@ import (
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/ptr"
+	"tailscale.com/types/views"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/must"
@@ -179,7 +179,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 	t.Helper()
 
 	bus := eventbus.New()
-	defer bus.Close()
+	t.Cleanup(bus.Close)
 
 	netMon, err := netmon.New(bus, logf)
 	if err != nil {
@@ -191,6 +191,7 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListen
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
 	conn, err := NewConn(Options{
 		NetMon:                 netMon,
+		EventBus:               bus,
 		Metrics:                &reg,
 		Logf:                   logf,
 		HealthTracker:          ht,
@@ -406,7 +407,7 @@ func TestNewConn(t *testing.T) {
 	}
 
 	bus := eventbus.New()
-	defer bus.Close()
+	t.Cleanup(bus.Close)
 
 	netMon, err := netmon.New(bus, logger.WithPrefix(t.Logf, "... netmon: "))
 	if err != nil {
@@ -424,6 +425,7 @@ func TestNewConn(t *testing.T) {
 		EndpointsFunc:     epFunc,
 		Logf:              t.Logf,
 		NetMon:            netMon,
+		EventBus:          bus,
 		Metrics:           new(usermetric.Registry),
 	})
 	if err != nil {
@@ -542,7 +544,7 @@ func TestDeviceStartStop(t *testing.T) {
 	tstest.ResourceCheck(t)
 
 	bus := eventbus.New()
-	defer bus.Close()
+	t.Cleanup(bus.Close)
 
 	netMon, err := netmon.New(bus, logger.WithPrefix(t.Logf, "... netmon: "))
 	if err != nil {
@@ -554,6 +556,7 @@ func TestDeviceStartStop(t *testing.T) {
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {},
 		Logf:          t.Logf,
 		NetMon:        netMon,
+		EventBus:      bus,
 		Metrics:       new(usermetric.Registry),
 	})
 	if err != nil {
@@ -1349,7 +1352,7 @@ func newTestConn(t testing.TB) *Conn {
 	port := pickPort(t)
 
 	bus := eventbus.New()
-	defer bus.Close()
+	t.Cleanup(bus.Close)
 
 	netMon, err := netmon.New(bus, logger.WithPrefix(t.Logf, "... netmon: "))
 	if err != nil {
@@ -1359,6 +1362,7 @@ func newTestConn(t testing.TB) *Conn {
 
 	conn, err := NewConn(Options{
 		NetMon:                 netMon,
+		EventBus:               bus,
 		HealthTracker:          new(health.Tracker),
 		Metrics:                new(usermetric.Registry),
 		DisablePortMapper:      true,
@@ -3147,6 +3151,7 @@ func TestNetworkDownSendErrors(t *testing.T) {
 		Logf:              t.Logf,
 		NetMon:            netMon,
 		Metrics:           reg,
+		EventBus:          bus,
 	}))
 	defer conn.Close()
 
@@ -3384,54 +3389,72 @@ func Test_virtualNetworkID(t *testing.T) {
 	}
 }
 
-func Test_peerAPIIfCandidateRelayServer(t *testing.T) {
-	selfOnlyIPv4 := &tailcfg.Node{
-		Cap: math.MinInt32,
+func Test_looksLikeInitiationMsg(t *testing.T) {
+	initMsg := make([]byte, device.MessageInitiationSize)
+	binary.BigEndian.PutUint32(initMsg, device.MessageInitiationType)
+	initMsgSizeTransportType := make([]byte, device.MessageInitiationSize)
+	binary.BigEndian.PutUint32(initMsgSizeTransportType, device.MessageTransportType)
+	tests := []struct {
+		name string
+		b    []byte
+		want bool
+	}{
+		{
+			name: "valid initiation",
+			b:    initMsg,
+			want: true,
+		},
+		{
+			name: "invalid message type field",
+			b:    initMsgSizeTransportType,
+			want: false,
+		},
+		{
+			name: "too small",
+			b:    initMsg[:device.MessageInitiationSize-1],
+			want: false,
+		},
+		{
+			name: "too big",
+			b:    append(initMsg, 0),
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := looksLikeInitiationMsg(tt.b); got != tt.want {
+				t.Errorf("looksLikeInitiationMsg() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_nodeHasCap(t *testing.T) {
+	nodeAOnlyIPv4 := &tailcfg.Node{
+		ID: 1,
 		Addresses: []netip.Prefix{
 			netip.MustParsePrefix("1.1.1.1/32"),
 		},
 	}
-	selfOnlyIPv6 := selfOnlyIPv4.Clone()
-	selfOnlyIPv6.Addresses[0] = netip.MustParsePrefix("::1/128")
+	nodeBOnlyIPv6 := nodeAOnlyIPv4.Clone()
+	nodeBOnlyIPv6.Addresses[0] = netip.MustParsePrefix("::1/128")
 
-	peerHostinfo := &tailcfg.Hostinfo{
-		Services: []tailcfg.Service{
-			{
-				Proto: tailcfg.PeerAPI4,
-				Port:  4,
-			},
-			{
-				Proto: tailcfg.PeerAPI6,
-				Port:  6,
-			},
-		},
-	}
-	peerOnlyIPv4 := &tailcfg.Node{
-		Cap: math.MinInt32,
-		CapMap: map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-			tailcfg.NodeAttrRelayServer: nil,
-		},
+	nodeCOnlyIPv4 := &tailcfg.Node{
+		ID: 2,
 		Addresses: []netip.Prefix{
 			netip.MustParsePrefix("2.2.2.2/32"),
 		},
-		Hostinfo: peerHostinfo.View(),
 	}
-
-	peerOnlyIPv6 := peerOnlyIPv4.Clone()
-	peerOnlyIPv6.Addresses[0] = netip.MustParsePrefix("::2/128")
-
-	peerOnlyIPv4ZeroCapVer := peerOnlyIPv4.Clone()
-	peerOnlyIPv4ZeroCapVer.Cap = 0
-
-	peerOnlyIPv4NilHostinfo := peerOnlyIPv4.Clone()
-	peerOnlyIPv4NilHostinfo.Hostinfo = tailcfg.HostinfoView{}
+	nodeDOnlyIPv6 := nodeCOnlyIPv4.Clone()
+	nodeDOnlyIPv6.Addresses[0] = netip.MustParsePrefix("::2/128")
 
 	tests := []struct {
 		name string
 		filt *filter.Filter
-		self tailcfg.NodeView
-		peer tailcfg.NodeView
-		want netip.AddrPort
+		src  tailcfg.NodeView
+		dst  tailcfg.NodeView
+		cap  tailcfg.PeerCapability
+		want bool
 	}{
 		{
 			name: "match v4",
@@ -3446,9 +3469,10 @@ func Test_peerAPIIfCandidateRelayServer(t *testing.T) {
 					},
 				},
 			}, nil, nil, nil, nil, nil),
-			self: selfOnlyIPv4.View(),
-			peer: peerOnlyIPv4.View(),
-			want: netip.MustParseAddrPort("2.2.2.2:4"),
+			src:  nodeCOnlyIPv4.View(),
+			dst:  nodeAOnlyIPv4.View(),
+			cap:  tailcfg.PeerCapabilityRelayTarget,
+			want: true,
 		},
 		{
 			name: "match v6",
@@ -3463,12 +3487,13 @@ func Test_peerAPIIfCandidateRelayServer(t *testing.T) {
 					},
 				},
 			}, nil, nil, nil, nil, nil),
-			self: selfOnlyIPv6.View(),
-			peer: peerOnlyIPv6.View(),
-			want: netip.MustParseAddrPort("[::2]:6"),
+			src:  nodeDOnlyIPv6.View(),
+			dst:  nodeBOnlyIPv6.View(),
+			cap:  tailcfg.PeerCapabilityRelayTarget,
+			want: true,
 		},
 		{
-			name: "no match dst",
+			name: "no match CapMatch Dst",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("::2/128")},
@@ -3480,8 +3505,10 @@ func Test_peerAPIIfCandidateRelayServer(t *testing.T) {
 					},
 				},
 			}, nil, nil, nil, nil, nil),
-			self: selfOnlyIPv6.View(),
-			peer: peerOnlyIPv6.View(),
+			src:  nodeDOnlyIPv6.View(),
+			dst:  nodeBOnlyIPv6.View(),
+			cap:  tailcfg.PeerCapabilityRelayTarget,
+			want: false,
 		},
 		{
 			name: "no match peer cap",
@@ -3496,11 +3523,13 @@ func Test_peerAPIIfCandidateRelayServer(t *testing.T) {
 					},
 				},
 			}, nil, nil, nil, nil, nil),
-			self: selfOnlyIPv6.View(),
-			peer: peerOnlyIPv6.View(),
+			src:  nodeDOnlyIPv6.View(),
+			dst:  nodeBOnlyIPv6.View(),
+			cap:  tailcfg.PeerCapabilityRelayTarget,
+			want: false,
 		},
 		{
-			name: "cap ver not relay capable",
+			name: "nil src",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
@@ -3512,17 +3541,13 @@ func Test_peerAPIIfCandidateRelayServer(t *testing.T) {
 					},
 				},
 			}, nil, nil, nil, nil, nil),
-			self: peerOnlyIPv4.View(),
-			peer: peerOnlyIPv4ZeroCapVer.View(),
+			src:  tailcfg.NodeView{},
+			dst:  nodeAOnlyIPv4.View(),
+			cap:  tailcfg.PeerCapabilityRelayTarget,
+			want: false,
 		},
 		{
-			name: "nil filt",
-			filt: nil,
-			self: selfOnlyIPv4.View(),
-			peer: peerOnlyIPv4.View(),
-		},
-		{
-			name: "nil self",
+			name: "nil dst",
 			filt: filter.New([]filtertype.Match{
 				{
 					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
@@ -3534,46 +3559,136 @@ func Test_peerAPIIfCandidateRelayServer(t *testing.T) {
 					},
 				},
 			}, nil, nil, nil, nil, nil),
-			self: tailcfg.NodeView{},
-			peer: peerOnlyIPv4.View(),
-		},
-		{
-			name: "nil peer",
-			filt: filter.New([]filtertype.Match{
-				{
-					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
-					Caps: []filtertype.CapMatch{
-						{
-							Dst: netip.MustParsePrefix("1.1.1.1/32"),
-							Cap: tailcfg.PeerCapabilityRelayTarget,
-						},
-					},
-				},
-			}, nil, nil, nil, nil, nil),
-			self: selfOnlyIPv4.View(),
-			peer: tailcfg.NodeView{},
-		},
-		{
-			name: "nil peer hostinfo",
-			filt: filter.New([]filtertype.Match{
-				{
-					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
-					Caps: []filtertype.CapMatch{
-						{
-							Dst: netip.MustParsePrefix("1.1.1.1/32"),
-							Cap: tailcfg.PeerCapabilityRelayTarget,
-						},
-					},
-				},
-			}, nil, nil, nil, nil, nil),
-			self: selfOnlyIPv4.View(),
-			peer: peerOnlyIPv4NilHostinfo.View(),
+			src:  nodeCOnlyIPv4.View(),
+			dst:  tailcfg.NodeView{},
+			cap:  tailcfg.PeerCapabilityRelayTarget,
+			want: false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := peerAPIIfCandidateRelayServer(tt.filt, tt.self, tt.peer); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("peerAPIIfCandidateRelayServer() = %v, want %v", got, tt.want)
+			if got := nodeHasCap(tt.filt, tt.src, tt.dst, tt.cap); got != tt.want {
+				t.Errorf("nodeHasCap() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConn_updateRelayServersSet(t *testing.T) {
+	peerNodeCandidateRelay := &tailcfg.Node{
+		Cap: 121,
+		ID:  1,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("1.1.1.1/32"),
+		},
+		HomeDERP: 1,
+		Key:      key.NewNode().Public(),
+		DiscoKey: key.NewDisco().Public(),
+	}
+
+	peerNodeNotCandidateRelayCapVer := &tailcfg.Node{
+		Cap: 120, // intentionally lower to fail capVer check
+		ID:  1,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("1.1.1.1/32"),
+		},
+		HomeDERP: 1,
+		Key:      key.NewNode().Public(),
+		DiscoKey: key.NewDisco().Public(),
+	}
+
+	selfNode := &tailcfg.Node{
+		Cap: 120, // intentionally lower than capVerIsRelayCapable to verify self check
+		ID:  2,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("2.2.2.2/32"),
+		},
+		HomeDERP: 2,
+		Key:      key.NewNode().Public(),
+		DiscoKey: key.NewDisco().Public(),
+	}
+
+	tests := []struct {
+		name             string
+		filt             *filter.Filter
+		self             tailcfg.NodeView
+		peers            views.Slice[tailcfg.NodeView]
+		wantRelayServers set.Set[candidatePeerRelay]
+	}{
+		{
+			name: "candidate relay server",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: peerNodeCandidateRelay.Addresses,
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: selfNode.Addresses[0],
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self:  selfNode.View(),
+			peers: views.SliceOf([]tailcfg.NodeView{peerNodeCandidateRelay.View()}),
+			wantRelayServers: set.SetOf([]candidatePeerRelay{
+				{
+					nodeKey:          peerNodeCandidateRelay.Key,
+					discoKey:         peerNodeCandidateRelay.DiscoKey,
+					derpHomeRegionID: 1,
+				},
+			}),
+		},
+		{
+			name: "self candidate relay server",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: selfNode.Addresses,
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: selfNode.Addresses[0],
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self:  selfNode.View(),
+			peers: views.SliceOf([]tailcfg.NodeView{selfNode.View()}),
+			wantRelayServers: set.SetOf([]candidatePeerRelay{
+				{
+					nodeKey:          selfNode.Key,
+					discoKey:         selfNode.DiscoKey,
+					derpHomeRegionID: 2,
+				},
+			}),
+		},
+		{
+			name: "no candidate relay server",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: peerNodeNotCandidateRelayCapVer.Addresses,
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: selfNode.Addresses[0],
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			self:             selfNode.View(),
+			peers:            views.SliceOf([]tailcfg.NodeView{peerNodeNotCandidateRelayCapVer.View()}),
+			wantRelayServers: make(set.Set[candidatePeerRelay]),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Conn{}
+			c.updateRelayServersSet(tt.filt, tt.self, tt.peers)
+			got := c.relayManager.getServers()
+			if !got.Equal(tt.wantRelayServers) {
+				t.Fatalf("got: %v != want: %v", got, tt.wantRelayServers)
+			}
+			if len(tt.wantRelayServers) > 0 != c.hasPeerRelayServers.Load() {
+				t.Fatalf("c.hasPeerRelayServers: %v != wantRelayServers: %v", c.hasPeerRelayServers.Load(), tt.wantRelayServers)
 			}
 		})
 	}
