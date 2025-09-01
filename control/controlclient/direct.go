@@ -54,6 +54,7 @@ import (
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/singleflight"
 	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/systemd"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/zstdframe"
@@ -616,7 +617,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		return regen, opt.URL, nil, err
 	}
 
-	tailnet, err := syspolicy.GetString(syspolicy.Tailnet, "")
+	tailnet, err := syspolicy.GetString(pkey.Tailnet, "")
 	if err != nil {
 		c.logf("unable to provide Tailnet field in register request. err: %v", err)
 	}
@@ -856,6 +857,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	hi := c.hostInfoLocked()
 	backendLogID := hi.BackendLogID
 	connectionHandleForTest := c.connectionHandleForTest
+	tkaHead := c.tkaHead
 	var epStrs []string
 	var eps []netip.AddrPort
 	var epTypes []tailcfg.EndpointType
@@ -906,7 +908,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 		Hostinfo:                hi,
 		DebugFlags:              c.debugFlags,
 		OmitPeers:               nu == nil,
-		TKAHead:                 c.tkaHead,
+		TKAHead:                 tkaHead,
 		ConnectionHandleForTest: connectionHandleForTest,
 	}
 	var extraDebugFlags []string

@@ -124,6 +124,12 @@ type Server struct {
 	// field at zero unless you know what you are doing.
 	Port uint16
 
+	// AdvertiseTags specifies tags that should be applied to this node, for
+	// purposes of ACL enforcement. These can be referenced from the ACL policy
+	// document. Note that advertising a tag on the client doesn't guarantee
+	// that the control server will allow the node to adopt that tag.
+	AdvertiseTags []string
+
 	getCertForTesting func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 	initOnce         sync.Once
@@ -274,7 +280,13 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		// out the CONNECT code from tailscaled/proxy.go that uses
 		// httputil.ReverseProxy and adding auth support.
 		go func() {
-			lah := localapi.NewHandler(ipnauth.Self, s.lb, s.logf, s.logid)
+			lah := localapi.NewHandler(localapi.HandlerConfig{
+				Actor:    ipnauth.Self,
+				Backend:  s.lb,
+				Logf:     s.logf,
+				LogID:    s.logid,
+				EventBus: s.sys.Bus.Get(),
+			})
 			lah.PermitWrite = true
 			lah.PermitRead = true
 			lah.RequiredPassword = s.localAPICred
@@ -656,6 +668,7 @@ func (s *Server) start() (reterr error) {
 	prefs.WantRunning = true
 	prefs.ControlURL = s.ControlURL
 	prefs.RunWebClient = s.RunWebClient
+	prefs.AdvertiseTags = s.AdvertiseTags
 	authKey := s.getAuthKey()
 	err = lb.Start(ipn.Options{
 		UpdatePrefs: prefs,
@@ -676,7 +689,13 @@ func (s *Server) start() (reterr error) {
 	go s.printAuthURLLoop()
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
-	lah := localapi.NewHandler(ipnauth.Self, lb, tsLogf, s.logid)
+	lah := localapi.NewHandler(localapi.HandlerConfig{
+		Actor:    ipnauth.Self,
+		Backend:  lb,
+		Logf:     tsLogf,
+		LogID:    s.logid,
+		EventBus: sys.Bus.Get(),
+	})
 	lah.PermitWrite = true
 	lah.PermitRead = true
 

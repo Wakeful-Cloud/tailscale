@@ -62,6 +62,7 @@ import (
 	"tailscale.com/util/must"
 	"tailscale.com/util/set"
 	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/setting"
 	"tailscale.com/util/syspolicy/source"
 	"tailscale.com/wgengine"
@@ -1182,16 +1183,16 @@ func TestConfigureExitNode(t *testing.T) {
 			// Configure policy settings, if any.
 			store := source.NewTestStore(t)
 			if tt.exitNodeIDPolicy != nil {
-				store.SetStrings(source.TestSettingOf(syspolicy.ExitNodeID, string(*tt.exitNodeIDPolicy)))
+				store.SetStrings(source.TestSettingOf(pkey.ExitNodeID, string(*tt.exitNodeIDPolicy)))
 			}
 			if tt.exitNodeIPPolicy != nil {
-				store.SetStrings(source.TestSettingOf(syspolicy.ExitNodeIP, tt.exitNodeIPPolicy.String()))
+				store.SetStrings(source.TestSettingOf(pkey.ExitNodeIP, tt.exitNodeIPPolicy.String()))
 			}
 			if tt.exitNodeAllowedIDs != nil {
-				store.SetStringLists(source.TestSettingOf(syspolicy.AllowedSuggestedExitNodes, toStrings(tt.exitNodeAllowedIDs)))
+				store.SetStringLists(source.TestSettingOf(pkey.AllowedSuggestedExitNodes, toStrings(tt.exitNodeAllowedIDs)))
 			}
 			if tt.exitNodeAllowOverride {
-				store.SetBooleans(source.TestSettingOf(syspolicy.AllowExitNodeOverride, true))
+				store.SetBooleans(source.TestSettingOf(pkey.AllowExitNodeOverride, true))
 			}
 			if store.IsEmpty() {
 				// No syspolicy settings, so don't register a store.
@@ -2080,7 +2081,14 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 		wantRoutes           map[dnsname.FQDN][]*dnstype.Resolver
 	}
 
-	defaultResolvers := []*dnstype.Resolver{{Addr: "default.example.com"}}
+	const tsUseWithExitNodeResolverAddr = "usewithexitnode.example.com"
+	defaultResolvers := []*dnstype.Resolver{
+		{Addr: "default.example.com"},
+	}
+	containsFlaggedResolvers := append([]*dnstype.Resolver{
+		{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true},
+	}, defaultResolvers...)
+
 	wgResolvers := []*dnstype.Resolver{{Addr: "wg.example.com"}}
 	peers := []tailcfg.NodeView{
 		(&tailcfg.Node{
@@ -2099,9 +2107,33 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 		}).View(),
 	}
 	exitDOH := peerAPIBase(&netmap.NetworkMap{Peers: peers}, peers[0]) + "/dns-query"
-	routes := map[dnsname.FQDN][]*dnstype.Resolver{
+	baseRoutes := map[dnsname.FQDN][]*dnstype.Resolver{
 		"route.example.com.": {{Addr: "route.example.com"}},
 	}
+	containsEmptyRoutes := map[dnsname.FQDN][]*dnstype.Resolver{
+		"route.example.com.": {{Addr: "route.example.com"}},
+		"empty.example.com.": {},
+	}
+	containsFlaggedRoutes := map[dnsname.FQDN][]*dnstype.Resolver{
+		"route.example.com.":    {{Addr: "route.example.com"}},
+		"withexit.example.com.": {{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true}},
+	}
+	containsFlaggedAndEmptyRoutes := map[dnsname.FQDN][]*dnstype.Resolver{
+		"empty.example.com.":    {},
+		"route.example.com.":    {{Addr: "route.example.com"}},
+		"withexit.example.com.": {{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true}},
+	}
+	flaggedRoutes := map[dnsname.FQDN][]*dnstype.Resolver{
+		"withexit.example.com.": {{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true}},
+	}
+	emptyRoutes := map[dnsname.FQDN][]*dnstype.Resolver{
+		"empty.example.com.": {},
+	}
+	flaggedAndEmptyRoutes := map[dnsname.FQDN][]*dnstype.Resolver{
+		"empty.example.com.":    {},
+		"withexit.example.com.": {{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true}},
+	}
+
 	stringifyRoutes := func(routes map[dnsname.FQDN][]*dnstype.Resolver) map[string][]*dnstype.Resolver {
 		if routes == nil {
 			return nil
@@ -2138,19 +2170,23 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 			wantDefaultResolvers: []*dnstype.Resolver{{Addr: exitDOH}},
 			wantRoutes:           nil,
 		},
+		{
+			name:                 "tsExit/noRoutes/flaggedResolverOnly",
+			exitNode:             "ts",
+			peers:                peers,
+			dnsConfig:            &tailcfg.DNSConfig{Resolvers: containsFlaggedResolvers},
+			wantDefaultResolvers: []*dnstype.Resolver{{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true}},
+			wantRoutes:           nil,
+		},
 
-		// The following two cases may need to be revisited. For a shared-in
-		// exit node split-DNS may effectively break, furthermore in the future
-		// if different nodes observe different DNS configurations, even a
-		// tailnet local exit node may present a different DNS configuration,
-		// which may not meet expectations in some use cases.
-		// In the case where a default resolver is set, the default resolver
-		// should also perhaps take precedence also.
+		// When at tailscale exit node is in use,
+		// only routes that reference resolvers with the UseWithExitNode should be installed,
+		// as well as routes with 0-length resolver lists, which should be installed in all cases.
 		{
 			name:                 "tsExit/routes/noResolver",
 			exitNode:             "ts",
 			peers:                peers,
-			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(routes)},
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(baseRoutes)},
 			wantDefaultResolvers: []*dnstype.Resolver{{Addr: exitDOH}},
 			wantRoutes:           nil,
 		},
@@ -2158,9 +2194,57 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 			name:                 "tsExit/routes/defaultResolver",
 			exitNode:             "ts",
 			peers:                peers,
-			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(routes), Resolvers: defaultResolvers},
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(baseRoutes), Resolvers: defaultResolvers},
 			wantDefaultResolvers: []*dnstype.Resolver{{Addr: exitDOH}},
 			wantRoutes:           nil,
+		},
+		{
+			name:                 "tsExit/routes/flaggedResolverOnly",
+			exitNode:             "ts",
+			peers:                peers,
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(baseRoutes), Resolvers: containsFlaggedResolvers},
+			wantDefaultResolvers: []*dnstype.Resolver{{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true}},
+			wantRoutes:           nil,
+		},
+		{
+			name:                 "tsExit/flaggedRoutesOnly/defaultResolver",
+			exitNode:             "ts",
+			peers:                peers,
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(containsFlaggedRoutes), Resolvers: defaultResolvers},
+			wantDefaultResolvers: []*dnstype.Resolver{{Addr: exitDOH}},
+			wantRoutes:           flaggedRoutes,
+		},
+		{
+			name:                 "tsExit/flaggedRoutesOnly/flaggedResolverOnly",
+			exitNode:             "ts",
+			peers:                peers,
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(containsFlaggedRoutes), Resolvers: containsFlaggedResolvers},
+			wantDefaultResolvers: []*dnstype.Resolver{{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true}},
+			wantRoutes:           flaggedRoutes,
+		},
+		{
+			name:                 "tsExit/emptyRoutesOnly/defaultResolver",
+			exitNode:             "ts",
+			peers:                peers,
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(containsEmptyRoutes), Resolvers: defaultResolvers},
+			wantDefaultResolvers: []*dnstype.Resolver{{Addr: exitDOH}},
+			wantRoutes:           emptyRoutes,
+		},
+		{
+			name:                 "tsExit/flaggedAndEmptyRoutesOnly/defaultResolver",
+			exitNode:             "ts",
+			peers:                peers,
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(containsFlaggedAndEmptyRoutes), Resolvers: defaultResolvers},
+			wantDefaultResolvers: []*dnstype.Resolver{{Addr: exitDOH}},
+			wantRoutes:           flaggedAndEmptyRoutes,
+		},
+		{
+			name:                 "tsExit/flaggedAndEmptyRoutesOnly/flaggedResolverOnly",
+			exitNode:             "ts",
+			peers:                peers,
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(containsFlaggedAndEmptyRoutes), Resolvers: containsFlaggedResolvers},
+			wantDefaultResolvers: []*dnstype.Resolver{{Addr: tsUseWithExitNodeResolverAddr, UseWithExitNode: true}},
+			wantRoutes:           flaggedAndEmptyRoutes,
 		},
 
 		// WireGuard exit nodes with DNS capabilities provide a "fallback" type
@@ -2187,17 +2271,17 @@ func TestDNSConfigForNetmapForExitNodeConfigs(t *testing.T) {
 			name:                 "wgExit/routes/defaultResolver",
 			exitNode:             "wg",
 			peers:                peers,
-			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(routes), Resolvers: defaultResolvers},
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(baseRoutes), Resolvers: defaultResolvers},
 			wantDefaultResolvers: defaultResolvers,
-			wantRoutes:           routes,
+			wantRoutes:           baseRoutes,
 		},
 		{
 			name:                 "wgExit/routes/noResolver",
 			exitNode:             "wg",
 			peers:                peers,
-			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(routes)},
+			dnsConfig:            &tailcfg.DNSConfig{Routes: stringifyRoutes(baseRoutes)},
 			wantDefaultResolvers: wgResolvers,
-			wantRoutes:           routes,
+			wantRoutes:           baseRoutes,
 		},
 	}
 
@@ -2807,10 +2891,10 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 
 			policyStore := source.NewTestStore(t)
 			if test.exitNodeIDKey {
-				policyStore.SetStrings(source.TestSettingOf(syspolicy.ExitNodeID, test.exitNodeID))
+				policyStore.SetStrings(source.TestSettingOf(pkey.ExitNodeID, test.exitNodeID))
 			}
 			if test.exitNodeIPKey {
-				policyStore.SetStrings(source.TestSettingOf(syspolicy.ExitNodeIP, test.exitNodeIP))
+				policyStore.SetStrings(source.TestSettingOf(pkey.ExitNodeIP, test.exitNodeIP))
 			}
 			syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
 
@@ -2946,7 +3030,7 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 
 	syspolicy.RegisterWellKnownSettingsForTest(t)
 	policyStore := source.NewTestStoreOf(t, source.TestSettingOf(
-		syspolicy.ExitNodeID, "auto:any",
+		pkey.ExitNodeID, "auto:any",
 	))
 	syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
 
@@ -3031,7 +3115,7 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 	b.cc = cc
 	syspolicy.RegisterWellKnownSettingsForTest(t)
 	policyStore := source.NewTestStoreOf(t, source.TestSettingOf(
-		syspolicy.ExitNodeID, "auto:any",
+		pkey.ExitNodeID, "auto:any",
 	))
 	syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
 	peer1 := makePeer(1, withCap(26), withDERP(3), withSuggest(), withExitRoutes())
@@ -3140,7 +3224,7 @@ func TestSetControlClientStatusAutoExitNode(t *testing.T) {
 	b := newTestLocalBackend(t)
 	syspolicy.RegisterWellKnownSettingsForTest(t)
 	policyStore := source.NewTestStoreOf(t, source.TestSettingOf(
-		syspolicy.ExitNodeID, "auto:any",
+		pkey.ExitNodeID, "auto:any",
 	))
 	syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
 	b.currentNode().SetNetMap(nm)
@@ -3172,7 +3256,7 @@ func TestApplySysPolicy(t *testing.T) {
 		prefs          ipn.Prefs
 		wantPrefs      ipn.Prefs
 		wantAnyChange  bool
-		stringPolicies map[syspolicy.Key]string
+		stringPolicies map[pkey.Key]string
 	}{
 		{
 			name: "empty prefs without policies",
@@ -3207,13 +3291,13 @@ func TestApplySysPolicy(t *testing.T) {
 				RouteAll:               true,
 			},
 			wantAnyChange: true,
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.ControlURL:                "1",
-				syspolicy.EnableIncomingConnections: "never",
-				syspolicy.EnableServerMode:          "always",
-				syspolicy.ExitNodeAllowLANAccess:    "always",
-				syspolicy.EnableTailscaleDNS:        "always",
-				syspolicy.EnableTailscaleSubnets:    "always",
+			stringPolicies: map[pkey.Key]string{
+				pkey.ControlURL:                "1",
+				pkey.EnableIncomingConnections: "never",
+				pkey.EnableServerMode:          "always",
+				pkey.ExitNodeAllowLANAccess:    "always",
+				pkey.EnableTailscaleDNS:        "always",
+				pkey.EnableTailscaleSubnets:    "always",
 			},
 		},
 		{
@@ -3228,13 +3312,13 @@ func TestApplySysPolicy(t *testing.T) {
 				ShieldsUp:   true,
 				ForceDaemon: true,
 			},
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.ControlURL:                "1",
-				syspolicy.EnableIncomingConnections: "never",
-				syspolicy.EnableServerMode:          "always",
-				syspolicy.ExitNodeAllowLANAccess:    "never",
-				syspolicy.EnableTailscaleDNS:        "never",
-				syspolicy.EnableTailscaleSubnets:    "never",
+			stringPolicies: map[pkey.Key]string{
+				pkey.ControlURL:                "1",
+				pkey.EnableIncomingConnections: "never",
+				pkey.EnableServerMode:          "always",
+				pkey.ExitNodeAllowLANAccess:    "never",
+				pkey.EnableTailscaleDNS:        "never",
+				pkey.EnableTailscaleSubnets:    "never",
 			},
 		},
 		{
@@ -3256,13 +3340,13 @@ func TestApplySysPolicy(t *testing.T) {
 				RouteAll:               true,
 			},
 			wantAnyChange: true,
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.ControlURL:                "2",
-				syspolicy.EnableIncomingConnections: "always",
-				syspolicy.EnableServerMode:          "never",
-				syspolicy.ExitNodeAllowLANAccess:    "always",
-				syspolicy.EnableTailscaleDNS:        "never",
-				syspolicy.EnableTailscaleSubnets:    "always",
+			stringPolicies: map[pkey.Key]string{
+				pkey.ControlURL:                "2",
+				pkey.EnableIncomingConnections: "always",
+				pkey.EnableServerMode:          "never",
+				pkey.ExitNodeAllowLANAccess:    "always",
+				pkey.EnableTailscaleDNS:        "never",
+				pkey.EnableTailscaleSubnets:    "always",
 			},
 		},
 		{
@@ -3283,12 +3367,12 @@ func TestApplySysPolicy(t *testing.T) {
 				CorpDNS:                true,
 				RouteAll:               true,
 			},
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.EnableIncomingConnections: "user-decides",
-				syspolicy.EnableServerMode:          "user-decides",
-				syspolicy.ExitNodeAllowLANAccess:    "user-decides",
-				syspolicy.EnableTailscaleDNS:        "user-decides",
-				syspolicy.EnableTailscaleSubnets:    "user-decides",
+			stringPolicies: map[pkey.Key]string{
+				pkey.EnableIncomingConnections: "user-decides",
+				pkey.EnableServerMode:          "user-decides",
+				pkey.ExitNodeAllowLANAccess:    "user-decides",
+				pkey.EnableTailscaleDNS:        "user-decides",
+				pkey.EnableTailscaleSubnets:    "user-decides",
 			},
 		},
 		{
@@ -3297,8 +3381,8 @@ func TestApplySysPolicy(t *testing.T) {
 				ControlURL: "set",
 			},
 			wantAnyChange: true,
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.ControlURL: "set",
+			stringPolicies: map[pkey.Key]string{
+				pkey.ControlURL: "set",
 			},
 		},
 		{
@@ -3316,8 +3400,8 @@ func TestApplySysPolicy(t *testing.T) {
 				},
 			},
 			wantAnyChange: true,
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.ApplyUpdates: "always",
+			stringPolicies: map[pkey.Key]string{
+				pkey.ApplyUpdates: "always",
 			},
 		},
 		{
@@ -3335,8 +3419,8 @@ func TestApplySysPolicy(t *testing.T) {
 				},
 			},
 			wantAnyChange: true,
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.ApplyUpdates: "never",
+			stringPolicies: map[pkey.Key]string{
+				pkey.ApplyUpdates: "never",
 			},
 		},
 		{
@@ -3354,8 +3438,8 @@ func TestApplySysPolicy(t *testing.T) {
 				},
 			},
 			wantAnyChange: true,
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.CheckUpdates: "always",
+			stringPolicies: map[pkey.Key]string{
+				pkey.CheckUpdates: "always",
 			},
 		},
 		{
@@ -3373,8 +3457,8 @@ func TestApplySysPolicy(t *testing.T) {
 				},
 			},
 			wantAnyChange: true,
-			stringPolicies: map[syspolicy.Key]string{
-				syspolicy.CheckUpdates: "never",
+			stringPolicies: map[pkey.Key]string{
+				pkey.CheckUpdates: "never",
 			},
 		},
 	}
@@ -4217,7 +4301,7 @@ func (b *LocalBackend) SetPrefsForTest(newp *ipn.Prefs) {
 	}
 	unlock := b.lockAndGetUnlock()
 	defer unlock()
-	b.setPrefsLockedOnEntry(newp, unlock)
+	b.setPrefsLocked(newp)
 }
 
 type peerOptFunc func(*tailcfg.Node)
@@ -5491,7 +5575,7 @@ func TestFillAllowedSuggestions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			policyStore := source.NewTestStoreOf(t, source.TestSettingOf(
-				syspolicy.AllowedSuggestedExitNodes, tt.allowPolicy,
+				pkey.AllowedSuggestedExitNodes, tt.allowPolicy,
 			))
 			syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
 
@@ -6397,23 +6481,23 @@ func TestUpdatePrefsOnSysPolicyChange(t *testing.T) {
 	}{
 		{
 			name:           "ShieldsUp/True",
-			stringSettings: []source.TestSetting[string]{source.TestSettingOf(syspolicy.EnableIncomingConnections, "never")},
+			stringSettings: []source.TestSetting[string]{source.TestSettingOf(pkey.EnableIncomingConnections, "never")},
 			want:           wantPrefsChanges(fieldChange{"ShieldsUp", true}),
 		},
 		{
 			name:           "ShieldsUp/False",
 			initialPrefs:   &ipn.Prefs{ShieldsUp: true},
-			stringSettings: []source.TestSetting[string]{source.TestSettingOf(syspolicy.EnableIncomingConnections, "always")},
+			stringSettings: []source.TestSetting[string]{source.TestSettingOf(pkey.EnableIncomingConnections, "always")},
 			want:           wantPrefsChanges(fieldChange{"ShieldsUp", false}),
 		},
 		{
 			name:           "ExitNodeID",
-			stringSettings: []source.TestSetting[string]{source.TestSettingOf(syspolicy.ExitNodeID, "foo")},
+			stringSettings: []source.TestSetting[string]{source.TestSettingOf(pkey.ExitNodeID, "foo")},
 			want:           wantPrefsChanges(fieldChange{"ExitNodeID", tailcfg.StableNodeID("foo")}),
 		},
 		{
 			name:           "EnableRunExitNode",
-			stringSettings: []source.TestSetting[string]{source.TestSettingOf(syspolicy.EnableRunExitNode, "always")},
+			stringSettings: []source.TestSetting[string]{source.TestSettingOf(pkey.EnableRunExitNode, "always")},
 			want:           wantPrefsChanges(fieldChange{"AdvertiseRoutes", []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()}}),
 		},
 		{
@@ -6422,9 +6506,9 @@ func TestUpdatePrefsOnSysPolicyChange(t *testing.T) {
 				ExitNodeAllowLANAccess: true,
 			},
 			stringSettings: []source.TestSetting[string]{
-				source.TestSettingOf(syspolicy.EnableServerMode, "always"),
-				source.TestSettingOf(syspolicy.ExitNodeAllowLANAccess, "never"),
-				source.TestSettingOf(syspolicy.ExitNodeIP, "127.0.0.1"),
+				source.TestSettingOf(pkey.EnableServerMode, "always"),
+				source.TestSettingOf(pkey.ExitNodeAllowLANAccess, "never"),
+				source.TestSettingOf(pkey.ExitNodeIP, "127.0.0.1"),
 			},
 			want: wantPrefsChanges(
 				fieldChange{"ForceDaemon", true},
@@ -6440,9 +6524,9 @@ func TestUpdatePrefsOnSysPolicyChange(t *testing.T) {
 				AdvertiseRoutes: []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()},
 			},
 			stringSettings: []source.TestSetting[string]{
-				source.TestSettingOf(syspolicy.EnableTailscaleDNS, "always"),
-				source.TestSettingOf(syspolicy.ExitNodeID, "foo"),
-				source.TestSettingOf(syspolicy.EnableRunExitNode, "always"),
+				source.TestSettingOf(pkey.EnableTailscaleDNS, "always"),
+				source.TestSettingOf(pkey.ExitNodeID, "foo"),
+				source.TestSettingOf(pkey.EnableRunExitNode, "always"),
 			},
 			want: nil, // syspolicy settings match the preferences; no change notification is expected.
 		},

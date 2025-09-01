@@ -65,6 +65,7 @@ import (
 	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
 	"tailscale.com/util/syspolicy"
+	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
@@ -800,7 +801,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			sys.NetMon.Get().SetTailscaleInterfaceName(devName)
 		}
 
-		r, err := router.New(logf, dev, sys.NetMon.Get(), sys.HealthTracker())
+		r, err := router.New(logf, dev, sys.NetMon.Get(), sys.HealthTracker(), sys.Bus.Get())
 		if err != nil {
 			dev.Close()
 			return false, fmt.Errorf("creating router: %w", err)
@@ -1011,6 +1012,6 @@ func defaultEncryptState() bool {
 		// (plan9/FreeBSD/etc).
 		return false
 	}
-	v, _ := syspolicy.GetBoolean(syspolicy.EncryptState, false)
+	v, _ := syspolicy.GetBoolean(pkey.EncryptState, false)
 	return v
 }
