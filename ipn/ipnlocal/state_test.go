@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ import (
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 	"tailscale.com/wgengine"
@@ -113,10 +115,11 @@ func (nt *notifyThrottler) drain(count int) []ipn.Notify {
 // in the controlclient.Client, so by controlling it, we can check that
 // the state machine works as expected.
 type mockControl struct {
-	tb     testing.TB
-	logf   logger.Logf
-	opts   controlclient.Options
-	paused atomic.Bool
+	tb              testing.TB
+	logf            logger.Logf
+	opts            controlclient.Options
+	paused          atomic.Bool
+	controlClientID int64
 
 	mu          sync.Mutex
 	persist     *persist.Persist
@@ -127,12 +130,13 @@ type mockControl struct {
 
 func newClient(tb testing.TB, opts controlclient.Options) *mockControl {
 	return &mockControl{
-		tb:          tb,
-		authBlocked: true,
-		logf:        opts.Logf,
-		opts:        opts,
-		shutdown:    make(chan struct{}),
-		persist:     opts.Persist.Clone(),
+		tb:              tb,
+		authBlocked:     true,
+		logf:            opts.Logf,
+		opts:            opts,
+		shutdown:        make(chan struct{}),
+		persist:         opts.Persist.Clone(),
+		controlClientID: rand.Int64(),
 	}
 }
 
@@ -198,6 +202,16 @@ func (cc *mockControl) authenticated(nm *netmap.NetworkMap) {
 	}
 	cc.persist.NodeID = nm.SelfNode.StableID()
 	cc.send(nil, "", true, nm)
+}
+
+func (cc *mockControl) sendAuthURL(nm *netmap.NetworkMap) {
+	s := controlclient.Status{
+		URL:     "https://example.com/a/foo",
+		NetMap:  nm,
+		Persist: cc.persist.View(),
+	}
+	s.SetStateForTest(controlclient.StateURLVisitRequired)
+	cc.opts.Observer.SetControlClientStatus(cc, s)
 }
 
 // called records that a particular function name was called.
@@ -287,6 +301,10 @@ func (cc *mockControl) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 	cc.called("UpdateEndpoints")
 }
 
+func (cc *mockControl) ClientID() int64 {
+	return cc.controlClientID
+}
+
 func (b *LocalBackend) nonInteractiveLoginForStateTest() {
 	b.mu.Lock()
 	if b.cc == nil {
@@ -328,7 +346,7 @@ func TestStateMachine(t *testing.T) {
 	sys := tsd.NewSystem()
 	store := new(testStateStorage)
 	sys.Set(store)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker.Get(), sys.UserMetricsRegistry(), sys.Bus.Get())
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
@@ -340,7 +358,6 @@ func TestStateMachine(t *testing.T) {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
 	t.Cleanup(b.Shutdown)
-	b.DisablePortMapperForTest()
 
 	var cc, previousCC *mockControl
 	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
@@ -966,7 +983,7 @@ func TestEditPrefsHasNoKeys(t *testing.T) {
 	logf := tstest.WhileTestRunningLogger(t)
 	sys := tsd.NewSystem()
 	sys.Set(new(mem.Store))
-	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker.Get(), sys.UserMetricsRegistry(), sys.Bus.Get())
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
@@ -1349,6 +1366,151 @@ func TestEngineReconfigOnStateChange(t *testing.T) {
 				Hosts:  hostsFor(node3),
 			},
 		},
+		{
+			name: "Start/Connect/Login/Expire",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+				cc().send(nil, "", false, &netmap.NetworkMap{
+					Expiry: time.Now().Add(-time.Minute),
+				})
+			},
+			wantState:     ipn.NeedsLogin,
+			wantCfg:       &wgcfg.Config{},
+			wantRouterCfg: &router.Config{},
+			wantDNSCfg:    &dns.Config{},
+		},
+		{
+			name: "Start/Connect/Login/InitReauth",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+
+				// Start the re-auth process:
+				lb.StartLoginInteractive(context.Background())
+				cc().sendAuthURL(node1)
+			},
+			// Without seamless renewal, even starting a reauth tears down everything:
+			wantState:     ipn.Starting,
+			wantCfg:       &wgcfg.Config{},
+			wantRouterCfg: &router.Config{},
+			wantDNSCfg:    &dns.Config{},
+		},
+		{
+			name: "Start/Connect/Login/InitReauth/Login",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+
+				// Start the re-auth process:
+				lb.StartLoginInteractive(context.Background())
+				cc().sendAuthURL(node1)
+
+				// Complete the re-auth process:
+				cc().authenticated(node1)
+			},
+			wantState: ipn.Starting,
+			wantCfg: &wgcfg.Config{
+				Name:      "tailscale",
+				NodeID:    node1.SelfNode.StableID(),
+				Peers:     []wgcfg.Peer{},
+				Addresses: node1.SelfNode.Addresses().AsSlice(),
+			},
+			wantRouterCfg: &router.Config{
+				SNATSubnetRoutes: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
+				Routes:           routesWithQuad100(),
+			},
+			wantDNSCfg: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:  hostsFor(node1),
+			},
+		},
+		{
+			name: "Seamless/Start/Connect/Login/InitReauth",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+
+				// Start the re-auth process:
+				lb.StartLoginInteractive(context.Background())
+				cc().sendAuthURL(node1)
+			},
+			// With seamless renewal, starting a reauth should leave everything up:
+			wantState: ipn.Starting,
+			wantCfg: &wgcfg.Config{
+				Name:      "tailscale",
+				NodeID:    node1.SelfNode.StableID(),
+				Peers:     []wgcfg.Peer{},
+				Addresses: node1.SelfNode.Addresses().AsSlice(),
+			},
+			wantRouterCfg: &router.Config{
+				SNATSubnetRoutes: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
+				Routes:           routesWithQuad100(),
+			},
+			wantDNSCfg: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:  hostsFor(node1),
+			},
+		},
+		{
+			name: "Seamless/Start/Connect/Login/InitReauth/Login",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+
+				// Start the re-auth process:
+				lb.StartLoginInteractive(context.Background())
+				cc().sendAuthURL(node1)
+
+				// Complete the re-auth process:
+				cc().authenticated(node1)
+			},
+			wantState: ipn.Starting,
+			wantCfg: &wgcfg.Config{
+				Name:      "tailscale",
+				NodeID:    node1.SelfNode.StableID(),
+				Peers:     []wgcfg.Peer{},
+				Addresses: node1.SelfNode.Addresses().AsSlice(),
+			},
+			wantRouterCfg: &router.Config{
+				SNATSubnetRoutes: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				LocalAddrs:       node1.SelfNode.Addresses().AsSlice(),
+				Routes:           routesWithQuad100(),
+			},
+			wantDNSCfg: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:  hostsFor(node1),
+			},
+		},
+		{
+			name: "Seamless/Start/Connect/Login/Expire",
+			steps: func(t *testing.T, lb *LocalBackend, cc func() *mockControl) {
+				lb.ControlKnobs().SeamlessKeyRenewal.Store(true)
+				mustDo(t)(lb.Start(ipn.Options{}))
+				mustDo2(t)(lb.EditPrefs(connect))
+				cc().authenticated(node1)
+				cc().send(nil, "", false, &netmap.NetworkMap{
+					Expiry: time.Now().Add(-time.Minute),
+				})
+			},
+			// Even with seamless, if the key we are using expires, we want to disconnect:
+			wantState:     ipn.NeedsLogin,
+			wantCfg:       &wgcfg.Config{},
+			wantRouterCfg: &router.Config{},
+			wantDNSCfg:    &dns.Config{},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1492,7 +1654,8 @@ func newLocalBackendWithMockEngineAndControl(t *testing.T, enableLogging bool) (
 	dialer := &tsdial.Dialer{Logf: logf}
 	dialer.SetNetMon(netmon.NewStatic())
 
-	sys := tsd.NewSystem()
+	bus := eventbustest.NewBus(t)
+	sys := tsd.NewSystemWithBus(bus)
 	sys.Set(dialer)
 	sys.Set(dialer.NetMon())
 
@@ -1501,7 +1664,7 @@ func newLocalBackendWithMockEngineAndControl(t *testing.T, enableLogging bool) (
 		EventBus:          sys.Bus.Get(),
 		NetMon:            dialer.NetMon(),
 		Metrics:           sys.UserMetricsRegistry(),
-		HealthTracker:     sys.HealthTracker(),
+		HealthTracker:     sys.HealthTracker.Get(),
 		DisablePortMapper: true,
 	})
 	if err != nil {

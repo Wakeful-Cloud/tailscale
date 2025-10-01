@@ -317,7 +317,7 @@ func (p *Probe) loop() {
 			p.run()
 			// Wait and then retry if probe fails. We use the inverse of the
 			// configured negative interval as our sleep period.
-			// TODO(percy):implement exponential backoff, possibly using logtail/backoff.
+			// TODO(percy):implement exponential backoff, possibly using util/backoff.
 			select {
 			case <-time.After(-1 * p.interval):
 				p.run()
@@ -570,9 +570,9 @@ func (p *Prober) RunHandler(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	stats := fmt.Sprintf("Last %d probes: success rate %d%%, median latency %v\n",
-		len(prevInfo.RecentResults),
-		int(prevInfo.RecentSuccessRatio()*100), prevInfo.RecentMedianLatency())
+	stats := fmt.Sprintf("Last %d probes (including this one): success rate %d%%, median latency %v\n",
+		len(info.RecentResults),
+		int(info.RecentSuccessRatio()*100), info.RecentMedianLatency())
 	if err != nil {
 		return tsweb.Error(respStatus, fmt.Sprintf("Probe failed: %s\n%s", err.Error(), stats), err)
 	}

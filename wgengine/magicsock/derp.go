@@ -19,7 +19,6 @@ import (
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/health"
-	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/tsaddr"
@@ -28,6 +27,7 @@ import (
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/rands"
 	"tailscale.com/util/testenv"
@@ -836,7 +836,6 @@ func (c *Conn) maybeCloseDERPsOnRebind(okayLocalIPs []netip.Prefix) {
 			c.closeOrReconnectDERPLocked(regionID, "rebind-default-route-change")
 			continue
 		}
-		regionID := regionID
 		dc := ad.c
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

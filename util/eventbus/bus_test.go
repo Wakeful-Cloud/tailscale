@@ -27,7 +27,16 @@ func TestBus(t *testing.T) {
 	defer b.Close()
 
 	c := b.Client("TestSub")
-	defer c.Close()
+	cdone := c.Done()
+	defer func() {
+		c.Close()
+		select {
+		case <-cdone:
+			t.Log("Client close signal received (OK)")
+		case <-time.After(time.Second):
+			t.Error("timed out waiting for client close signal")
+		}
+	}()
 	s := eventbus.Subscribe[EventA](c)
 
 	go func() {
@@ -176,6 +185,173 @@ func TestSpam(t *testing.T) {
 
 	// TODO: check that the published sequences are proper
 	// subsequences of the received slices.
+}
+
+func TestClient_Done(t *testing.T) {
+	b := eventbus.New()
+	defer b.Close()
+
+	c := b.Client(t.Name())
+	s := eventbus.Subscribe[string](c)
+
+	// The client is not Done until closed.
+	select {
+	case <-c.Done():
+		t.Fatal("Client done before being closed")
+	default:
+		// OK
+	}
+
+	go c.Close()
+
+	// Once closed, the client becomes Done.
+	select {
+	case <-c.Done():
+		// OK
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for Client to be done")
+	}
+
+	// Thereafter, the subscriber should also be closed.
+	select {
+	case <-s.Done():
+		// OK
+	case <-time.After(time.Second):
+		t.Fatal("timoeout waiting for Subscriber to be done")
+	}
+}
+
+func TestMonitor(t *testing.T) {
+	t.Run("ZeroWait", func(t *testing.T) {
+		var zero eventbus.Monitor
+
+		ready := make(chan struct{})
+		go func() { zero.Wait(); close(ready) }()
+
+		select {
+		case <-ready:
+			// OK
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for Wait to return")
+		}
+	})
+
+	t.Run("ZeroDone", func(t *testing.T) {
+		var zero eventbus.Monitor
+
+		select {
+		case <-zero.Done():
+			// OK
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for zero monitor to be done")
+		}
+	})
+
+	t.Run("ZeroClose", func(t *testing.T) {
+		var zero eventbus.Monitor
+
+		ready := make(chan struct{})
+		go func() { zero.Close(); close(ready) }()
+
+		select {
+		case <-ready:
+			// OK
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for Close to return")
+		}
+	})
+
+	testMon := func(t *testing.T, release func(*eventbus.Client, eventbus.Monitor)) func(t *testing.T) {
+		t.Helper()
+		return func(t *testing.T) {
+			bus := eventbus.New()
+			cli := bus.Client("test client")
+
+			// The monitored goroutine runs until the client or test subscription ends.
+			sub := eventbus.Subscribe[string](cli)
+			m := cli.Monitor(func(c *eventbus.Client) {
+				select {
+				case <-c.Done():
+					t.Log("client closed")
+				case <-sub.Done():
+					t.Log("subscription closed")
+				}
+			})
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				m.Wait()
+			}()
+
+			// While the goroutine is running, Wait does not complete.
+			select {
+			case <-done:
+				t.Error("monitor is ready before its goroutine is finished (Wait)")
+			default:
+				// OK
+			}
+			select {
+			case <-m.Done():
+				t.Error("monitor is ready before its goroutine is finished (Done)")
+			default:
+				// OK
+			}
+
+			release(cli, m)
+			select {
+			case <-done:
+				// OK
+			case <-time.After(time.Second):
+				t.Fatal("timeout waiting for monitor to complete (Wait)")
+			}
+			select {
+			case <-m.Done():
+				// OK
+			case <-time.After(time.Second):
+				t.Fatal("timeout waiting for monitor to complete (Done)")
+			}
+		}
+	}
+	t.Run("Close", testMon(t, func(_ *eventbus.Client, m eventbus.Monitor) { m.Close() }))
+	t.Run("Wait", testMon(t, func(c *eventbus.Client, m eventbus.Monitor) { c.Close(); m.Wait() }))
+}
+
+func TestRegression(t *testing.T) {
+	bus := eventbus.New()
+	t.Cleanup(bus.Close)
+
+	t.Run("SubscribeClosed", func(t *testing.T) {
+		c := bus.Client("test sub client")
+		c.Close()
+
+		var v any
+		func() {
+			defer func() { v = recover() }()
+			eventbus.Subscribe[string](c)
+		}()
+		if v == nil {
+			t.Fatal("Expected a panic from Subscribe on a closed client")
+		} else {
+			t.Logf("Got expected panic: %v", v)
+		}
+	})
+
+	t.Run("PublishClosed", func(t *testing.T) {
+		c := bus.Client("test pub client")
+		c.Close()
+
+		var v any
+		func() {
+			defer func() { v = recover() }()
+			eventbus.Publish[string](c)
+		}()
+		if v == nil {
+			t.Fatal("expected a panic from Publish on a closed client")
+		} else {
+			t.Logf("Got expected panic: %v", v)
+		}
+	})
 }
 
 type queueChecker struct {

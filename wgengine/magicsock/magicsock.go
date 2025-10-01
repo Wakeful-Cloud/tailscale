@@ -33,6 +33,7 @@ import (
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
@@ -44,7 +45,7 @@ import (
 	"tailscale.com/net/netns"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/ping"
-	"tailscale.com/net/portmapper"
+	"tailscale.com/net/portmapper/portmappertype"
 	"tailscale.com/net/sockopts"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/net/stun"
@@ -155,7 +156,7 @@ type Conn struct {
 	// struct. Initialized once at construction, then constant.
 
 	eventBus               *eventbus.Bus
-	eventClient            *eventbus.Client
+	eventSubs              eventbus.Monitor
 	logf                   logger.Logf
 	epFunc                 func([]tailcfg.Endpoint)
 	derpActiveFunc         func()
@@ -175,17 +176,10 @@ type Conn struct {
 	connCtxCancel func()          // closes connCtx
 	donec         <-chan struct{} // connCtx.Done()'s to avoid context.cancelCtx.Done()'s mutex per call
 
-	// These [eventbus.Subscriber] fields are solely accessed by
-	// consumeEventbusTopics once initialized.
-	pmSub                 *eventbus.Subscriber[portmapper.Mapping]
-	filterSub             *eventbus.Subscriber[FilterUpdate]
-	nodeViewsSub          *eventbus.Subscriber[NodeViewsUpdate]
-	nodeMutsSub           *eventbus.Subscriber[NodeMutationsUpdate]
-	syncSub               *eventbus.Subscriber[syncPoint]
+	// A publisher for synchronization points to ensure correct ordering of
+	// config changes between magicsock and wireguard.
 	syncPub               *eventbus.Publisher[syncPoint]
 	allocRelayEndpointPub *eventbus.Publisher[UDPRelayAllocReq]
-	allocRelayEndpointSub *eventbus.Subscriber[UDPRelayAllocResp]
-	subsDoneCh            chan struct{} // closed when consumeEventbusTopics returns
 
 	// pconn4 and pconn6 are the underlying UDP sockets used to
 	// send/receive packets for wireguard and other magicsock
@@ -207,11 +201,8 @@ type Conn struct {
 
 	// portMapper is the NAT-PMP/PCP/UPnP prober/client, for requesting
 	// port mappings from NAT devices.
-	portMapper *portmapper.Client
-
-	// portMapperLogfUnregister is the function to call to unregister
-	// the portmapper log limiter.
-	portMapperLogfUnregister func()
+	// If nil, the portmapper is disabled.
+	portMapper portmappertype.Client
 
 	// derpRecvCh is used by receiveDERP to read DERP messages.
 	// It must have buffer size > 0; see issue 3736.
@@ -644,29 +635,35 @@ func newConn(logf logger.Logf) *Conn {
 // [eventbus.Subscriber]'s and passes them to their related handler. Events are
 // always handled in the order they are received, i.e. the next event is not
 // read until the previous event's handler has returned. It returns when the
-// [portmapper.Mapping] subscriber is closed, which is interpreted to be the
-// same as the [eventbus.Client] closing ([eventbus.Subscribers] are either
-// all open or all closed).
-func (c *Conn) consumeEventbusTopics() {
-	defer close(c.subsDoneCh)
-
-	for {
-		select {
-		case <-c.pmSub.Done():
-			return
-		case <-c.pmSub.Events():
-			c.onPortMapChanged()
-		case filterUpdate := <-c.filterSub.Events():
-			c.onFilterUpdate(filterUpdate)
-		case nodeViews := <-c.nodeViewsSub.Events():
-			c.onNodeViewsUpdate(nodeViews)
-		case nodeMuts := <-c.nodeMutsSub.Events():
-			c.onNodeMutationsUpdate(nodeMuts)
-		case syncPoint := <-c.syncSub.Events():
-			c.dlogf("magicsock: received sync point after reconfig")
-			syncPoint.Signal()
-		case allocResp := <-c.allocRelayEndpointSub.Events():
-			c.onUDPRelayAllocResp(allocResp)
+// [eventbus.Client] is closed.
+func (c *Conn) consumeEventbusTopics(cli *eventbus.Client) func(*eventbus.Client) {
+	// Subscribe calls must return before NewConn otherwise published
+	// events can be missed.
+	pmSub := eventbus.Subscribe[portmappertype.Mapping](cli)
+	filterSub := eventbus.Subscribe[FilterUpdate](cli)
+	nodeViewsSub := eventbus.Subscribe[NodeViewsUpdate](cli)
+	nodeMutsSub := eventbus.Subscribe[NodeMutationsUpdate](cli)
+	syncSub := eventbus.Subscribe[syncPoint](cli)
+	allocRelayEndpointSub := eventbus.Subscribe[UDPRelayAllocResp](cli)
+	return func(cli *eventbus.Client) {
+		for {
+			select {
+			case <-cli.Done():
+				return
+			case <-pmSub.Events():
+				c.onPortMapChanged()
+			case filterUpdate := <-filterSub.Events():
+				c.onFilterUpdate(filterUpdate)
+			case nodeViews := <-nodeViewsSub.Events():
+				c.onNodeViewsUpdate(nodeViews)
+			case nodeMuts := <-nodeMutsSub.Events():
+				c.onNodeMutationsUpdate(nodeMuts)
+			case syncPoint := <-syncSub.Events():
+				c.dlogf("magicsock: received sync point after reconfig")
+				syncPoint.Signal()
+			case allocResp := <-allocRelayEndpointSub.Events():
+				c.onUDPRelayAllocResp(allocResp)
+			}
 		}
 	}
 }
@@ -733,36 +730,33 @@ func NewConn(opts Options) (*Conn, error) {
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
 
-	c.eventClient = c.eventBus.Client("magicsock.Conn")
+	// Set up publishers and subscribers. Subscribe calls must return before
+	// NewConn otherwise published events can be missed.
+	cli := c.eventBus.Client("magicsock.Conn")
+	c.syncPub = eventbus.Publish[syncPoint](cli)
+	c.allocRelayEndpointPub = eventbus.Publish[UDPRelayAllocReq](cli)
+	c.eventSubs = cli.Monitor(c.consumeEventbusTopics(cli))
 
-	// Subscribe calls must return before NewConn otherwise published
-	// events can be missed.
-	c.pmSub = eventbus.Subscribe[portmapper.Mapping](c.eventClient)
-	c.filterSub = eventbus.Subscribe[FilterUpdate](c.eventClient)
-	c.nodeViewsSub = eventbus.Subscribe[NodeViewsUpdate](c.eventClient)
-	c.nodeMutsSub = eventbus.Subscribe[NodeMutationsUpdate](c.eventClient)
-	c.syncSub = eventbus.Subscribe[syncPoint](c.eventClient)
-	c.syncPub = eventbus.Publish[syncPoint](c.eventClient)
-	c.allocRelayEndpointPub = eventbus.Publish[UDPRelayAllocReq](c.eventClient)
-	c.allocRelayEndpointSub = eventbus.Subscribe[UDPRelayAllocResp](c.eventClient)
-	c.subsDoneCh = make(chan struct{})
-	go c.consumeEventbusTopics()
+	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
+	c.donec = c.connCtx.Done()
 
 	// Don't log the same log messages possibly every few seconds in our
 	// portmapper.
-	portmapperLogf := logger.WithPrefix(c.logf, "portmapper: ")
-	portmapperLogf, c.portMapperLogfUnregister = netmon.LinkChangeLogLimiter(portmapperLogf, opts.NetMon)
-	portMapOpts := &portmapper.DebugKnobs{
-		DisableAll: func() bool { return opts.DisablePortMapper || c.onlyTCP443.Load() },
+	if buildfeatures.HasPortMapper && !opts.DisablePortMapper {
+		portmapperLogf := logger.WithPrefix(c.logf, "portmapper: ")
+		portmapperLogf = netmon.LinkChangeLogLimiter(c.connCtx, portmapperLogf, opts.NetMon)
+		var disableUPnP func() bool
+		if c.controlKnobs != nil {
+			disableUPnP = c.controlKnobs.DisableUPnP.Load
+		}
+		newPortMapper, ok := portmappertype.HookNewPortMapper.GetOk()
+		if ok {
+			c.portMapper = newPortMapper(portmapperLogf, opts.EventBus, opts.NetMon, disableUPnP, c.onlyTCP443.Load)
+		} else if !testenv.InTest() {
+			panic("unexpected: HookNewPortMapper not set")
+		}
 	}
-	c.portMapper = portmapper.NewClient(portmapper.Config{
-		EventBus:     c.eventBus,
-		Logf:         portmapperLogf,
-		NetMon:       opts.NetMon,
-		DebugKnobs:   portMapOpts,
-		ControlKnobs: opts.ControlKnobs,
-	})
-	c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
+
 	c.netMon = opts.NetMon
 	c.health = opts.HealthTracker
 	c.onPortUpdate = opts.OnPortUpdate
@@ -772,8 +766,6 @@ func NewConn(opts Options) (*Conn, error) {
 		return nil, err
 	}
 
-	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
-	c.donec = c.connCtx.Done()
 	c.netChecker = &netcheck.Client{
 		Logf:                logger.WithPrefix(c.logf, "netcheck: "),
 		NetMon:              c.netMon,
@@ -898,6 +890,9 @@ func deregisterMetrics(m *metrics) {
 // can be called with a nil argument to uninstall the capture
 // hook.
 func (c *Conn) InstallCaptureHook(cb packet.CaptureCallback) {
+	if !buildfeatures.HasCapture {
+		return
+	}
 	c.captureHook.Store(cb)
 }
 
@@ -1023,6 +1018,7 @@ func (c *Conn) setEndpoints(endpoints []tailcfg.Endpoint) (changed bool) {
 func (c *Conn) SetStaticEndpoints(ep views.Slice[netip.AddrPort]) {
 	c.mu.Lock()
 	if reflect.DeepEqual(c.staticEndpoints.AsSlice(), ep.AsSlice()) {
+		c.mu.Unlock()
 		return
 	}
 	c.staticEndpoints = ep
@@ -1086,7 +1082,9 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		UPnP:                  report.UPnP,
 		PMP:                   report.PMP,
 		PCP:                   report.PCP,
-		HavePortMap:           c.portMapper.HaveMapping(),
+	}
+	if c.portMapper != nil {
+		ni.HavePortMap = c.portMapper.HaveMapping()
 	}
 	for rid, d := range report.RegionV4Latency {
 		ni.DERPLatency[fmt.Sprintf("%d-v4", rid)] = d.Seconds()
@@ -1253,7 +1251,7 @@ func (c *Conn) DiscoPublicKey() key.DiscoPublic {
 func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, error) {
 	var havePortmap bool
 	var portmapExt netip.AddrPort
-	if runtime.GOOS != "js" {
+	if runtime.GOOS != "js" && c.portMapper != nil {
 		portmapExt, havePortmap = c.portMapper.GetCachedMappingOrStartCreatingOne()
 	}
 
@@ -1293,7 +1291,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	}
 
 	// If we didn't have a portmap earlier, maybe it's done by now.
-	if !havePortmap {
+	if !havePortmap && c.portMapper != nil {
 		portmapExt, havePortmap = c.portMapper.GetCachedMappingOrStartCreatingOne()
 	}
 	if havePortmap {
@@ -1565,6 +1563,7 @@ func (c *Conn) maybeRebindOnError(err error) {
 
 	if c.lastErrRebind.Load().Before(time.Now().Add(-5 * time.Second)) {
 		c.logf("magicsock: performing rebind due to %q", reason)
+		c.lastErrRebind.Store(time.Now())
 		c.Rebind()
 		go c.ReSTUN(reason)
 	} else {
@@ -2026,7 +2025,7 @@ func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.
 		// Can't send. (e.g. no IPv6 locally)
 	} else {
 		if !c.networkDown() && pmtuShouldLogDiscoTxErr(m, err) {
-			c.logf("magicsock: disco: failed to send %v to %v: %v", disco.MessageSummary(m), dst, err)
+			c.logf("magicsock: disco: failed to send %v to %v %s: %v", disco.MessageSummary(m), dst, dstKey.ShortString(), err)
 		}
 	}
 	return sent, err
@@ -2411,11 +2410,11 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 				msgType, sender.ShortString(), derpNodeSrc.ShortString())
 			return
 		} else {
-			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v) got %s, for %d<->%d",
+			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v) got %s disco[0]=%v disco[1]=%v",
 				c.discoShort, epDisco.short,
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				msgType,
-				req.ClientDisco[0], req.ClientDisco[1])
+				req.ClientDisco[0].ShortString(), req.ClientDisco[1].ShortString())
 		}
 
 		if c.filt == nil {
@@ -2539,10 +2538,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 	// Remember this route if not present.
 	var dup bool
 	if isDerp {
-		if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
-			if ep.addCandidateEndpoint(src.ap, dm.TxID) {
-				return
-			}
+		if _, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
 			numNodes = 1
 		}
 	} else {
@@ -2670,7 +2666,9 @@ func (c *Conn) SetNetworkUp(up bool) {
 	if up {
 		c.startDerpHomeConnectLocked()
 	} else {
-		c.portMapper.NoteNetworkDown()
+		if c.portMapper != nil {
+			c.portMapper.NoteNetworkDown()
+		}
 		c.closeAllDerpLocked("network-down")
 	}
 }
@@ -3313,14 +3311,13 @@ func (c *connBind) isClosed() bool {
 //
 // Only the first close does anything. Any later closes return nil.
 func (c *Conn) Close() error {
-	// Close the [eventbus.Client] and wait for Conn.consumeEventbusTopics to
-	// return. Do this before acquiring c.mu:
+	// Close the [eventbus.Client] and wait for c.consumeEventbusTopics to
+	// return before acquiring c.mu:
 	//  1. Conn.consumeEventbusTopics event handlers also acquire c.mu, they can
 	//     deadlock with c.Close().
 	//  2. Conn.consumeEventbusTopics event handlers may not guard against
 	//     undesirable post/in-progress Conn.Close() behaviors.
-	c.eventClient.Close()
-	<-c.subsDoneCh
+	c.eventSubs.Close()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -3332,8 +3329,9 @@ func (c *Conn) Close() error {
 		c.derpCleanupTimer.Stop()
 	}
 	c.stopPeriodicReSTUNTimerLocked()
-	c.portMapper.Close()
-	c.portMapperLogfUnregister()
+	if c.portMapper != nil {
+		c.portMapper.Close()
+	}
 
 	c.peerMap.forEachEndpoint(func(ep *endpoint) {
 		ep.stopAndReset()
@@ -3586,7 +3584,9 @@ func (c *Conn) rebind(curPortFate currentPortFate) error {
 	if err := c.bindSocket(&c.pconn4, "udp4", curPortFate); err != nil {
 		return fmt.Errorf("magicsock: Rebind IPv4 failed: %w", err)
 	}
-	c.portMapper.SetLocalPort(c.LocalPort())
+	if c.portMapper != nil {
+		c.portMapper.SetLocalPort(c.LocalPort())
+	}
 	c.UpdatePMTUD()
 	return nil
 }

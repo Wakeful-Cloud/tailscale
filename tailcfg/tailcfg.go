@@ -170,7 +170,9 @@ type CapabilityVersion int
 //   - 123: 2025-07-28: fix deadlock regression from cryptokey routing change (issue #16651)
 //   - 124: 2025-08-08: removed NodeAttrDisableMagicSockCryptoRouting support, crypto routing is now mandatory
 //   - 125: 2025-08-11: dnstype.Resolver adds UseWithExitNode field.
-const CurrentCapabilityVersion CapabilityVersion = 125
+//   - 126: 2025-09-17: Client uses seamless key renewal unless disabled by control (tailscale/corp#31479)
+//   - 127: 2025-09-19: can handle C2N /debug/netmap.
+const CurrentCapabilityVersion CapabilityVersion = 127
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -1360,6 +1362,13 @@ type MapRequest struct {
 	NodeKey   key.NodePublic
 	DiscoKey  key.DiscoPublic
 
+	// HardwareAttestationKey is the public key of the node's hardware-backed
+	// identity attestation key, if any.
+	HardwareAttestationKey key.HardwareAttestationPublic `json:",omitzero"`
+	// HardwareAttestationKeySignature is the signature of the NodeKey
+	// serialized using MarshalText using its hardware attestation key, if any.
+	HardwareAttestationKeySignature []byte `json:",omitempty"`
+
 	// Stream is whether the client wants to receive multiple MapResponses over
 	// the same HTTP connection.
 	//
@@ -2255,7 +2264,14 @@ type ControlDialPlan struct {
 // connecting to the control server.
 type ControlIPCandidate struct {
 	// IP is the address to attempt connecting to.
-	IP netip.Addr
+	IP netip.Addr `json:",omitzero"`
+
+	// ACEHost, if non-empty, means that the client should connect to the
+	// control plane using an HTTPS CONNECT request to the provided hostname. If
+	// the IP field is also set, then the IP is the IP address of the ACEHost
+	// (and not the control plane) and DNS should not be used. The target (the
+	// argument to CONNECT) is always the control plane's hostname, not an IP.
+	ACEHost string `json:",omitempty"`
 
 	// DialStartSec is the number of seconds after the beginning of the
 	// connection process to wait before trying this candidate.
@@ -2523,8 +2539,19 @@ const (
 	// This cannot be set simultaneously with NodeAttrLinuxMustUseIPTables.
 	NodeAttrLinuxMustUseNfTables NodeCapability = "linux-netfilter?v=nftables"
 
-	// NodeAttrSeamlessKeyRenewal makes clients enable beta functionality
-	// of renewing node keys without breaking connections.
+	// NodeAttrDisableSeamlessKeyRenewal disables seamless key renewal, which is
+	// enabled by default in clients as of 2025-09-17 (1.90 and later).
+	//
+	// We will use this attribute to manage the rollout, and disable seamless in
+	// clients with known bugs.
+	// http://go/seamless-key-renewal
+	NodeAttrDisableSeamlessKeyRenewal NodeCapability = "disable-seamless-key-renewal"
+
+	// NodeAttrSeamlessKeyRenewal was used to opt-in to seamless key renewal
+	// during its private alpha.
+	//
+	// Deprecated: NodeAttrSeamlessKeyRenewal is deprecated as of CapabilityVersion 126,
+	// because seamless key renewal is now enabled by default.
 	NodeAttrSeamlessKeyRenewal NodeCapability = "seamless-key-renewal"
 
 	// NodeAttrProbeUDPLifetime makes the client probe UDP path lifetime at the
@@ -2656,6 +2683,14 @@ const (
 	// NodeAttrTrafficSteering configures the node to use the traffic
 	// steering subsystem for via routes. See tailscale/corp#29966.
 	NodeAttrTrafficSteering NodeCapability = "traffic-steering"
+
+	// NodeAttrTailnetDisplayName is an optional alternate name for the tailnet
+	// to be displayed to the user.
+	// If empty or absent, a default is used.
+	// If this value is present and set by a user this will only include letters,
+	// numbers, apostrophe, spaces, and hyphens. This may not be true for the default.
+	// Values can look like "foo.com" or "Foo's Test Tailnet - Staging".
+	NodeAttrTailnetDisplayName NodeCapability = "tailnet-display-name"
 )
 
 // SetDNSRequest is a request to add a DNS record.

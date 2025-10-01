@@ -28,17 +28,17 @@ import (
 	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/http2"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlhttp"
+	"tailscale.com/feature"
+	_ "tailscale.com/feature/condregister/useproxy"
 	"tailscale.com/hostinfo"
 	"tailscale.com/internal/noiseconn"
 	"tailscale.com/ipn"
+	"tailscale.com/net/ace"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
@@ -49,7 +49,9 @@ import (
 )
 
 var (
-	debugCaptureCmd func() *ffcli.Command // or nil
+	debugCaptureCmd   func() *ffcli.Command // or nil
+	debugPortmapCmd   func() *ffcli.Command // or nil
+	debugPeerRelayCmd func() *ffcli.Command // or nil
 )
 
 func debugCmd() *ffcli.Command {
@@ -287,6 +289,8 @@ func debugCmd() *ffcli.Command {
 					fs.StringVar(&ts2021Args.host, "host", "controlplane.tailscale.com", "hostname of control plane")
 					fs.IntVar(&ts2021Args.version, "version", int(tailcfg.CurrentCapabilityVersion), "protocol version")
 					fs.BoolVar(&ts2021Args.verbose, "verbose", false, "be extra verbose")
+					fs.StringVar(&ts2021Args.aceHost, "ace", "", "if non-empty, use this ACE server IP/hostname as a candidate path")
+					fs.StringVar(&ts2021Args.dialPlanJSONFile, "dial-plan", "", "if non-empty, use this JSON file to configure the dial plan")
 					return fs
 				})(),
 			},
@@ -319,21 +323,7 @@ func debugCmd() *ffcli.Command {
 				ShortHelp:  "Test a DERP configuration",
 			},
 			ccall(debugCaptureCmd),
-			{
-				Name:       "portmap",
-				ShortUsage: "tailscale debug portmap",
-				Exec:       debugPortmap,
-				ShortHelp:  "Run portmap debugging",
-				FlagSet: (func() *flag.FlagSet {
-					fs := newFlagSet("portmap")
-					fs.DurationVar(&debugPortmapArgs.duration, "duration", 5*time.Second, "timeout for port mapping")
-					fs.StringVar(&debugPortmapArgs.ty, "type", "", `portmap debug type (one of "", "pmp", "pcp", or "upnp")`)
-					fs.StringVar(&debugPortmapArgs.gatewayAddr, "gateway-addr", "", `override gateway IP (must also pass --self-addr)`)
-					fs.StringVar(&debugPortmapArgs.selfAddr, "self-addr", "", `override self IP (must also pass --gateway-addr)`)
-					fs.BoolVar(&debugPortmapArgs.logHTTP, "log-http", false, `print all HTTP requests and responses to the log`)
-					return fs
-				})(),
-			},
+			ccall(debugPortmapCmd),
 			{
 				Name:       "peer-endpoint-changes",
 				ShortUsage: "tailscale debug peer-endpoint-changes <hostname-or-IP>",
@@ -374,6 +364,18 @@ func debugCmd() *ffcli.Command {
 				ShortHelp:  "Print the current set of candidate peer relay servers",
 				Exec:       runPeerRelayServers,
 			},
+			{
+				Name:       "test-risk",
+				ShortUsage: "tailscale debug test-risk",
+				ShortHelp:  "Do a fake risky action",
+				Exec:       runTestRisk,
+				FlagSet: (func() *flag.FlagSet {
+					fs := newFlagSet("test-risk")
+					fs.StringVar(&testRiskArgs.acceptedRisk, "accept-risk", "", "comma-separated list of accepted risks")
+					return fs
+				})(),
+			},
+			ccall(debugPeerRelayCmd),
 		}...),
 	}
 }
@@ -967,6 +969,9 @@ var ts2021Args struct {
 	host    string // "controlplane.tailscale.com"
 	version int    // 27 or whatever
 	verbose bool
+	aceHost string // if non-empty, FQDN of https ACE server to use ("ace.example.com")
+
+	dialPlanJSONFile string // if non-empty, path to JSON file [tailcfg.ControlDialPlan] JSON
 }
 
 func runTS2021(ctx context.Context, args []string) error {
@@ -975,19 +980,22 @@ func runTS2021(ctx context.Context, args []string) error {
 
 	keysURL := "https://" + ts2021Args.host + "/key?v=" + strconv.Itoa(ts2021Args.version)
 
+	keyTransport := http.DefaultTransport.(*http.Transport).Clone()
+	if ts2021Args.aceHost != "" {
+		log.Printf("using ACE server %q", ts2021Args.aceHost)
+		keyTransport.Proxy = nil
+		keyTransport.DialContext = (&ace.Dialer{ACEHost: ts2021Args.aceHost}).Dial
+	}
+
 	if ts2021Args.verbose {
 		u, err := url.Parse(keysURL)
 		if err != nil {
 			return err
 		}
-		envConf := httpproxy.FromEnvironment()
-		if *envConf == (httpproxy.Config{}) {
-			log.Printf("HTTP proxy env: (none)")
-		} else {
-			log.Printf("HTTP proxy env: %+v", envConf)
+		if proxyFromEnv, ok := feature.HookProxyFromEnvironment.GetOk(); ok {
+			proxy, err := proxyFromEnv(&http.Request{URL: u})
+			log.Printf("tshttpproxy.ProxyFromEnvironment = (%v, %v)", proxy, err)
 		}
-		proxy, err := tshttpproxy.ProxyFromEnvironment(&http.Request{URL: u})
-		log.Printf("tshttpproxy.ProxyFromEnvironment = (%v, %v)", proxy, err)
 	}
 	machinePrivate := key.NewMachine()
 	var dialer net.Dialer
@@ -1000,7 +1008,7 @@ func runTS2021(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := keyTransport.RoundTrip(req)
 	if err != nil {
 		log.Printf("Do: %v", err)
 		return err
@@ -1044,6 +1052,18 @@ func runTS2021(ctx context.Context, args []string) error {
 		return fmt.Errorf("creating netmon: %w", err)
 	}
 
+	var dialPlan *tailcfg.ControlDialPlan
+	if ts2021Args.dialPlanJSONFile != "" {
+		b, err := os.ReadFile(ts2021Args.dialPlanJSONFile)
+		if err != nil {
+			return fmt.Errorf("reading dial plan JSON file: %w", err)
+		}
+		dialPlan = new(tailcfg.ControlDialPlan)
+		if err := json.Unmarshal(b, dialPlan); err != nil {
+			return fmt.Errorf("unmarshaling dial plan JSON file: %w", err)
+		}
+	}
+
 	noiseDialer := &controlhttp.Dialer{
 		Hostname:        ts2021Args.host,
 		HTTPPort:        "80",
@@ -1051,9 +1071,20 @@ func runTS2021(ctx context.Context, args []string) error {
 		MachineKey:      machinePrivate,
 		ControlKey:      keys.PublicKey,
 		ProtocolVersion: uint16(ts2021Args.version),
+		DialPlan:        dialPlan,
 		Dialer:          dialFunc,
 		Logf:            logf,
 		NetMon:          netMon,
+	}
+	if ts2021Args.aceHost != "" {
+		noiseDialer.DialPlan = &tailcfg.ControlDialPlan{
+			Candidates: []tailcfg.ControlIPCandidate{
+				{
+					ACEHost:        ts2021Args.aceHost,
+					DialTimeoutSec: 10,
+				},
+			},
+		}
 	}
 	const tries = 2
 	for i := range tries {
@@ -1197,44 +1228,6 @@ func runSetExpire(ctx context.Context, args []string) error {
 		return errors.New("usage: tailscale debug set-expire --in=<duration>")
 	}
 	return localClient.DebugSetExpireIn(ctx, setExpireArgs.in)
-}
-
-var debugPortmapArgs struct {
-	duration    time.Duration
-	gatewayAddr string
-	selfAddr    string
-	ty          string
-	logHTTP     bool
-}
-
-func debugPortmap(ctx context.Context, args []string) error {
-	opts := &tailscale.DebugPortmapOpts{
-		Duration: debugPortmapArgs.duration,
-		Type:     debugPortmapArgs.ty,
-		LogHTTP:  debugPortmapArgs.logHTTP,
-	}
-	if (debugPortmapArgs.gatewayAddr != "") != (debugPortmapArgs.selfAddr != "") {
-		return fmt.Errorf("if one of --gateway-addr and --self-addr is provided, the other must be as well")
-	}
-	if debugPortmapArgs.gatewayAddr != "" {
-		var err error
-		opts.GatewayAddr, err = netip.ParseAddr(debugPortmapArgs.gatewayAddr)
-		if err != nil {
-			return fmt.Errorf("invalid --gateway-addr: %w", err)
-		}
-		opts.SelfAddr, err = netip.ParseAddr(debugPortmapArgs.selfAddr)
-		if err != nil {
-			return fmt.Errorf("invalid --self-addr: %w", err)
-		}
-	}
-	rc, err := localClient.DebugPortmap(ctx, opts)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-
-	_, err = io.Copy(os.Stdout, rc)
-	return err
 }
 
 func runPeerEndpointChanges(ctx context.Context, args []string) error {
@@ -1401,5 +1394,20 @@ func runPeerRelayServers(ctx context.Context, args []string) error {
 	e := json.NewEncoder(os.Stdout)
 	e.SetIndent("", "  ")
 	e.Encode(v)
+	return nil
+}
+
+var testRiskArgs struct {
+	acceptedRisk string
+}
+
+func runTestRisk(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		return errors.New("unexpected arguments")
+	}
+	if err := presentRiskToUser("test-risk", "This is a test risky action.", testRiskArgs.acceptedRisk); err != nil {
+		return err
+	}
+	fmt.Println("did-test-risky-action")
 	return nil
 }

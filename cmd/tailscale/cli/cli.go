@@ -18,14 +18,15 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 
 	"github.com/mattn/go-colorable"
 	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/local"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/paths"
 	"tailscale.com/util/slicesx"
 	"tailscale.com/version/distro"
@@ -113,7 +114,7 @@ func Run(args []string) (err error) {
 	}
 
 	var warnOnce sync.Once
-	tailscale.SetVersionMismatchHandler(func(clientVer, serverVer string) {
+	local.SetVersionMismatchHandler(func(clientVer, serverVer string) {
 		warnOnce.Do(func() {
 			fmt.Fprintf(Stderr, "Warning: client version %q != tailscaled server version %q\n", clientVer, serverVer)
 		})
@@ -164,7 +165,7 @@ func Run(args []string) (err error) {
 	}
 
 	err = rootCmd.Run(context.Background())
-	if tailscale.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
+	if local.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
 		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s'.\nTo not require root, use 'sudo tailscale set --operator=$USER' once.", err, strings.Join(args, " "))
 	}
 	if errors.Is(err, flag.ErrHelp) {
@@ -208,7 +209,17 @@ func noDupFlagify(c *ffcli.Command) {
 	}
 }
 
-var fileCmd func() *ffcli.Command
+var (
+	fileCmd,
+	sysPolicyCmd,
+	maybeWebCmd,
+	maybeDriveCmd,
+	maybeNetlockCmd,
+	maybeFunnelCmd,
+	maybeServeCmd,
+	maybeCertCmd,
+	_ func() *ffcli.Command
+)
 
 func newRootCmd() *ffcli.Command {
 	rootfs := newFlagSet("tailscale")
@@ -239,7 +250,7 @@ change in the future.
 			logoutCmd,
 			switchCmd,
 			configureCmd(),
-			syspolicyCmd,
+			nilOrCall(sysPolicyCmd),
 			netcheckCmd,
 			ipCmd,
 			dnsCmd,
@@ -248,23 +259,24 @@ change in the future.
 			pingCmd,
 			ncCmd,
 			sshCmd,
-			funnelCmd(),
-			serveCmd(),
+			nilOrCall(maybeFunnelCmd),
+			nilOrCall(maybeServeCmd),
 			versionCmd,
-			webCmd,
+			nilOrCall(maybeWebCmd),
 			nilOrCall(fileCmd),
 			bugReportCmd,
-			certCmd,
-			netlockCmd,
+			nilOrCall(maybeCertCmd),
+			nilOrCall(maybeNetlockCmd),
 			licensesCmd,
 			exitNodeCmd(),
 			updateCmd,
 			whoisCmd,
 			debugCmd(),
-			driveCmd,
+			nilOrCall(maybeDriveCmd),
 			idTokenCmd,
 			configureHostCmd(),
 			systrayCmd,
+			appcRoutesCmd,
 		),
 		FlagSet: rootfs,
 		Exec: func(ctx context.Context, args []string) error {
@@ -528,4 +540,29 @@ func jsonDocsWalk(cmd *ffcli.Command) *commandDoc {
 		}
 	}
 	return res
+}
+
+func lastSeenFmt(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := max(time.Since(t), time.Minute) // at least 1 minute
+
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf(", last seen %dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf(", last seen %dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf(", last seen %dd ago", int(d.Hours()/24))
+	}
+}
+
+var hookFixTailscaledConnectError feature.Hook[func(error) error] // for cliconndiag
+
+func fixTailscaledConnectError(origErr error) error {
+	if f, ok := hookFixTailscaledConnectError.GetOk(); ok {
+		return f(origErr)
+	}
+	return origErr
 }

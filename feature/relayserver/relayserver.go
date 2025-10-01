@@ -6,14 +6,23 @@
 package relayserver
 
 import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"net/netip"
+	"strings"
 	"sync"
 
 	"tailscale.com/disco"
+	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
+	"tailscale.com/ipn/localapi"
 	"tailscale.com/net/udprelay"
 	"tailscale.com/net/udprelay/endpoint"
+	"tailscale.com/net/udprelay/status"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -29,6 +38,32 @@ const featureName = "relayserver"
 func init() {
 	feature.Register(featureName)
 	ipnext.RegisterExtension(featureName, newExtension)
+	localapi.Register("debug-peer-relay-sessions", servePeerRelayDebugSessions)
+}
+
+// servePeerRelayDebugSessions is an HTTP handler for the Local API that
+// returns debug/status information for peer relay sessions being relayed by
+// this Tailscale node. It writes a JSON-encoded [status.ServerStatus] into the
+// HTTP response, or returns an HTTP 405/500 with error text as the body.
+func servePeerRelayDebugSessions(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var e *extension
+	if ok := h.LocalBackend().FindMatchingExtension(&e); !ok {
+		http.Error(w, "peer relay server extension unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	st := e.serverStatus()
+	j, err := json.Marshal(st)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to marshal json: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Write(j)
 }
 
 // newExtension is an [ipnext.NewExtensionFn] that creates a new relay server
@@ -49,16 +84,18 @@ type extension struct {
 
 	mu                            sync.Mutex // guards the following fields
 	shutdown                      bool
-	port                          *int          // ipn.Prefs.RelayServerPort, nil if disabled
-	disconnectFromBusCh           chan struct{} // non-nil if consumeEventbusTopics is running, closed to signal it to return
-	busDoneCh                     chan struct{} // non-nil if consumeEventbusTopics is running, closed when it returns
-	hasNodeAttrDisableRelayServer bool          // tailcfg.NodeAttrDisableRelayServer
+	port                          *int                             // ipn.Prefs.RelayServerPort, nil if disabled
+	disconnectFromBusCh           chan struct{}                    // non-nil if consumeEventbusTopics is running, closed to signal it to return
+	busDoneCh                     chan struct{}                    // non-nil if consumeEventbusTopics is running, closed when it returns
+	debugSessionsCh               chan chan []status.ServerSession // non-nil if consumeEventbusTopics is running
+	hasNodeAttrDisableRelayServer bool                             // tailcfg.NodeAttrDisableRelayServer
 }
 
 // relayServer is the interface of [udprelay.Server].
 type relayServer interface {
 	AllocateEndpoint(discoA key.DiscoPublic, discoB key.DiscoPublic) (endpoint.ServerEndpoint, error)
 	Close() error
+	GetSessions() []status.ServerSession
 }
 
 // Name implements [ipnext.Extension].
@@ -89,6 +126,7 @@ func (e *extension) handleBusLifetimeLocked() {
 	port := *e.port
 	e.disconnectFromBusCh = make(chan struct{})
 	e.busDoneCh = make(chan struct{})
+	e.debugSessionsCh = make(chan chan []status.ServerSession)
 	go e.consumeEventbusTopics(port)
 }
 
@@ -115,6 +153,31 @@ func (e *extension) profileStateChanged(_ ipn.LoginProfileView, prefs ipn.PrefsV
 	e.handleBusLifetimeLocked()
 }
 
+// overrideAddrs returns TS_DEBUG_RELAY_SERVER_ADDRS as []netip.Addr, if set. It
+// can be between 0 and 3 comma-separated Addrs. TS_DEBUG_RELAY_SERVER_ADDRS is
+// not a stable interface, and is subject to change.
+var overrideAddrs = sync.OnceValue(func() (ret []netip.Addr) {
+	all := envknob.String("TS_DEBUG_RELAY_SERVER_ADDRS")
+	const max = 3
+	remain := all
+	for remain != "" && len(ret) < max {
+		var s string
+		s, remain, _ = strings.Cut(remain, ",")
+		addr, err := netip.ParseAddr(s)
+		if err != nil {
+			log.Printf("ignoring invalid Addr %q in TS_DEBUG_RELAY_SERVER_ADDRS %q: %v", s, all, err)
+			continue
+		}
+		ret = append(ret, addr)
+	}
+	return
+})
+
+// consumeEventbusTopics serves endpoint allocation requests over the eventbus.
+// It also serves [relayServer] debug information on a channel.
+// consumeEventbusTopics must never acquire [extension.mu], which can be held by
+// other goroutines while waiting to receive on [extension.busDoneCh] or the
+// inner [extension.debugSessionsCh] channel.
 func (e *extension) consumeEventbusTopics(port int) {
 	defer close(e.busDoneCh)
 
@@ -133,14 +196,20 @@ func (e *extension) consumeEventbusTopics(port int) {
 		select {
 		case <-e.disconnectFromBusCh:
 			return
-		case <-reqSub.Done():
-			// If reqSub is done, the eventClient has been closed, which is a
-			// signal to return.
+		case <-eventClient.Done():
 			return
+		case respCh := <-e.debugSessionsCh:
+			if rs == nil {
+				// Don't initialize the server simply for a debug request.
+				respCh <- nil
+				continue
+			}
+			sessions := rs.GetSessions()
+			respCh <- sessions
 		case req := <-reqSub.Events():
 			if rs == nil {
 				var err error
-				rs, err = udprelay.NewServer(e.logf, port, nil)
+				rs, err = udprelay.NewServer(e.logf, port, overrideAddrs())
 				if err != nil {
 					e.logf("error initializing server: %v", err)
 					continue
@@ -177,6 +246,7 @@ func (e *extension) disconnectFromBusLocked() {
 		<-e.busDoneCh
 		e.busDoneCh = nil
 		e.disconnectFromBusCh = nil
+		e.debugSessionsCh = nil
 	}
 }
 
@@ -187,4 +257,31 @@ func (e *extension) Shutdown() error {
 	e.disconnectFromBusLocked()
 	e.shutdown = true
 	return nil
+}
+
+// serverStatus gathers and returns current peer relay server status information
+// for this Tailscale node, and status of each peer relay session this node is
+// relaying (if any).
+func (e *extension) serverStatus() status.ServerStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	st := status.ServerStatus{
+		UDPPort:  nil,
+		Sessions: nil,
+	}
+	if e.port == nil || e.busDoneCh == nil {
+		return st
+	}
+	st.UDPPort = ptr.To(*e.port)
+
+	ch := make(chan []status.ServerSession)
+	select {
+	case e.debugSessionsCh <- ch:
+		resp := <-ch
+		st.Sessions = resp
+		return st
+	case <-e.busDoneCh:
+		return st
+	}
 }

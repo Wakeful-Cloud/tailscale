@@ -31,6 +31,8 @@ import (
 	"golang.org/x/term"
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/log/filelogger"
@@ -43,7 +45,6 @@ import (
 	"tailscale.com/net/netns"
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
-	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/types/logger"
@@ -51,8 +52,8 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
-	"tailscale.com/util/syspolicy"
 	"tailscale.com/util/syspolicy/pkey"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
@@ -66,7 +67,7 @@ var getLogTargetOnce struct {
 func getLogTarget() string {
 	getLogTargetOnce.Do(func() {
 		envTarget, _ := os.LookupEnv("TS_LOG_TARGET")
-		getLogTargetOnce.v, _ = syspolicy.GetString(pkey.LogTarget, envTarget)
+		getLogTargetOnce.v, _ = policyclient.Get().GetString(pkey.LogTarget, envTarget)
 	})
 
 	return getLogTargetOnce.v
@@ -106,6 +107,7 @@ type Policy struct {
 	// Logtail is the logger.
 	Logtail *logtail.Logger
 	// PublicID is the logger's instance identifier.
+	// It may be the zero value if logging is not in use.
 	PublicID logid.PublicID
 	// Logf is where to write informational messages about this Logger.
 	Logf logger.Logf
@@ -464,18 +466,6 @@ func New(collection string, netMon *netmon.Monitor, health *health.Tracker, logf
 	}.New()
 }
 
-// Deprecated: Use [Options.New] instead.
-func NewWithConfigPath(collection, dir, cmdName string, netMon *netmon.Monitor, health *health.Tracker, logf logger.Logf) *Policy {
-	return Options{
-		Collection: collection,
-		Dir:        dir,
-		CmdName:    cmdName,
-		NetMon:     netMon,
-		Health:     health,
-		Logf:       logf,
-	}.New()
-}
-
 // Options is used to construct a [Policy].
 type Options struct {
 	// Collection is a required collection to upload logs under.
@@ -694,7 +684,7 @@ func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 
 // New returns a new log policy (a logger and its instance ID).
 func (opts Options) New() *Policy {
-	disableLogging := envknob.NoLogsNoSupport() || testenv.InTest() || runtime.GOOS == "plan9"
+	disableLogging := envknob.NoLogsNoSupport() || testenv.InTest() || runtime.GOOS == "plan9" || !buildfeatures.HasLogTail
 	_, policy := opts.init(disableLogging)
 	return policy
 }
@@ -868,7 +858,7 @@ type TransportOptions struct {
 // New returns an HTTP Transport particularly suited to uploading logs
 // to the given host name. See [DialContext] for details on how it works.
 func (opts TransportOptions) New() http.RoundTripper {
-	if testenv.InTest() {
+	if testenv.InTest() || envknob.NoLogsNoSupport() {
 		return noopPretendSuccessTransport{}
 	}
 	if opts.NetMon == nil {
@@ -880,8 +870,12 @@ func (opts TransportOptions) New() http.RoundTripper {
 		tr.TLSClientConfig = opts.TLSClientConfig.Clone()
 	}
 
-	tr.Proxy = tshttpproxy.ProxyFromEnvironment
-	tshttpproxy.SetTransportGetProxyConnectHeader(tr)
+	if buildfeatures.HasUseProxy {
+		tr.Proxy = feature.HookProxyFromEnvironment.GetOrNil()
+		if set, ok := feature.HookProxySetTransportGetProxyConnectHeader.GetOk(); ok {
+			set(tr)
+		}
+	}
 
 	// We do our own zstd compression on uploads, and responses never contain any payload,
 	// so don't send "Accept-Encoding: gzip" to save a few bytes on the wire, since there

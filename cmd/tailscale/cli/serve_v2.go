@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_serve
+
 package cli
 
 import (
@@ -24,7 +26,7 @@ import (
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
@@ -365,7 +367,7 @@ func (e *serveEnv) runServeCombined(subcmd serveMode) execFunc {
 			}
 		}
 
-		var watcher *tailscale.IPNBusWatcher
+		var watcher *local.IPNBusWatcher
 		svcName := noService
 
 		if forService {
@@ -426,7 +428,7 @@ func (e *serveEnv) runServeCombined(subcmd serveMode) execFunc {
 		}
 
 		if err := e.lc.SetServeConfig(ctx, parentSC); err != nil {
-			if tailscale.IsPreconditionsFailedError(err) {
+			if local.IsPreconditionsFailedError(err) {
 				fmt.Fprintln(e.stderr(), "Another client is changing the serve config; please try again.")
 			}
 			return err
@@ -1084,7 +1086,7 @@ func (e *serveEnv) removeWebServe(sc *ipn.ServeConfig, dnsName string, srvPort u
 
 	if len(mounts) > 1 {
 		msg := fmt.Sprintf("Are you sure you want to delete %d handlers under port %s?", len(mounts), portStr)
-		if !e.yes && !prompt.YesNo(msg) {
+		if !e.yes && !prompt.YesNo(msg, true) {
 			return nil
 		}
 	}

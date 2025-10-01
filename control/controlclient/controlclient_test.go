@@ -35,6 +35,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
+	"tailscale.com/util/eventbus/eventbustest"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
@@ -218,6 +219,8 @@ func TestDirectProxyManual(t *testing.T) {
 		t.Skip("skipping without --live-network-test")
 	}
 
+	bus := eventbustest.NewBus(t)
+
 	dialer := &tsdial.Dialer{}
 	dialer.SetNetMon(netmon.NewStatic())
 
@@ -233,12 +236,13 @@ func TestDirectProxyManual(t *testing.T) {
 		},
 		DiscoPublicKey: key.NewDisco().Public(),
 		Logf:           t.Logf,
-		HealthTracker:  &health.Tracker{},
+		HealthTracker:  health.NewTracker(bus),
 		PopBrowserURL: func(url string) {
 			t.Logf("PopBrowserURL: %q", url)
 		},
 		Dialer:       dialer,
 		ControlKnobs: &controlknobs.Knobs{},
+		Bus:          bus,
 	}
 	d, err := NewDirect(opts)
 	if err != nil {
@@ -262,6 +266,8 @@ func TestHTTPSWithProxy(t *testing.T) { testHTTPS(t, true) }
 
 func testHTTPS(t *testing.T, withProxy bool) {
 	bakedroots.ResetForTest(t, tlstest.TestRootCA())
+
+	bus := eventbustest.NewBus(t)
 
 	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", tlstest.ControlPlane.ServerTLSConfig())
 	if err != nil {
@@ -322,11 +328,12 @@ func testHTTPS(t *testing.T, withProxy bool) {
 		},
 		DiscoPublicKey: key.NewDisco().Public(),
 		Logf:           t.Logf,
-		HealthTracker:  &health.Tracker{},
+		HealthTracker:  health.NewTracker(bus),
 		PopBrowserURL: func(url string) {
 			t.Logf("PopBrowserURL: %q", url)
 		},
 		Dialer: dialer,
+		Bus:    bus,
 	}
 	d, err := NewDirect(opts)
 	if err != nil {

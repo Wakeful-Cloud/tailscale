@@ -5,6 +5,7 @@
 package testcontrol
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -30,10 +31,13 @@ import (
 	"tailscale.com/control/controlhttp/controlhttpserver"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
+	"tailscale.com/util/httpm"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 	"tailscale.com/util/rands"
@@ -53,11 +57,22 @@ type Server struct {
 	Verbose        bool
 	DNSConfig      *tailcfg.DNSConfig // nil means no DNS config
 	MagicDNSDomain string
-	HandleC2N      http.Handler // if non-nil, used for /some-c2n-path/ in tests
+	C2NResponses   syncs.Map[string, func(*http.Response)] // token => onResponse func
+
+	// PeerRelayGrants, if true, inserts relay capabilities into the wildcard
+	// grants rules.
+	PeerRelayGrants bool
 
 	// AllNodesSameUser, if true, makes all created nodes
 	// belong to the same user.
 	AllNodesSameUser bool
+
+	// DefaultNodeCapabilities overrides the capability map sent to each client.
+	DefaultNodeCapabilities *tailcfg.NodeCapMap
+
+	// CollectServices, if non-empty, sets whether the control server asks
+	// for service updates. If empty, the default is "true".
+	CollectServices opt.Bool
 
 	// ExplicitBaseURL or HTTPTestServer must be set.
 	ExplicitBaseURL string           // e.g. "http://127.0.0.1:1234" with no trailing URL
@@ -179,6 +194,52 @@ func (s *Server) AddPingRequest(nodeKeyDst key.NodePublic, pr *tailcfg.PingReque
 	return s.addDebugMessage(nodeKeyDst, pr)
 }
 
+// c2nRoundTripper is an http.RoundTripper that sends requests to a node via C2N.
+type c2nRoundTripper struct {
+	s *Server
+	n key.NodePublic
+}
+
+func (s *Server) NodeRoundTripper(n key.NodePublic) http.RoundTripper {
+	return c2nRoundTripper{s, n}
+}
+
+func (rt c2nRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	resc := make(chan *http.Response, 1)
+	if err := rt.s.SendC2N(rt.n, req, func(r *http.Response) { resc <- r }); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-resc:
+		return r, nil
+	}
+}
+
+// SendC2N sends req to node. When the response is received, onRes is called.
+func (s *Server) SendC2N(node key.NodePublic, req *http.Request, onRes func(*http.Response)) error {
+	var buf bytes.Buffer
+	if err := req.Write(&buf); err != nil {
+		return err
+	}
+
+	token := rands.HexString(10)
+	pr := &tailcfg.PingRequest{
+		URL:     "https://unused/c2n/" + token,
+		Log:     true,
+		Types:   "c2n",
+		Payload: buf.Bytes(),
+	}
+	s.C2NResponses.Store(token, onRes)
+	if !s.AddPingRequest(node, pr) {
+		s.C2NResponses.Delete(token)
+		return fmt.Errorf("node %v not connected", node)
+	}
+	return nil
+}
+
 // AddRawMapResponse delivers the raw MapResponse mr to nodeKeyDst. It's meant
 // for testing incremental map updates.
 //
@@ -265,9 +326,7 @@ func (s *Server) initMux() {
 	s.mux.HandleFunc("/key", s.serveKey)
 	s.mux.HandleFunc("/machine/", s.serveMachine)
 	s.mux.HandleFunc("/ts2021", s.serveNoiseUpgrade)
-	if s.HandleC2N != nil {
-		s.mux.Handle("/some-c2n-path/", s.HandleC2N)
-	}
+	s.mux.HandleFunc("/c2n/", s.serveC2N)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -279,6 +338,37 @@ func (s *Server) serveUnhandled(w http.ResponseWriter, r *http.Request) {
 	var got bytes.Buffer
 	r.Write(&got)
 	go panic(fmt.Sprintf("testcontrol.Server received unhandled request: %s", got.Bytes()))
+}
+
+// serveC2N handles a POST from a node containing a c2n response.
+func (s *Server) serveC2N(w http.ResponseWriter, r *http.Request) {
+	if err := func() error {
+		if r.Method != httpm.POST {
+			return errors.New("POST required")
+		}
+		token, ok := strings.CutPrefix(r.URL.Path, "/c2n/")
+		if !ok {
+			return fmt.Errorf("invalid path %q", r.URL.Path)
+		}
+
+		onRes, ok := s.C2NResponses.Load(token)
+		if !ok {
+			return fmt.Errorf("unknown c2n token %q", token)
+		}
+		s.C2NResponses.Delete(token)
+
+		res, err := http.ReadResponse(bufio.NewReader(r.Body), nil)
+		if err != nil {
+			return fmt.Errorf("error reading c2n response: %w", err)
+		}
+		onRes(res)
+		return nil
+	}(); err != nil {
+		s.logf("testcontrol: %s", err)
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type peerMachinePublicContextKey struct{}
@@ -644,6 +734,25 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		// some follow-ups? For now all are successes.
 	}
 
+	// The in-memory list of nodes, users, and logins is keyed by
+	// the node key.  If the node key changes, update all the data stores
+	// to use the new node key.
+	s.mu.Lock()
+	if _, oldNodeKeyOk := s.nodes[req.OldNodeKey]; oldNodeKeyOk {
+		if _, newNodeKeyOk := s.nodes[req.NodeKey]; !newNodeKeyOk {
+			s.nodes[req.OldNodeKey].Key = req.NodeKey
+			s.nodes[req.NodeKey] = s.nodes[req.OldNodeKey]
+
+			s.users[req.NodeKey] = s.users[req.OldNodeKey]
+			s.logins[req.NodeKey] = s.logins[req.OldNodeKey]
+
+			delete(s.nodes, req.OldNodeKey)
+			delete(s.users, req.OldNodeKey)
+			delete(s.logins, req.OldNodeKey)
+		}
+	}
+	s.mu.Unlock()
+
 	nk := req.NodeKey
 
 	user, login := s.getUser(nk)
@@ -663,6 +772,19 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 			v4Prefix,
 			v6Prefix,
 		}
+
+		var capMap tailcfg.NodeCapMap
+		if s.DefaultNodeCapabilities != nil {
+			capMap = *s.DefaultNodeCapabilities
+		} else {
+			capMap = tailcfg.NodeCapMap{
+				tailcfg.CapabilityHTTPS:                           []tailcfg.RawMessage{},
+				tailcfg.NodeAttrFunnel:                            []tailcfg.RawMessage{},
+				tailcfg.CapabilityFileSharing:                     []tailcfg.RawMessage{},
+				tailcfg.CapabilityFunnelPorts + "?ports=8080,443": []tailcfg.RawMessage{},
+			}
+		}
+
 		node := &tailcfg.Node{
 			ID:                tailcfg.NodeID(nodeID),
 			StableID:          tailcfg.StableNodeID(fmt.Sprintf("TESTCTRL%08x", int(nodeID))),
@@ -674,12 +796,9 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 			AllowedIPs:        allowedIPs,
 			Hostinfo:          req.Hostinfo.View(),
 			Name:              req.Hostinfo.Hostname,
-			Capabilities: []tailcfg.NodeCapability{
-				tailcfg.CapabilityHTTPS,
-				tailcfg.NodeAttrFunnel,
-				tailcfg.CapabilityFileSharing,
-				tailcfg.CapabilityFunnelPorts + "?ports=8080,443",
-			},
+			Cap:               req.Version,
+			CapMap:            capMap,
+			Capabilities:      slices.Collect(maps.Keys(capMap)),
 		}
 		s.nodes[nk] = node
 	}
@@ -811,6 +930,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 		endpoints := filterInvalidIPv6Endpoints(req.Endpoints)
 		node.Endpoints = endpoints
 		node.DiscoKey = req.DiscoKey
+		node.Cap = req.Version
 		if req.Hostinfo != nil {
 			node.Hostinfo = req.Hostinfo.View()
 			if ni := node.Hostinfo.NetInfo(); ni.Valid() {
@@ -929,14 +1049,21 @@ var keepAliveMsg = &struct {
 	KeepAlive: true,
 }
 
-func packetFilterWithIngressCaps() []tailcfg.FilterRule {
+func packetFilterWithIngress(addRelayCaps bool) []tailcfg.FilterRule {
 	out := slices.Clone(tailcfg.FilterAllowAll)
+	caps := []tailcfg.PeerCapability{
+		tailcfg.PeerCapabilityIngress,
+	}
+	if addRelayCaps {
+		caps = append(caps, tailcfg.PeerCapabilityRelay)
+		caps = append(caps, tailcfg.PeerCapabilityRelayTarget)
+	}
 	out = append(out, tailcfg.FilterRule{
 		SrcIPs: []string{"*"},
 		CapGrant: []tailcfg.CapGrant{
 			{
 				Dsts: []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()},
-				Caps: []tailcfg.PeerCapability{tailcfg.PeerCapabilityIngress},
+				Caps: caps,
 			},
 		},
 	})
@@ -974,8 +1101,8 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		Node:            node,
 		DERPMap:         s.DERPMap,
 		Domain:          domain,
-		CollectServices: "true",
-		PacketFilter:    packetFilterWithIngressCaps(),
+		CollectServices: cmp.Or(s.CollectServices, opt.True),
+		PacketFilter:    packetFilterWithIngress(s.PeerRelayGrants),
 		DNSConfig:       dns,
 		ControlTime:     &t,
 	}
@@ -1057,18 +1184,25 @@ func (s *Server) canGenerateAutomaticMapResponseFor(nk key.NodePublic) bool {
 func (s *Server) hasPendingRawMapMessage(nk key.NodePublic) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.msgToSend[nk].(*tailcfg.MapResponse)
+	_, ok := s.msgToSend[nk]
 	return ok
 }
 
 func (s *Server) takeRawMapMessage(nk key.NodePublic) (mapResJSON []byte, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	mr, ok := s.msgToSend[nk].(*tailcfg.MapResponse)
+	mr, ok := s.msgToSend[nk]
 	if !ok {
 		return nil, false
 	}
 	delete(s.msgToSend, nk)
+
+	// If it's a bare PingRequest, wrap it in a MapResponse.
+	switch pr := mr.(type) {
+	case *tailcfg.PingRequest:
+		mr = &tailcfg.MapResponse{PingRequest: pr}
+	}
+
 	var err error
 	mapResJSON, err = json.Marshal(mr)
 	if err != nil {

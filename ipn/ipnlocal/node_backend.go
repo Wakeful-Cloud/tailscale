@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"go4.org/netipx"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/tsaddr"
@@ -168,6 +169,7 @@ func (nb *nodeBackend) NetworkProfile() ipn.NetworkProfile {
 		// These are ok to call with nil netMap.
 		MagicDNSName: nb.netMap.MagicDNSSuffix(),
 		DomainName:   nb.netMap.DomainName(),
+		DisplayName:  nb.netMap.TailnetDisplayName(),
 	}
 }
 
@@ -255,6 +257,12 @@ func (nb *nodeBackend) PeersForTest() []tailcfg.NodeView {
 		return cmp.Compare(a.ID(), b.ID())
 	})
 	return ret
+}
+
+func (nb *nodeBackend) CollectServices() bool {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	return nb.netMap != nil && nb.netMap.CollectServices
 }
 
 // AppendMatchingPeers returns base with all peers that match pred appended.
@@ -622,6 +630,9 @@ func useWithExitNodeRoutes(routes map[string][]*dnstype.Resolver) map[string][]*
 func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.NodeView, prefs ipn.PrefsView, selfExpired bool, logf logger.Logf, versionOS string) *dns.Config {
 	if nm == nil {
 		return nil
+	}
+	if !buildfeatures.HasDNS {
+		return &dns.Config{}
 	}
 
 	// If the current node's key is expired, then we don't program any DNS

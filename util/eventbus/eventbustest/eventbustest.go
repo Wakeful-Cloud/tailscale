@@ -10,12 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"tailscale.com/util/eventbus"
 )
 
 // NewBus constructs an [eventbus.Bus] that will be shut automatically when
 // its controlling test ends.
-func NewBus(t *testing.T) *eventbus.Bus {
+func NewBus(t testing.TB) *eventbus.Bus {
 	bus := eventbus.New()
 	t.Cleanup(bus.Close)
 	return bus
@@ -79,6 +80,11 @@ func Type[T any]() func(T) { return func(T) {} }
 //	// The if error != nil, the test helper will return that error immediately.
 //	func(e ExpectedType) (bool, error)
 //
+//	// Tests for event type and whatever is defined in the body.
+//	// If a non-nil error is reported, the test helper will return that error
+//	// immediately; otherwise the expectation is considered to be met.
+//	func(e ExpectedType) error
+//
 // If the list of events must match exactly with no extra events,
 // use [ExpectExactly].
 func Expect(tw *Watcher, filters ...any) error {
@@ -100,7 +106,7 @@ func Expect(tw *Watcher, filters ...any) error {
 		case <-time.After(tw.TimeOut):
 			return fmt.Errorf(
 				"timed out waiting for event, saw %d events, %d was expected",
-				eventCount, head)
+				eventCount, len(filters))
 		case <-tw.chDone:
 			return errors.New("watcher closed while waiting for events")
 		}
@@ -114,7 +120,12 @@ func Expect(tw *Watcher, filters ...any) error {
 // [Expect]. Use [Expect] if other events are allowed.
 func ExpectExactly(tw *Watcher, filters ...any) error {
 	if len(filters) == 0 {
-		return errors.New("no event filters were provided")
+		select {
+		case event := <-tw.events:
+			return fmt.Errorf("saw event type %s, expected none", reflect.TypeOf(event))
+		case <-time.After(tw.TimeOut):
+			return nil
+		}
 	}
 	eventCount := 0
 	for pos, next := range filters {
@@ -138,7 +149,7 @@ func ExpectExactly(tw *Watcher, filters ...any) error {
 		case <-time.After(tw.TimeOut):
 			return fmt.Errorf(
 				"timed out waiting for event, saw %d events, %d was expected",
-				eventCount, pos)
+				eventCount, len(filters))
 		case <-tw.chDone:
 			return errors.New("watcher closed while waiting for events")
 		}
@@ -179,15 +190,22 @@ func eventFilter(f any) filter {
 			return []reflect.Value{reflect.ValueOf(true), reflect.Zero(reflect.TypeFor[error]())}
 		}
 	case 1:
-		if ft.Out(0) != reflect.TypeFor[bool]() {
-			panic(fmt.Sprintf("result is %T, want bool", ft.Out(0)))
-		}
-		fixup = func(vals []reflect.Value) []reflect.Value {
-			return append(vals, reflect.Zero(reflect.TypeFor[error]()))
+		switch ft.Out(0) {
+		case reflect.TypeFor[bool]():
+			fixup = func(vals []reflect.Value) []reflect.Value {
+				return append(vals, reflect.Zero(reflect.TypeFor[error]()))
+			}
+		case reflect.TypeFor[error]():
+			fixup = func(vals []reflect.Value) []reflect.Value {
+				pass := vals[0].IsZero()
+				return append([]reflect.Value{reflect.ValueOf(pass)}, vals...)
+			}
+		default:
+			panic(fmt.Sprintf("result is %v, want bool or error", ft.Out(0)))
 		}
 	case 2:
 		if ft.Out(0) != reflect.TypeFor[bool]() || ft.Out(1) != reflect.TypeFor[error]() {
-			panic(fmt.Sprintf("results are %T, %T; want bool, error", ft.Out(0), ft.Out(1)))
+			panic(fmt.Sprintf("results are %v, %v; want bool, error", ft.Out(0), ft.Out(1)))
 		}
 		fixup = func(vals []reflect.Value) []reflect.Value { return vals }
 	default:
@@ -236,4 +254,39 @@ func Inject[T any](inj *Injector, event T) {
 		inj.publishers[eventType] = pub
 	}
 	pub.(*eventbus.Publisher[T]).Publish(event)
+}
+
+// EqualTo returns an event-matching function for use with [Expect] and
+// [ExpectExactly] that matches on an event of the given type that is equal to
+// want by comparison with [cmp.Diff]. The expectation fails with an error
+// message including the diff, if present.
+func EqualTo[T any](want T) func(T) error {
+	return func(got T) error {
+		if diff := cmp.Diff(got, want); diff != "" {
+			return fmt.Errorf("wrong result (-got, +want):\n%s", diff)
+		}
+		return nil
+	}
+}
+
+// LogAllEvents logs summaries of all the events routed via the specified bus
+// during the execution of the test governed by t. This is intended to support
+// development and debugging of tests.
+func LogAllEvents(t testing.TB, bus *eventbus.Bus) {
+	dw := bus.Debugger().WatchBus()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var i int
+		for {
+			select {
+			case <-dw.Done():
+				return
+			case re := <-dw.Events():
+				i++
+				t.Logf("[eventbus] #%[1]d: %[2]T | %+[2]v", i, re.Event)
+			}
+		}
+	}()
+	t.Cleanup(func() { dw.Close(); <-done })
 }

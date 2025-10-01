@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"tailscale.com/health"
-	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
@@ -22,7 +21,9 @@ import (
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/structs"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/execqueue"
 )
 
@@ -122,7 +123,7 @@ type Auto struct {
 	observerQueue execqueue.ExecQueue
 	shutdownFn    func() // to be called prior to shutdown or nil
 
-	unregisterHealthWatch func()
+	eventSubs eventbus.Monitor
 
 	mu sync.Mutex // mutex guards the following fields
 
@@ -193,19 +194,39 @@ func NewNoStart(opts Options) (_ *Auto, err error) {
 		observer:   opts.Observer,
 		shutdownFn: opts.Shutdown,
 	}
+
+	// Set up eventbus client and subscriber
+	ec := opts.Bus.Client("controlClient.Auto")
+	c.eventSubs = ec.Monitor(c.consumeEventbusTopics(ec))
+
 	c.authCtx, c.authCancel = context.WithCancel(context.Background())
 	c.authCtx = sockstats.WithSockStats(c.authCtx, sockstats.LabelControlClientAuto, opts.Logf)
 
 	c.mapCtx, c.mapCancel = context.WithCancel(context.Background())
 	c.mapCtx = sockstats.WithSockStats(c.mapCtx, sockstats.LabelControlClientAuto, opts.Logf)
 
-	c.unregisterHealthWatch = opts.HealthTracker.RegisterWatcher(func(c health.Change) {
-		if c.WarnableChanged {
-			direct.ReportWarnableChange(c.Warnable, c.UnhealthyState)
-		}
-	})
 	return c, nil
+}
 
+// consumeEventbusTopics consumes events from all relevant
+// [eventbus.Subscriber]'s and passes them to their related handler. Events are
+// always handled in the order they are received, i.e. the next event is not
+// read until the previous event's handler has returned. It returns when the
+// [eventbus.Client] is closed.
+func (c *Auto) consumeEventbusTopics(ec *eventbus.Client) func(*eventbus.Client) {
+	healthChangeSub := eventbus.Subscribe[health.Change](ec)
+	return func(cli *eventbus.Client) {
+		for {
+			select {
+			case <-cli.Done():
+				return
+			case change := <-healthChangeSub.Events():
+				if change.WarnableChanged {
+					c.direct.ReportWarnableChange(change.Warnable, change.UnhealthyState)
+				}
+			}
+		}
+	}
 }
 
 // SetPaused controls whether HTTP activity should be paused.
@@ -422,6 +443,11 @@ func (c *Auto) unpausedChanLocked() <-chan bool {
 	unpaused := make(chan bool, 1)
 	c.unpauseWaiters = append(c.unpauseWaiters, unpaused)
 	return unpaused
+}
+
+// ClientID returns the ClientID of the direct controlClient
+func (c *Auto) ClientID() int64 {
+	return c.direct.ClientID()
 }
 
 // mapRoutineState is the state of Auto.mapRoutine while it's running.
@@ -756,6 +782,8 @@ func (c *Auto) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 }
 
 func (c *Auto) Shutdown() {
+	c.eventSubs.Close()
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -779,7 +807,6 @@ func (c *Auto) Shutdown() {
 		shutdownFn()
 	}
 
-	c.unregisterHealthWatch()
 	<-c.authDone
 	<-c.mapDone
 	<-c.updateDone

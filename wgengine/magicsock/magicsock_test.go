@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unsafe"
 
@@ -39,8 +40,7 @@ import (
 	"golang.org/x/net/ipv4"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
-	"tailscale.com/derp"
-	"tailscale.com/derp/derphttp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -67,6 +67,7 @@ import (
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/util/set"
@@ -111,9 +112,9 @@ func (c *Conn) WaitReady(t testing.TB) {
 }
 
 func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, stunIP netip.Addr) (derpMap *tailcfg.DERPMap, cleanup func()) {
-	d := derp.NewServer(key.NewNode(), logf)
+	d := derpserver.New(key.NewNode(), logf)
 
-	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(d))
+	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(d))
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
 	httpsrv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
 	httpsrv.StartTLS()
@@ -179,14 +180,13 @@ func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, der
 func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey key.NodePrivate) *magicStack {
 	t.Helper()
 
-	bus := eventbus.New()
-	t.Cleanup(bus.Close)
+	bus := eventbustest.NewBus(t)
 
 	netMon, err := netmon.New(bus, logf)
 	if err != nil {
 		t.Fatalf("netmon.New: %v", err)
 	}
-	ht := new(health.Tracker)
+	ht := health.NewTracker(bus)
 
 	var reg usermetric.Registry
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
@@ -1352,8 +1352,7 @@ func newTestConn(t testing.TB) *Conn {
 	t.Helper()
 	port := pickPort(t)
 
-	bus := eventbus.New()
-	t.Cleanup(bus.Close)
+	bus := eventbustest.NewBus(t)
 
 	netMon, err := netmon.New(bus, logger.WithPrefix(t.Logf, "... netmon: "))
 	if err != nil {
@@ -1364,7 +1363,7 @@ func newTestConn(t testing.TB) *Conn {
 	conn, err := NewConn(Options{
 		NetMon:                 netMon,
 		EventBus:               bus,
-		HealthTracker:          new(health.Tracker),
+		HealthTracker:          health.NewTracker(bus),
 		Metrics:                new(usermetric.Registry),
 		DisablePortMapper:      true,
 		Logf:                   t.Logf,
@@ -3038,7 +3037,7 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 	}
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
-			ht := new(health.Tracker)
+			ht := health.NewTracker(eventbustest.NewBus(t))
 			c := newConn(t.Logf)
 			c.myDerp = tt.old
 			c.derpMap = derpMap
@@ -3116,47 +3115,119 @@ func TestMaybeRebindOnError(t *testing.T) {
 	}
 
 	t.Run("no-frequent-rebind", func(t *testing.T) {
-		if runtime.GOOS != "plan9" {
-			err := fmt.Errorf("outer err: %w", syscall.EPERM)
-			conn := newTestConn(t)
-			defer conn.Close()
-			conn.lastErrRebind.Store(time.Now().Add(-1 * time.Second))
-			before := metricRebindCalls.Value()
-			conn.maybeRebindOnError(err)
-			after := metricRebindCalls.Value()
-			if before != after {
-				t.Errorf("should not rebind within 5 seconds of last")
+		synctest.Test(t, func(t *testing.T) {
+			if runtime.GOOS != "plan9" {
+				err := fmt.Errorf("outer err: %w", syscall.EPERM)
+				conn := newTestConn(t)
+				defer conn.Close()
+				lastRebindTime := time.Now().Add(-1 * time.Second)
+				conn.lastErrRebind.Store(lastRebindTime)
+				before := metricRebindCalls.Value()
+				conn.maybeRebindOnError(err)
+				after := metricRebindCalls.Value()
+				if before != after {
+					t.Errorf("should not rebind within 5 seconds of last")
+				}
+
+				// ensure that rebinds are performed and store an updated last
+				// rebind time.
+				time.Sleep(6 * time.Second)
+
+				conn.maybeRebindOnError(err)
+				newTime := conn.lastErrRebind.Load()
+				if newTime == lastRebindTime {
+					t.Errorf("expected a rebind to occur")
+				}
+				if newTime.Sub(lastRebindTime) < 5*time.Second {
+					t.Errorf("expected at least 5 seconds between %s and %s", lastRebindTime, newTime)
+				}
 			}
-		}
+
+		})
 	})
 }
 
-func TestNetworkDownSendErrors(t *testing.T) {
+func newTestConnAndRegistry(t *testing.T) (*Conn, *usermetric.Registry, func()) {
+	t.Helper()
 	bus := eventbus.New()
-	defer bus.Close()
-
 	netMon := must.Get(netmon.New(bus, t.Logf))
-	defer netMon.Close()
 
 	reg := new(usermetric.Registry)
+
 	conn := must.Get(NewConn(Options{
 		DisablePortMapper: true,
 		Logf:              t.Logf,
 		NetMon:            netMon,
-		Metrics:           reg,
 		EventBus:          bus,
+		Metrics:           reg,
 	}))
-	defer conn.Close()
 
-	conn.SetNetworkUp(false)
-	if err := conn.Send([][]byte{{00}}, &lazyEndpoint{}, 0); err == nil {
-		t.Error("expected error, got nil")
+	return conn, reg, func() {
+		bus.Close()
+		netMon.Close()
+		conn.Close()
 	}
-	resp := httptest.NewRecorder()
-	reg.Handler(resp, new(http.Request))
-	if !strings.Contains(resp.Body.String(), `tailscaled_outbound_dropped_packets_total{reason="error"} 1`) {
-		t.Errorf("expected NetworkDown to increment packet dropped metric; got %q", resp.Body.String())
-	}
+}
+
+func TestNetworkSendErrors(t *testing.T) {
+	t.Run("network-down", func(t *testing.T) {
+		// TODO(alexc): This test case fails on Windows because it never
+		// successfully sends the first packet:
+		//
+		// 	   expected successful Send, got err: "write udp4 0.0.0.0:57516->127.0.0.1:9999:
+		// 	   wsasendto: The requested address is not valid in its context."
+		//
+		// It would be nice to run this test on Windows, but I was already
+		// on a side quest and it was unclear if this test has ever worked
+		// correctly on Windows.
+		if runtime.GOOS == "windows" {
+			t.Skipf("skipping on %s", runtime.GOOS)
+		}
+
+		conn, reg, close := newTestConnAndRegistry(t)
+		defer close()
+
+		buffs := [][]byte{{00, 00, 00, 00, 00, 00, 00, 00}}
+		ep := &lazyEndpoint{
+			src: epAddr{ap: netip.MustParseAddrPort("127.0.0.1:9999")},
+		}
+		offset := 8
+
+		// Check this is a valid payload to send when the network is up
+		conn.SetNetworkUp(true)
+		if err := conn.Send(buffs, ep, offset); err != nil {
+			t.Errorf("expected successful Send, got err: %q", err)
+		}
+
+		// Now we know the payload would be sent if the network is up,
+		// send it again when the network is down
+		conn.SetNetworkUp(false)
+		err := conn.Send(buffs, ep, offset)
+		if err == nil {
+			t.Error("expected error, got nil")
+		}
+		resp := httptest.NewRecorder()
+		reg.Handler(resp, new(http.Request))
+		if !strings.Contains(resp.Body.String(), `tailscaled_outbound_dropped_packets_total{reason="error"} 1`) {
+			t.Errorf("expected NetworkDown to increment packet dropped metric; got %q", resp.Body.String())
+		}
+	})
+
+	t.Run("invalid-payload", func(t *testing.T) {
+		conn, reg, close := newTestConnAndRegistry(t)
+		defer close()
+
+		conn.SetNetworkUp(false)
+		err := conn.Send([][]byte{{00}}, &lazyEndpoint{}, 0)
+		if err == nil {
+			t.Error("expected error, got nil")
+		}
+		resp := httptest.NewRecorder()
+		reg.Handler(resp, new(http.Request))
+		if !strings.Contains(resp.Body.String(), `tailscaled_outbound_dropped_packets_total{reason="error"} 1`) {
+			t.Errorf("expected invalid payload to increment packet dropped metric; got %q", resp.Body.String())
+		}
+	})
 }
 
 func Test_packetLooksLike(t *testing.T) {

@@ -12,13 +12,11 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
-	"net/url"
 	"os"
 	"os/signal"
 	"reflect"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,7 +24,7 @@ import (
 	shellquote "github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	qrcode "github.com/skip2/go-qrcode"
-	"golang.org/x/oauth2/clientcredentials"
+	_ "tailscale.com/feature/condregister/oauthkey"
 	"tailscale.com/health/healthmsg"
 	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
@@ -39,6 +37,7 @@ import (
 	"tailscale.com/types/preftype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/version/distro"
 )
 
@@ -94,6 +93,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	// When adding new flags, prefer to put them under "tailscale set" instead
 	// of here. Setting preferences via "tailscale up" is deprecated.
 	upf.BoolVar(&upArgs.qr, "qr", false, "show QR code for login URLs")
+	upf.StringVar(&upArgs.qrFormat, "qr-format", "small", "QR code formatting (small or large)")
 	upf.StringVar(&upArgs.authKeyOrFile, "auth-key", "", `node authorization key; if it begins with "file:", then it's a path to a file containing the authkey`)
 
 	upf.StringVar(&upArgs.server, "login-server", ipn.DefaultControlURL, "base URL of control server")
@@ -163,6 +163,7 @@ func defaultNetfilterMode() string {
 // added to it. Add new arguments to setArgsT instead.
 type upArgsT struct {
 	qr                     bool
+	qrFormat               string
 	reset                  bool
 	server                 string
 	acceptRoutes           bool
@@ -384,7 +385,7 @@ func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, jus
 	}
 
 	if env.upArgs.forceReauth && isSSHOverTailscale() {
-		if err := presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action will result in your SSH session disconnecting.`, env.upArgs.acceptedRisks); err != nil {
+		if err := presentRiskToUser(riskLoseSSH, `You are connected over Tailscale; this action may result in your SSH session disconnecting.`, env.upArgs.acceptedRisks); err != nil {
 			return false, nil, err
 		}
 	}
@@ -445,6 +446,7 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		return fixTailscaledConnectError(err)
 	}
 	origAuthURL := st.AuthURL
+	origNodeKey := st.Self.PublicKey
 
 	// printAuthURL reports whether we should print out the
 	// provided auth URL from an IPN notify.
@@ -485,7 +487,7 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		fatalf("%s", err)
 	}
 
-	warnOnAdvertiseRouts(ctx, prefs)
+	warnOnAdvertiseRoutes(ctx, prefs)
 	if err := checkExitNodeRisk(ctx, prefs, upArgs.acceptedRisks); err != nil {
 		return err
 	}
@@ -539,8 +541,18 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		}
 	}()
 
-	running := make(chan bool, 1) // gets value once in state ipn.Running
-	watchErr := make(chan error, 1)
+	// Start watching the IPN bus before we call Start() or StartLoginInteractive(),
+	// or we could miss IPN notifications.
+	//
+	// In particular, if we're doing a force-reauth, we could miss the
+	// notification with the auth URL we should print for the user.  The
+	// initial state could contain the auth URL, but only if IPN is in the
+	// NeedsLogin state -- sometimes it's in Starting, and we don't get the URL.
+	watcher, err := localClient.WatchIPNBus(watchCtx, ipn.NotifyInitialState)
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
 
 	// Special case: bare "tailscale up" means to just start
 	// running, if there's ever been a login.
@@ -563,9 +575,13 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		if err != nil {
 			return err
 		}
-		authKey, err = resolveAuthKey(ctx, authKey, upArgs.advertiseTags)
-		if err != nil {
-			return err
+		// Try to use an OAuth secret to generate an auth key if that functionality
+		// is available.
+		if f, ok := tailscale.HookResolveAuthKey.GetOk(); ok {
+			authKey, err = f(ctx, authKey, strings.Split(upArgs.advertiseTags, ","))
+			if err != nil {
+				return err
+			}
 		}
 		err = localClient.Start(ctx, ipn.Options{
 			AuthKey:     authKey,
@@ -582,15 +598,23 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		}
 	}
 
-	watcher, err := localClient.WatchIPNBus(watchCtx, ipn.NotifyInitialState)
-	if err != nil {
-		return err
-	}
-	defer watcher.Close()
+	upComplete := make(chan bool, 1)
+	watchErr := make(chan error, 1)
 
 	go func() {
 		var printed bool // whether we've yet printed anything to stdout or stderr
 		var lastURLPrinted string
+
+		// If we're doing a force-reauth, we need to get two notifications:
+		//
+		//	 1. IPN is running
+		//	 2. The node key has changed
+		//
+		// These two notifications arrive separately, and trying to combine them
+		// has caused unexpected issues elsewhere in `tailscale up`.  For now, we
+		// track them separately.
+		ipnIsRunning := false
+		waitingForKeyChange := upArgs.forceReauth
 
 		for {
 			n, err := watcher.Next()
@@ -602,29 +626,34 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 				msg := *n.ErrMessage
 				fatalf("backend error: %v\n", msg)
 			}
-			if s := n.State; s != nil {
-				switch *s {
-				case ipn.NeedsMachineAuth:
-					printed = true
-					if env.upArgs.json {
-						printUpDoneJSON(ipn.NeedsMachineAuth, "")
-					} else {
-						fmt.Fprintf(Stderr, "\nTo approve your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
-					}
-				case ipn.Running:
-					// Done full authentication process
-					if env.upArgs.json {
-						printUpDoneJSON(ipn.Running, "")
-					} else if printed {
-						// Only need to print an update if we printed the "please click" message earlier.
-						fmt.Fprintf(Stderr, "Success.\n")
-					}
-					select {
-					case running <- true:
-					default:
-					}
-					cancelWatch()
+			if s := n.State; s != nil && *s == ipn.NeedsMachineAuth {
+				printed = true
+				if env.upArgs.json {
+					printUpDoneJSON(ipn.NeedsMachineAuth, "")
+				} else {
+					fmt.Fprintf(Stderr, "\nTo approve your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL(policyclient.Get()))
 				}
+			}
+			if s := n.State; s != nil {
+				ipnIsRunning = *s == ipn.Running
+			}
+			if n.NetMap != nil && n.NetMap.NodeKey != origNodeKey {
+				waitingForKeyChange = false
+			}
+			if ipnIsRunning && !waitingForKeyChange {
+				// Done full authentication process
+				if env.upArgs.json {
+					printUpDoneJSON(ipn.Running, "")
+				} else if printed {
+					// Only need to print an update if we printed the "please click" message earlier.
+					fmt.Fprintf(Stderr, "Success.\n")
+				}
+				select {
+				case upComplete <- true:
+				default:
+				}
+				cancelWatch()
+				return
 			}
 			if url := n.BrowseToURL; url != nil {
 				authURL := *url
@@ -657,7 +686,14 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 						if err != nil {
 							log.Printf("QR code error: %v", err)
 						} else {
-							fmt.Fprintf(Stderr, "%s\n", q.ToString(false))
+							switch upArgs.qrFormat {
+							case "large":
+								fmt.Fprintf(Stderr, "%s\n", q.ToString(false))
+							case "small":
+								fmt.Fprintf(Stderr, "%s\n", q.ToSmallString(false))
+							default:
+								log.Printf("unknown QR code format: %q", upArgs.qrFormat)
+							}
 						}
 					}
 				}
@@ -679,18 +715,18 @@ func runUp(ctx context.Context, cmd string, args []string, upArgs upArgsT) (retE
 		timeoutCh = timeoutTimer.C
 	}
 	select {
-	case <-running:
+	case <-upComplete:
 		return nil
 	case <-watchCtx.Done():
 		select {
-		case <-running:
+		case <-upComplete:
 			return nil
 		default:
 		}
 		return watchCtx.Err()
 	case err := <-watchErr:
 		select {
-		case <-running:
+		case <-upComplete:
 			return nil
 		default:
 		}
@@ -804,7 +840,7 @@ func addPrefFlagMapping(flagName string, prefNames ...string) {
 // correspond to an ipn.Pref.
 func preflessFlag(flagName string) bool {
 	switch flagName {
-	case "auth-key", "force-reauth", "reset", "qr", "json", "timeout", "accept-risk", "host-routes":
+	case "auth-key", "force-reauth", "reset", "qr", "qr-format", "json", "timeout", "accept-risk", "host-routes":
 		return true
 	}
 	return false
@@ -1099,91 +1135,7 @@ func exitNodeIP(p *ipn.Prefs, st *ipnstate.Status) (ip netip.Addr) {
 	return
 }
 
-// resolveAuthKey either returns v unchanged (in the common case) or, if it
-// starts with "tskey-client-" (as Tailscale OAuth secrets do) parses it like
-//
-//	tskey-client-xxxx[?ephemeral=false&bar&preauthorized=BOOL&baseURL=...]
-//
-// and does the OAuth2 dance to get and return an authkey. The "ephemeral"
-// property defaults to true if unspecified. The "preauthorized" defaults to
-// false. The "baseURL" defaults to https://api.tailscale.com.
-// The passed in tags are required, and must be non-empty. These will be
-// set on the authkey generated by the OAuth2 dance.
-func resolveAuthKey(ctx context.Context, v, tags string) (string, error) {
-	if !strings.HasPrefix(v, "tskey-client-") {
-		return v, nil
-	}
-	if tags == "" {
-		return "", errors.New("oauth authkeys require --advertise-tags")
-	}
-
-	clientSecret, named, _ := strings.Cut(v, "?")
-	attrs, err := url.ParseQuery(named)
-	if err != nil {
-		return "", err
-	}
-	for k := range attrs {
-		switch k {
-		case "ephemeral", "preauthorized", "baseURL":
-		default:
-			return "", fmt.Errorf("unknown attribute %q", k)
-		}
-	}
-	getBool := func(name string, def bool) (bool, error) {
-		v := attrs.Get(name)
-		if v == "" {
-			return def, nil
-		}
-		ret, err := strconv.ParseBool(v)
-		if err != nil {
-			return false, fmt.Errorf("invalid attribute boolean attribute %s value %q", name, v)
-		}
-		return ret, nil
-	}
-	ephemeral, err := getBool("ephemeral", true)
-	if err != nil {
-		return "", err
-	}
-	preauth, err := getBool("preauthorized", false)
-	if err != nil {
-		return "", err
-	}
-
-	baseURL := "https://api.tailscale.com"
-	if v := attrs.Get("baseURL"); v != "" {
-		baseURL = v
-	}
-
-	credentials := clientcredentials.Config{
-		ClientID:     "some-client-id", // ignored
-		ClientSecret: clientSecret,
-		TokenURL:     baseURL + "/api/v2/oauth/token",
-	}
-
-	tsClient := tailscale.NewClient("-", nil)
-	tsClient.UserAgent = "tailscale-cli"
-	tsClient.HTTPClient = credentials.Client(ctx)
-	tsClient.BaseURL = baseURL
-
-	caps := tailscale.KeyCapabilities{
-		Devices: tailscale.KeyDeviceCapabilities{
-			Create: tailscale.KeyDeviceCreateCapabilities{
-				Reusable:      false,
-				Ephemeral:     ephemeral,
-				Preauthorized: preauth,
-				Tags:          strings.Split(tags, ","),
-			},
-		},
-	}
-
-	authkey, _, err := tsClient.CreateKey(ctx, caps)
-	if err != nil {
-		return "", err
-	}
-	return authkey, nil
-}
-
-func warnOnAdvertiseRouts(ctx context.Context, prefs *ipn.Prefs) {
+func warnOnAdvertiseRoutes(ctx context.Context, prefs *ipn.Prefs) {
 	if len(prefs.AdvertiseRoutes) > 0 || prefs.AppConnector.Advertise {
 		// TODO(jwhited): compress CheckIPForwarding and CheckUDPGROForwarding
 		//  into a single HTTP req.

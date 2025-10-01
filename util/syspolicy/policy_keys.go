@@ -4,7 +4,6 @@
 package syspolicy
 
 import (
-	"tailscale.com/types/lazy"
 	"tailscale.com/util/syspolicy/internal"
 	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/setting"
@@ -18,6 +17,7 @@ var implicitDefinitions = []*setting.Definition{
 	// Device policy settings (can only be configured on a per-device basis):
 	setting.NewDefinition(pkey.AllowedSuggestedExitNodes, setting.DeviceSetting, setting.StringListValue),
 	setting.NewDefinition(pkey.AllowExitNodeOverride, setting.DeviceSetting, setting.BooleanValue),
+	setting.NewDefinition(pkey.AllowTailscaledRestart, setting.DeviceSetting, setting.BooleanValue),
 	setting.NewDefinition(pkey.AlwaysOn, setting.DeviceSetting, setting.BooleanValue),
 	setting.NewDefinition(pkey.AlwaysOnOverrideWithReason, setting.DeviceSetting, setting.BooleanValue),
 	setting.NewDefinition(pkey.ApplyUpdates, setting.DeviceSetting, setting.PreferenceOptionValue),
@@ -76,32 +76,4 @@ func init() {
 		}
 		return nil
 	})
-}
-
-var implicitDefinitionMap lazy.SyncValue[setting.DefinitionMap]
-
-// WellKnownSettingDefinition returns a well-known, implicit setting definition by its key,
-// or an [ErrNoSuchKey] if a policy setting with the specified key does not exist
-// among implicit policy definitions.
-func WellKnownSettingDefinition(k pkey.Key) (*setting.Definition, error) {
-	m, err := implicitDefinitionMap.GetErr(func() (setting.DefinitionMap, error) {
-		return setting.DefinitionMapOf(implicitDefinitions)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if d, ok := m[k]; ok {
-		return d, nil
-	}
-	return nil, ErrNoSuchKey
-}
-
-// RegisterWellKnownSettingsForTest registers all implicit setting definitions
-// for the duration of the test.
-func RegisterWellKnownSettingsForTest(tb testenv.TB) {
-	tb.Helper()
-	err := setting.SetDefinitionsForTest(tb, implicitDefinitions...)
-	if err != nil {
-		tb.Fatalf("Failed to register well-known settings: %v", err)
-	}
 }

@@ -6,12 +6,14 @@ package ipnlocal
 import (
 	"time"
 
+	"tailscale.com/control/controlclient"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/eventbus"
 )
 
 // For extra defense-in-depth, when we're testing expired nodes we check
@@ -40,13 +42,38 @@ type expiryManager struct {
 
 	logf  logger.Logf
 	clock tstime.Clock
+
+	eventSubs eventbus.Monitor
 }
 
-func newExpiryManager(logf logger.Logf) *expiryManager {
-	return &expiryManager{
+func newExpiryManager(logf logger.Logf, bus *eventbus.Bus) *expiryManager {
+	em := &expiryManager{
 		previouslyExpired: map[tailcfg.StableNodeID]bool{},
 		logf:              logf,
 		clock:             tstime.StdClock{},
+	}
+
+	cli := bus.Client("ipnlocal.expiryManager")
+	em.eventSubs = cli.Monitor(em.consumeEventbusTopics(cli))
+	return em
+}
+
+// consumeEventbusTopics consumes events from all relevant
+// [eventbus.Subscriber]'s and passes them to their related handler. Events are
+// always handled in the order they are received, i.e. the next event is not
+// read until the previous event's handler has returned. It returns when the
+// [eventbus.Client] is closed.
+func (em *expiryManager) consumeEventbusTopics(cli *eventbus.Client) func(*eventbus.Client) {
+	controlTimeSub := eventbus.Subscribe[controlclient.ControlTime](cli)
+	return func(cli *eventbus.Client) {
+		for {
+			select {
+			case <-cli.Done():
+				return
+			case time := <-controlTimeSub.Events():
+				em.onControlTime(time.Value)
+			}
+		}
 	}
 }
 
@@ -217,6 +244,8 @@ func (em *expiryManager) nextPeerExpiry(nm *netmap.NetworkMap, localNow time.Tim
 
 	return nextExpiry
 }
+
+func (em *expiryManager) close() { em.eventSubs.Close() }
 
 // ControlNow estimates the current time on the control server, calculated as
 // localNow + the delta between local and control server clocks as recorded

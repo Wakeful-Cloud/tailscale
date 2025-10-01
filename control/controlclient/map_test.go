@@ -20,6 +20,7 @@ import (
 	"go4.org/mem"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
+	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime"
@@ -27,7 +28,9 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/persist"
 	"tailscale.com/types/ptr"
+	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 )
@@ -1326,7 +1329,7 @@ func TestNetmapDisplayMessage(t *testing.T) {
 // [netmap.NetworkMap] to a [health.Tracker].
 func TestNetmapHealthIntegration(t *testing.T) {
 	ms := newTestMapSession(t, nil)
-	ht := health.Tracker{}
+	ht := health.NewTracker(eventbustest.NewBus(t))
 
 	ht.SetIPNState("NeedsLogin", true)
 	ht.GotStreamedMapResponse()
@@ -1371,7 +1374,7 @@ func TestNetmapHealthIntegration(t *testing.T) {
 // passing the [netmap.NetworkMap] to a [health.Tracker].
 func TestNetmapDisplayMessageIntegration(t *testing.T) {
 	ms := newTestMapSession(t, nil)
-	ht := health.Tracker{}
+	ht := health.NewTracker(eventbustest.NewBus(t))
 
 	ht.SetIPNState("NeedsLogin", true)
 	ht.GotStreamedMapResponse()
@@ -1416,5 +1419,29 @@ func TestNetmapDisplayMessageIntegration(t *testing.T) {
 
 	if diff := cmp.Diff(want, state.Warnings, cmpopts.IgnoreFields(health.UnhealthyState{}, "ETag")); diff != "" {
 		t.Errorf("unexpected message contents (-want +got):\n%s", diff)
+	}
+}
+
+func TestNetmapForMapResponseForDebug(t *testing.T) {
+	mr := &tailcfg.MapResponse{
+		Node: &tailcfg.Node{
+			ID:   1,
+			Name: "foo.bar.ts.net.",
+		},
+		Peers: []*tailcfg.Node{
+			{ID: 2, Name: "peer1.bar.ts.net.", HomeDERP: 1},
+			{ID: 3, Name: "peer2.bar.ts.net.", HomeDERP: 1},
+		},
+	}
+	ms := newTestMapSession(t, nil)
+	nm1 := ms.netmapForResponse(mr)
+
+	prefs := &ipn.Prefs{Persist: &persist.Persist{PrivateNodeKey: ms.privateNodeKey}}
+	nm2, err := NetmapFromMapResponseForDebug(t.Context(), prefs.View().Persist(), mr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(nm1, nm2) {
+		t.Errorf("mismatch\nnm1: %s\nnm2: %s\n", logger.AsJSON(nm1), logger.AsJSON(nm2))
 	}
 }

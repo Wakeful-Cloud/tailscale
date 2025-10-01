@@ -27,11 +27,14 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
+	_ "tailscale.com/feature/condregister/oauthkey"
+	_ "tailscale.com/feature/condregister/portmapper"
+	_ "tailscale.com/feature/condregister/useproxy"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
+	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnlocal"
@@ -493,6 +496,16 @@ func (s *Server) TailscaleIPs() (ip4, ip6 netip.Addr) {
 	return ip4, ip6
 }
 
+// LogtailWriter returns an [io.Writer] that writes to Tailscale's logging service and will be only visible to Tailscale's
+// support team. Logs written there cannot be retrieved by the user. This method always returns a non-nil value.
+func (s *Server) LogtailWriter() io.Writer {
+	if s.logtail == nil {
+		return io.Discard
+	}
+
+	return s.logtail
+}
+
 func (s *Server) getAuthKey() string {
 	if v := s.AuthKey; v != "" {
 		return v
@@ -568,7 +581,7 @@ func (s *Server) start() (reterr error) {
 
 	sys := tsd.NewSystem()
 	s.sys = sys
-	if err := s.startLogger(&closePool, sys.HealthTracker(), tsLogf); err != nil {
+	if err := s.startLogger(&closePool, sys.HealthTracker.Get(), tsLogf); err != nil {
 		return err
 	}
 
@@ -586,7 +599,7 @@ func (s *Server) start() (reterr error) {
 		Dialer:        s.dialer,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
 	})
 	if err != nil {
@@ -594,7 +607,7 @@ func (s *Server) start() (reterr error) {
 	}
 	closePool.add(s.dialer)
 	sys.Set(eng)
-	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
+	sys.HealthTracker.Get().SetMetricsRegistry(sys.UserMetricsRegistry())
 
 	// TODO(oxtoacart): do we need to support Taildrive on tsnet, and if so, how?
 	ns, err := netstack.Create(tsLogf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
@@ -670,6 +683,14 @@ func (s *Server) start() (reterr error) {
 	prefs.RunWebClient = s.RunWebClient
 	prefs.AdvertiseTags = s.AdvertiseTags
 	authKey := s.getAuthKey()
+	// Try to use an OAuth secret to generate an auth key if that functionality
+	// is available.
+	if f, ok := tailscale.HookResolveAuthKey.GetOk(); ok {
+		authKey, err = f(s.shutdownCtx, s.getAuthKey(), prefs.AdvertiseTags)
+		if err != nil {
+			return fmt.Errorf("resolving auth key: %w", err)
+		}
+	}
 	err = lb.Start(ipn.Options{
 		UpdatePrefs: prefs,
 		AuthKey:     authKey,
@@ -908,25 +929,6 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 		return nil, true // don't handle, don't forward to localhost
 	}
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
-}
-
-// APIClient returns a tailscale.Client that can be used to make authenticated
-// requests to the Tailscale control server.
-// It requires the user to set tailscale.I_Acknowledge_This_API_Is_Unstable.
-//
-// Deprecated: use AuthenticatedAPITransport with tailscale.com/client/tailscale/v2 instead.
-func (s *Server) APIClient() (*tailscale.Client, error) {
-	if !tailscale.I_Acknowledge_This_API_Is_Unstable {
-		return nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
-	}
-	if err := s.Start(); err != nil {
-		return nil, err
-	}
-
-	c := tailscale.NewClient("-", nil)
-	c.UserAgent = "tailscale-tsnet"
-	c.HTTPClient = &http.Client{Transport: s.lb.KeyProvingNoiseRoundTripper()}
-	return c, nil
 }
 
 // I_Acknowledge_This_API_Is_Experimental must be set true to use AuthenticatedAPITransport()

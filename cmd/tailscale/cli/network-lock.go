@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build !ts_omit_tailnetlock
+
 package cli
 
 import (
@@ -26,6 +28,10 @@ import (
 	"tailscale.com/types/tkatype"
 	"tailscale.com/util/prompt"
 )
+
+func init() {
+	maybeNetlockCmd = func() *ffcli.Command { return netlockCmd }
+}
 
 var netlockCmd = &ffcli.Command{
 	Name:       "lock",
@@ -378,7 +384,7 @@ Removal of a signing key(s) without resigning nodes (--re-sign=false)
 will cause any nodes signed by the the given key(s) to be locked out
 of the Tailscale network. Proceed with caution.
 `)
-			if !prompt.YesNo("Are you sure you want to remove the signing key(s)?") {
+			if !prompt.YesNo("Are you sure you want to remove the signing key(s)?", true) {
 				fmt.Printf("aborting removal of signing key(s)\n")
 				os.Exit(0)
 			}

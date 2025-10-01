@@ -23,27 +23,33 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/miekg/dns"
 	"go4.org/mem"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale"
-	"tailscale.com/clientupdate"
 	"tailscale.com/cmd/testwrapper/flakytest"
+	"tailscale.com/feature"
+	_ "tailscale.com/feature/clientupdate"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tstun"
+	"tailscale.com/net/udprelay/status"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/key"
+	"tailscale.com/types/netmap"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
+	"tailscale.com/util/set"
 )
 
 func TestMain(m *testing.M) {
@@ -170,6 +176,7 @@ func TestControlKnobs(t *testing.T) {
 }
 
 func TestCollectPanic(t *testing.T) {
+	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15865")
 	tstest.Shard(t)
 	tstest.Parallel(t)
 	env := NewTestEnv(t)
@@ -262,52 +269,163 @@ func TestStateSavedOnStart(t *testing.T) {
 }
 
 func TestOneNodeUpAuth(t *testing.T) {
-	tstest.Shard(t)
-	tstest.Parallel(t)
-	env := NewTestEnv(t, ConfigureControl(func(control *testcontrol.Server) {
-		control.RequireAuth = true
-	}))
+	for _, tt := range []struct {
+		name string
+		args []string
+		//
+		// What auth key should we use for control?
+		authKey string
+		//
+		// Is tailscaled already logged in before we run this `up` command?
+		alreadyLoggedIn bool
+		//
+		// Do we need to log in again with a new /auth/ URL?
+		needsNewAuthURL bool
+	}{
+		{
+			name:            "up",
+			args:            []string{"up"},
+			needsNewAuthURL: true,
+		},
+		{
+			name:            "up-with-force-reauth",
+			args:            []string{"up", "--force-reauth"},
+			needsNewAuthURL: true,
+		},
+		{
+			name:            "up-with-auth-key",
+			args:            []string{"up", "--auth-key=opensesame"},
+			authKey:         "opensesame",
+			needsNewAuthURL: false,
+		},
+		{
+			name:            "up-with-force-reauth-and-auth-key",
+			args:            []string{"up", "--force-reauth", "--auth-key=opensesame"},
+			authKey:         "opensesame",
+			needsNewAuthURL: false,
+		},
+		{
+			name:            "up-after-login",
+			args:            []string{"up"},
+			alreadyLoggedIn: true,
+			needsNewAuthURL: false,
+		},
+		{
+			name:            "up-with-force-reauth-after-login",
+			args:            []string{"up", "--force-reauth"},
+			alreadyLoggedIn: true,
+			needsNewAuthURL: true,
+		},
+		{
+			name:            "up-with-auth-key-after-login",
+			args:            []string{"up", "--auth-key=opensesame"},
+			authKey:         "opensesame",
+			alreadyLoggedIn: true,
+			needsNewAuthURL: false,
+		},
+		{
+			name:            "up-with-force-reauth-and-auth-key-after-login",
+			args:            []string{"up", "--force-reauth", "--auth-key=opensesame"},
+			authKey:         "opensesame",
+			alreadyLoggedIn: true,
+			needsNewAuthURL: false,
+		},
+	} {
+		tstest.Shard(t)
 
-	n1 := NewTestNode(t, env)
-	d1 := n1.StartDaemon()
+		for _, useSeamlessKeyRenewal := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s-seamless-%t", tt.name, useSeamlessKeyRenewal), func(t *testing.T) {
+				tstest.Parallel(t)
 
-	n1.AwaitListening()
+				env := NewTestEnv(t, ConfigureControl(
+					func(control *testcontrol.Server) {
+						if tt.authKey != "" {
+							control.RequireAuthKey = tt.authKey
+						} else {
+							control.RequireAuth = true
+						}
 
-	st := n1.MustStatus()
-	t.Logf("Status: %s", st.BackendState)
+						control.AllNodesSameUser = true
 
-	t.Logf("Running up --login-server=%s ...", env.ControlURL())
+						if useSeamlessKeyRenewal {
+							control.DefaultNodeCapabilities = &tailcfg.NodeCapMap{
+								tailcfg.NodeAttrSeamlessKeyRenewal: []tailcfg.RawMessage{},
+							}
+						}
+					},
+				))
 
-	cmd := n1.Tailscale("up", "--login-server="+env.ControlURL())
-	var authCountAtomic atomic.Int32
-	cmd.Stdout = &authURLParserWriter{fn: func(urlStr string) error {
-		t.Logf("saw auth URL %q", urlStr)
-		if env.Control.CompleteAuth(urlStr) {
-			if authCountAtomic.Add(1) > 1 {
-				err := errors.New("completed multple auth URLs")
-				t.Error(err)
-				return err
-			}
-			t.Logf("completed auth path %s", urlStr)
-			return nil
+				n1 := NewTestNode(t, env)
+				d1 := n1.StartDaemon()
+				defer d1.MustCleanShutdown(t)
+
+				cmdArgs := append(tt.args, "--login-server="+env.ControlURL())
+
+				// This handler looks for /auth/ URLs in the stdout from "tailscale up",
+				// and if it sees them, completes the auth process.
+				//
+				// It counts how many auth URLs it's seen.
+				var authCountAtomic atomic.Int32
+				authURLHandler := &authURLParserWriter{fn: func(urlStr string) error {
+					t.Logf("saw auth URL %q", urlStr)
+					if env.Control.CompleteAuth(urlStr) {
+						if authCountAtomic.Add(1) > 1 {
+							err := errors.New("completed multiple auth URLs")
+							t.Error(err)
+							return err
+						}
+						t.Logf("completed login to %s", urlStr)
+						return nil
+					} else {
+						err := fmt.Errorf("Failed to complete initial login to %q", urlStr)
+						t.Fatal(err)
+						return err
+					}
+				}}
+
+				// If we should be logged in at the start of the test case, go ahead
+				// and run the login command.
+				//
+				// Otherwise, just wait for tailscaled to be listening.
+				if tt.alreadyLoggedIn {
+					t.Logf("Running initial login: %s", strings.Join(cmdArgs, " "))
+					cmd := n1.Tailscale(cmdArgs...)
+					cmd.Stdout = authURLHandler
+					cmd.Stderr = cmd.Stdout
+					if err := cmd.Run(); err != nil {
+						t.Fatalf("up: %v", err)
+					}
+					authCountAtomic.Store(0)
+					n1.AwaitRunning()
+				} else {
+					n1.AwaitListening()
+				}
+
+				st := n1.MustStatus()
+				t.Logf("Status: %s", st.BackendState)
+
+				t.Logf("Running command: %s", strings.Join(cmdArgs, " "))
+				cmd := n1.Tailscale(cmdArgs...)
+				cmd.Stdout = authURLHandler
+				cmd.Stderr = cmd.Stdout
+
+				if err := cmd.Run(); err != nil {
+					t.Fatalf("up: %v", err)
+				}
+				t.Logf("Got IP: %v", n1.AwaitIP4())
+
+				n1.AwaitRunning()
+
+				var expectedAuthUrls int32
+				if tt.needsNewAuthURL {
+					expectedAuthUrls = 1
+				}
+				if n := authCountAtomic.Load(); n != expectedAuthUrls {
+					t.Errorf("Auth URLs completed = %d; want %d", n, expectedAuthUrls)
+				}
+			})
 		}
-		err := fmt.Errorf("Failed to complete auth path to %q", urlStr)
-		t.Error(err)
-		return err
-	}}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("up: %v", err)
 	}
-	t.Logf("Got IP: %v", n1.AwaitIP4())
-
-	n1.AwaitRunning()
-
-	if n := authCountAtomic.Load(); n != 1 {
-		t.Errorf("Auth URLs completed = %d; want 1", n)
-	}
-
-	d1.MustCleanShutdown(t)
 }
 
 func TestConfigFileAuthKey(t *testing.T) {
@@ -594,22 +712,6 @@ func TestC2NPingRequest(t *testing.T) {
 
 	env := NewTestEnv(t)
 
-	gotPing := make(chan bool, 1)
-	env.Control.HandleC2N = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			t.Errorf("unexpected ping method %q", r.Method)
-		}
-		got, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("ping body read error: %v", err)
-		}
-		const want = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nabc"
-		if string(got) != want {
-			t.Errorf("body error\n got: %q\nwant: %q", got, want)
-		}
-		gotPing <- true
-	})
-
 	n1 := NewTestNode(t, env)
 	n1.StartDaemon()
 
@@ -633,27 +735,33 @@ func TestC2NPingRequest(t *testing.T) {
 		}
 		cancel()
 
-		pr := &tailcfg.PingRequest{
-			URL:     fmt.Sprintf("https://unused/some-c2n-path/ping-%d", try),
-			Log:     true,
-			Types:   "c2n",
-			Payload: []byte("POST /echo HTTP/1.0\r\nContent-Length: 3\r\n\r\nabc"),
-		}
-		if !env.Control.AddPingRequest(nodeKey, pr) {
-			t.Logf("failed to AddPingRequest")
+		ctx, cancel = context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "POST", "/echo", bytes.NewReader([]byte("abc")))
+		if err != nil {
+			t.Errorf("failed to create request: %v", err)
 			continue
 		}
-
-		// Wait for PingRequest to come back
-		pingTimeout := time.NewTimer(2 * time.Second)
-		defer pingTimeout.Stop()
-		select {
-		case <-gotPing:
-			t.Logf("got ping; success")
-			return
-		case <-pingTimeout.C:
-			// Try again.
+		r, err := env.Control.NodeRoundTripper(nodeKey).RoundTrip(req)
+		if err != nil {
+			t.Errorf("RoundTrip failed: %v", err)
+			continue
 		}
+		if r.StatusCode != 200 {
+			t.Errorf("unexpected status code: %d", r.StatusCode)
+			continue
+		}
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("error reading body: %v", err)
+			continue
+		}
+		if string(b) != "abc" {
+			t.Errorf("body = %q; want %q", b, "abc")
+			continue
+		}
+		return
 	}
 	t.Error("all ping attempts failed")
 }
@@ -1018,7 +1126,7 @@ func TestLogoutRemovesAllPeers(t *testing.T) {
 }
 
 func TestAutoUpdateDefaults(t *testing.T) {
-	if !clientupdate.CanAutoUpdate() {
+	if !feature.CanAutoUpdate() {
 		t.Skip("auto-updates not supported on this platform")
 	}
 	tstest.Shard(t)
@@ -1528,4 +1636,293 @@ func TestEncryptStateMigration(t *testing.T) {
 		n.encryptState = false
 		runNode(t, wantPlaintextStateKeys)
 	})
+}
+
+// TestPeerRelayPing creates three nodes with one acting as a peer relay.
+// The test succeeds when "tailscale ping" flows through the peer
+// relay between all 3 nodes, and "tailscale debug peer-relay-sessions" returns
+// expected values.
+func TestPeerRelayPing(t *testing.T) {
+	tstest.Shard(t)
+	tstest.Parallel(t)
+
+	env := NewTestEnv(t, ConfigureControl(func(server *testcontrol.Server) {
+		server.PeerRelayGrants = true
+	}))
+	env.neverDirectUDP = true
+	env.relayServerUseLoopback = true
+
+	n1 := NewTestNode(t, env)
+	n2 := NewTestNode(t, env)
+	peerRelay := NewTestNode(t, env)
+
+	allNodes := []*TestNode{n1, n2, peerRelay}
+	wantPeerRelayServers := make(set.Set[string])
+	for _, n := range allNodes {
+		n.StartDaemon()
+		n.AwaitResponding()
+		n.MustUp()
+		wantPeerRelayServers.Add(n.AwaitIP4().String())
+		n.AwaitRunning()
+	}
+
+	if err := peerRelay.Tailscale("set", "--relay-server-port=0").Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error)
+	for _, a := range allNodes {
+		go func() {
+			err := tstest.WaitFor(time.Second*5, func() error {
+				out, err := a.Tailscale("debug", "peer-relay-servers").CombinedOutput()
+				if err != nil {
+					return fmt.Errorf("debug peer-relay-servers failed: %v", err)
+				}
+				servers := make([]string, 0)
+				err = json.Unmarshal(out, &servers)
+				if err != nil {
+					return fmt.Errorf("failed to unmarshal debug peer-relay-servers: %v", err)
+				}
+				gotPeerRelayServers := make(set.Set[string])
+				for _, server := range servers {
+					gotPeerRelayServers.Add(server)
+				}
+				if !gotPeerRelayServers.Equal(wantPeerRelayServers) {
+					return fmt.Errorf("got peer relay servers: %v want: %v", gotPeerRelayServers, wantPeerRelayServers)
+				}
+				return nil
+			})
+			errCh <- err
+		}()
+	}
+	for range allNodes {
+		err := <-errCh
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pingPairs := make([][2]*TestNode, 0)
+	for _, a := range allNodes {
+		for _, z := range allNodes {
+			if a == z {
+				continue
+			}
+			pingPairs = append(pingPairs, [2]*TestNode{a, z})
+		}
+	}
+	for _, pair := range pingPairs {
+		go func() {
+			a := pair[0]
+			z := pair[1]
+			err := tstest.WaitFor(time.Second*10, func() error {
+				remoteKey := z.MustStatus().Self.PublicKey
+				if err := a.Tailscale("ping", "--until-direct=false", "--c=1", "--timeout=1s", z.AwaitIP4().String()).Run(); err != nil {
+					return err
+				}
+				remotePeer, ok := a.MustStatus().Peer[remoteKey]
+				if !ok {
+					return fmt.Errorf("%v->%v remote peer not found", a.MustStatus().Self.ID, z.MustStatus().Self.ID)
+				}
+				if len(remotePeer.PeerRelay) == 0 {
+					return fmt.Errorf("%v->%v not using peer relay, curAddr=%v relay=%v", a.MustStatus().Self.ID, z.MustStatus().Self.ID, remotePeer.CurAddr, remotePeer.Relay)
+				}
+				t.Logf("%v->%v using peer relay addr: %v", a.MustStatus().Self.ID, z.MustStatus().Self.ID, remotePeer.PeerRelay)
+				return nil
+			})
+			errCh <- err
+		}()
+	}
+	for range pingPairs {
+		err := <-errCh
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	allControlNodes := env.Control.AllNodes()
+	wantSessionsForDiscoShorts := make(set.Set[[2]string])
+	for i, a := range allControlNodes {
+		if i == len(allControlNodes)-1 {
+			break
+		}
+		for _, z := range allControlNodes[i+1:] {
+			wantSessionsForDiscoShorts.Add([2]string{a.DiscoKey.ShortString(), z.DiscoKey.ShortString()})
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	debugSessions, err := peerRelay.LocalClient().DebugPeerRelaySessions(ctx)
+	cancel()
+	if err != nil {
+		t.Fatalf("debug peer-relay-sessions failed: %v", err)
+	}
+	if len(debugSessions.Sessions) != len(wantSessionsForDiscoShorts) {
+		t.Errorf("got %d peer relay sessions, want %d", len(debugSessions.Sessions), len(wantSessionsForDiscoShorts))
+	}
+	for _, session := range debugSessions.Sessions {
+		if !wantSessionsForDiscoShorts.Contains([2]string{session.Client1.ShortDisco, session.Client2.ShortDisco}) &&
+			!wantSessionsForDiscoShorts.Contains([2]string{session.Client2.ShortDisco, session.Client1.ShortDisco}) {
+			t.Errorf("peer relay session for disco keys %s<->%s not found in debug peer-relay-sessions: %+v", session.Client1.ShortDisco, session.Client2.ShortDisco, debugSessions.Sessions)
+		}
+		for _, client := range []status.ClientInfo{session.Client1, session.Client2} {
+			if client.BytesTx == 0 {
+				t.Errorf("unexpected 0 bytes TX counter in peer relay session: %+v", session)
+			}
+			if client.PacketsTx == 0 {
+				t.Errorf("unexpected 0 packets TX counter in peer relay session: %+v", session)
+			}
+			if !client.Endpoint.IsValid() {
+				t.Errorf("unexpected endpoint zero value in peer relay session: %+v", session)
+			}
+			if len(client.ShortDisco) == 0 {
+				t.Errorf("unexpected zero len short disco in peer relay session: %+v", session)
+			}
+		}
+	}
+}
+
+func TestC2NDebugNetmap(t *testing.T) {
+	tstest.Shard(t)
+	tstest.Parallel(t)
+	env := NewTestEnv(t, ConfigureControl(func(s *testcontrol.Server) {
+		s.CollectServices = opt.False
+	}))
+
+	var testNodes []*TestNode
+	var nodes []*tailcfg.Node
+	for i := range 2 {
+		n := NewTestNode(t, env)
+		d := n.StartDaemon()
+		defer d.MustCleanShutdown(t)
+
+		n.AwaitResponding()
+		n.MustUp()
+		n.AwaitRunning()
+		testNodes = append(testNodes, n)
+
+		controlNodes := env.Control.AllNodes()
+		if len(controlNodes) != i+1 {
+			t.Fatalf("expected %d nodes, got %d nodes", i+1, len(controlNodes))
+		}
+		for _, cn := range controlNodes {
+			if n.MustStatus().Self.PublicKey == cn.Key {
+				nodes = append(nodes, cn)
+				break
+			}
+		}
+	}
+
+	// getC2NNetmap fetches the current netmap. If a candidate map response is provided,
+	// a candidate netmap is also fetched and compared to the current netmap.
+	getC2NNetmap := func(node key.NodePublic, cand *tailcfg.MapResponse) *netmap.NetworkMap {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+
+		var req *http.Request
+		if cand != nil {
+			body := must.Get(json.Marshal(&tailcfg.C2NDebugNetmapRequest{Candidate: cand}))
+			req = must.Get(http.NewRequestWithContext(ctx, "POST", "/debug/netmap", bytes.NewReader(body)))
+		} else {
+			req = must.Get(http.NewRequestWithContext(ctx, "GET", "/debug/netmap", nil))
+		}
+		httpResp := must.Get(env.Control.NodeRoundTripper(node).RoundTrip(req))
+		defer httpResp.Body.Close()
+
+		if httpResp.StatusCode != 200 {
+			t.Errorf("unexpected status code: %d", httpResp.StatusCode)
+			return nil
+		}
+
+		respBody := must.Get(io.ReadAll(httpResp.Body))
+		var resp tailcfg.C2NDebugNetmapResponse
+		must.Do(json.Unmarshal(respBody, &resp))
+
+		var current netmap.NetworkMap
+		must.Do(json.Unmarshal(resp.Current, &current))
+
+		if !current.PrivateKey.IsZero() {
+			t.Errorf("current netmap has non-zero private key: %v", current.PrivateKey)
+		}
+		// Check candidate netmap if we sent a map response.
+		if cand != nil {
+			var candidate netmap.NetworkMap
+			must.Do(json.Unmarshal(resp.Candidate, &candidate))
+			if !candidate.PrivateKey.IsZero() {
+				t.Errorf("candidate netmap has non-zero private key: %v", candidate.PrivateKey)
+			}
+			if diff := cmp.Diff(current.SelfNode, candidate.SelfNode); diff != "" {
+				t.Errorf("SelfNode differs (-current +candidate):\n%s", diff)
+			}
+			if diff := cmp.Diff(current.Peers, candidate.Peers); diff != "" {
+				t.Errorf("Peers differ (-current +candidate):\n%s", diff)
+			}
+		}
+		return &current
+	}
+
+	for _, n := range nodes {
+		mr := must.Get(env.Control.MapResponse(&tailcfg.MapRequest{NodeKey: n.Key}))
+		nm := getC2NNetmap(n.Key, mr)
+
+		// Make sure peers do not have "testcap" initially (we'll change this later).
+		if len(nm.Peers) != 1 || nm.Peers[0].CapMap().Contains("testcap") {
+			t.Fatalf("expected 1 peer without testcap, got: %v", nm.Peers)
+		}
+
+		// Make sure nodes think each other are offline initially.
+		if nm.Peers[0].Online().Get() {
+			t.Fatalf("expected 1 peer to be offline, got: %v", nm.Peers)
+		}
+	}
+
+	// Send a delta update to n0, setting "testcap" on node 1.
+	env.Control.AddRawMapResponse(nodes[0].Key, &tailcfg.MapResponse{
+		PeersChangedPatch: []*tailcfg.PeerChange{{
+			NodeID: nodes[1].ID, CapMap: tailcfg.NodeCapMap{"testcap": []tailcfg.RawMessage{}},
+		}},
+	})
+
+	// node 0 should see node 1 with "testcap".
+	must.Do(tstest.WaitFor(5*time.Second, func() error {
+		st := testNodes[0].MustStatus()
+		p, ok := st.Peer[nodes[1].Key]
+		if !ok {
+			return fmt.Errorf("node 0 (%s) doesn't see node 1 (%s) as peer\n%v", nodes[0].Key, nodes[1].Key, st)
+		}
+		if _, ok := p.CapMap["testcap"]; !ok {
+			return fmt.Errorf("node 0 (%s) sees node 1 (%s) as peer but without testcap\n%v", nodes[0].Key, nodes[1].Key, p)
+		}
+		return nil
+	}))
+
+	// Check that node 0's current netmap has "testcap" for node 1.
+	nm := getC2NNetmap(nodes[0].Key, nil)
+	if len(nm.Peers) != 1 || !nm.Peers[0].CapMap().Contains("testcap") {
+		t.Errorf("current netmap missing testcap: %v", nm.Peers[0].CapMap())
+	}
+
+	// Send a delta update to n1, marking node 0 as online.
+	env.Control.AddRawMapResponse(nodes[1].Key, &tailcfg.MapResponse{
+		PeersChangedPatch: []*tailcfg.PeerChange{{
+			NodeID: nodes[0].ID, Online: ptr.To(true),
+		}},
+	})
+
+	// node 1 should see node 0 as online.
+	must.Do(tstest.WaitFor(5*time.Second, func() error {
+		st := testNodes[1].MustStatus()
+		p, ok := st.Peer[nodes[0].Key]
+		if !ok || !p.Online {
+			return fmt.Errorf("node 0 (%s) doesn't see node 1 (%s) as an online peer\n%v", nodes[0].Key, nodes[1].Key, st)
+		}
+		return nil
+	}))
+
+	// The netmap from node 1 should show node 0 as online.
+	nm = getC2NNetmap(nodes[1].Key, nil)
+	if len(nm.Peers) != 1 || !nm.Peers[0].Online().Get() {
+		t.Errorf("expected peer to be online; got %+v", nm.Peers[0].AsStruct())
+	}
 }

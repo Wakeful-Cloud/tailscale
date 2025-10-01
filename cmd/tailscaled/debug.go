@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build go1.19
+//go:build !ts_omit_debug
 
 package main
 
@@ -16,15 +16,17 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptrace"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"time"
 
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/feature"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netmon"
-	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/util/eventbus"
@@ -38,7 +40,23 @@ var debugArgs struct {
 	portmap   bool
 }
 
-var debugModeFunc = debugMode // so it can be addressable
+func init() {
+	debugModeFunc := debugMode // to be addressable
+	subCommands["debug"] = &debugModeFunc
+
+	hookNewDebugMux.Set(newDebugMux)
+}
+
+func newDebugMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/metrics", servePrometheusMetrics)
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	return mux
+}
 
 func debugMode(args []string) error {
 	fs := flag.NewFlagSet("debug", flag.ExitOnError)
@@ -124,9 +142,14 @@ func getURL(ctx context.Context, urlStr string) error {
 	if err != nil {
 		return fmt.Errorf("http.NewRequestWithContext: %v", err)
 	}
-	proxyURL, err := tshttpproxy.ProxyFromEnvironment(req)
-	if err != nil {
-		return fmt.Errorf("tshttpproxy.ProxyFromEnvironment: %v", err)
+	var proxyURL *url.URL
+	if buildfeatures.HasUseProxy {
+		if proxyFromEnv, ok := feature.HookProxyFromEnvironment.GetOk(); ok {
+			proxyURL, err = proxyFromEnv(req)
+			if err != nil {
+				return fmt.Errorf("tshttpproxy.ProxyFromEnvironment: %v", err)
+			}
+		}
 	}
 	log.Printf("proxy: %v", proxyURL)
 	tr := &http.Transport{
@@ -135,7 +158,10 @@ func getURL(ctx context.Context, urlStr string) error {
 		DisableKeepAlives:  true,
 	}
 	if proxyURL != nil {
-		auth, err := tshttpproxy.GetAuthHeader(proxyURL)
+		var auth string
+		if f, ok := feature.HookProxyGetAuthHeader.GetOk(); ok {
+			auth, err = f(proxyURL)
+		}
 		if err == nil && auth != "" {
 			tr.ProxyConnectHeader.Set("Proxy-Authorization", auth)
 		}
@@ -161,7 +187,9 @@ func getURL(ctx context.Context, urlStr string) error {
 }
 
 func checkDerp(ctx context.Context, derpRegion string) (err error) {
-	ht := new(health.Tracker)
+	bus := eventbus.New()
+	defer bus.Close()
+	ht := health.NewTracker(bus)
 	req, err := http.NewRequestWithContext(ctx, "GET", ipn.DefaultControlURL+"/derpmap/default", nil)
 	if err != nil {
 		return fmt.Errorf("create derp map request: %w", err)
