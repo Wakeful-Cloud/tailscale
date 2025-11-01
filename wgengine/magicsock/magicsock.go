@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"expvar"
 	"fmt"
 	"io"
 	"net"
@@ -29,16 +28,15 @@ import (
 	"github.com/tailscale/wireguard-go/device"
 	"go4.org/mem"
 	"golang.org/x/net/ipv6"
-
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
 	"tailscale.com/feature/buildfeatures"
+	"tailscale.com/feature/condlite/expvar"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/batching"
-	"tailscale.com/net/connstats"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
@@ -57,6 +55,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/lazy"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/netlogfunc"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
@@ -68,6 +67,7 @@ import (
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgint"
 )
 
@@ -156,7 +156,7 @@ type Conn struct {
 	// struct. Initialized once at construction, then constant.
 
 	eventBus               *eventbus.Bus
-	eventSubs              eventbus.Monitor
+	eventClient            *eventbus.Client
 	logf                   logger.Logf
 	epFunc                 func([]tailcfg.Endpoint)
 	derpActiveFunc         func()
@@ -180,6 +180,7 @@ type Conn struct {
 	// config changes between magicsock and wireguard.
 	syncPub               *eventbus.Publisher[syncPoint]
 	allocRelayEndpointPub *eventbus.Publisher[UDPRelayAllocReq]
+	portUpdatePub         *eventbus.Publisher[router.PortUpdate]
 
 	// pconn4 and pconn6 are the underlying UDP sockets used to
 	// send/receive packets for wireguard and other magicsock
@@ -260,8 +261,8 @@ type Conn struct {
 	//lint:ignore U1000 used on Linux/Darwin only
 	peerMTUEnabled atomic.Bool
 
-	// stats maintains per-connection counters.
-	stats atomic.Pointer[connstats.Statistics]
+	// connCounter maintains per-connection counters.
+	connCounter syncs.AtomicValue[netlogfunc.ConnectionCounter]
 
 	// captureHook, if non-nil, is the pcap logging callback when capturing.
 	captureHook syncs.AtomicValue[packet.CaptureCallback]
@@ -394,10 +395,6 @@ type Conn struct {
 	// wgPinger is the WireGuard only pinger used for latency measurements.
 	wgPinger lazy.SyncValue[*ping.Pinger]
 
-	// onPortUpdate is called with the new port when magicsock rebinds to
-	// a new port.
-	onPortUpdate func(port uint16, network string)
-
 	// getPeerByKey optionally specifies a function to look up a peer's
 	// wireguard state by its public key. If nil, it's not used.
 	getPeerByKey func(key.NodePublic) (_ wgint.Peer, ok bool)
@@ -468,7 +465,8 @@ type Options struct {
 	// NoteRecvActivity, if provided, is a func for magicsock to call
 	// whenever it receives a packet from a a peer if it's been more
 	// than ~10 seconds since the last one. (10 seconds is somewhat
-	// arbitrary; the sole user just doesn't need or want it called on
+	// arbitrary; the sole user, lazy WireGuard configuration,
+	// just doesn't need or want it called on
 	// every packet, just every minute or two for WireGuard timeouts,
 	// and 10 seconds seems like a good trade-off between often enough
 	// and not too often.)
@@ -491,10 +489,6 @@ type Options struct {
 	// ControlKnobs are the set of control knobs to use.
 	// If nil, they're ignored and not updated.
 	ControlKnobs *controlknobs.Knobs
-
-	// OnPortUpdate is called with the new port when magicsock rebinds to
-	// a new port.
-	OnPortUpdate func(port uint16, network string)
 
 	// PeerByKeyFunc optionally specifies a function to look up a peer's
 	// WireGuard state by its public key. If nil, it's not used.
@@ -631,43 +625,6 @@ func newConn(logf logger.Logf) *Conn {
 	return c
 }
 
-// consumeEventbusTopics consumes events from all [Conn]-relevant
-// [eventbus.Subscriber]'s and passes them to their related handler. Events are
-// always handled in the order they are received, i.e. the next event is not
-// read until the previous event's handler has returned. It returns when the
-// [eventbus.Client] is closed.
-func (c *Conn) consumeEventbusTopics(cli *eventbus.Client) func(*eventbus.Client) {
-	// Subscribe calls must return before NewConn otherwise published
-	// events can be missed.
-	pmSub := eventbus.Subscribe[portmappertype.Mapping](cli)
-	filterSub := eventbus.Subscribe[FilterUpdate](cli)
-	nodeViewsSub := eventbus.Subscribe[NodeViewsUpdate](cli)
-	nodeMutsSub := eventbus.Subscribe[NodeMutationsUpdate](cli)
-	syncSub := eventbus.Subscribe[syncPoint](cli)
-	allocRelayEndpointSub := eventbus.Subscribe[UDPRelayAllocResp](cli)
-	return func(cli *eventbus.Client) {
-		for {
-			select {
-			case <-cli.Done():
-				return
-			case <-pmSub.Events():
-				c.onPortMapChanged()
-			case filterUpdate := <-filterSub.Events():
-				c.onFilterUpdate(filterUpdate)
-			case nodeViews := <-nodeViewsSub.Events():
-				c.onNodeViewsUpdate(nodeViews)
-			case nodeMuts := <-nodeMutsSub.Events():
-				c.onNodeMutationsUpdate(nodeMuts)
-			case syncPoint := <-syncSub.Events():
-				c.dlogf("magicsock: received sync point after reconfig")
-				syncPoint.Signal()
-			case allocResp := <-allocRelayEndpointSub.Events():
-				c.onUDPRelayAllocResp(allocResp)
-			}
-		}
-	}
-}
-
 func (c *Conn) onUDPRelayAllocResp(allocResp UDPRelayAllocResp) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -732,10 +689,20 @@ func NewConn(opts Options) (*Conn, error) {
 
 	// Set up publishers and subscribers. Subscribe calls must return before
 	// NewConn otherwise published events can be missed.
-	cli := c.eventBus.Client("magicsock.Conn")
-	c.syncPub = eventbus.Publish[syncPoint](cli)
-	c.allocRelayEndpointPub = eventbus.Publish[UDPRelayAllocReq](cli)
-	c.eventSubs = cli.Monitor(c.consumeEventbusTopics(cli))
+	ec := c.eventBus.Client("magicsock.Conn")
+	c.eventClient = ec
+	c.syncPub = eventbus.Publish[syncPoint](ec)
+	c.allocRelayEndpointPub = eventbus.Publish[UDPRelayAllocReq](ec)
+	c.portUpdatePub = eventbus.Publish[router.PortUpdate](ec)
+	eventbus.SubscribeFunc(ec, c.onPortMapChanged)
+	eventbus.SubscribeFunc(ec, c.onFilterUpdate)
+	eventbus.SubscribeFunc(ec, c.onNodeViewsUpdate)
+	eventbus.SubscribeFunc(ec, c.onNodeMutationsUpdate)
+	eventbus.SubscribeFunc(ec, func(sp syncPoint) {
+		c.dlogf("magicsock: received sync point after reconfig")
+		sp.Signal()
+	})
+	eventbus.SubscribeFunc(ec, c.onUDPRelayAllocResp)
 
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
 	c.donec = c.connCtx.Done()
@@ -752,14 +719,17 @@ func NewConn(opts Options) (*Conn, error) {
 		newPortMapper, ok := portmappertype.HookNewPortMapper.GetOk()
 		if ok {
 			c.portMapper = newPortMapper(portmapperLogf, opts.EventBus, opts.NetMon, disableUPnP, c.onlyTCP443.Load)
-		} else if !testenv.InTest() {
-			panic("unexpected: HookNewPortMapper not set")
 		}
+		// If !ok, the HookNewPortMapper hook is not set (so feature/portmapper
+		// isn't linked), but the build tag to explicitly omit the portmapper
+		// isn't set either. This should only happen to js/wasm builds, where
+		// the portmapper is a no-op even if linked (but it's no longer linked,
+		// since the move to feature/portmapper), or if people are wiring up
+		// their own Tailscale build from pieces.
 	}
 
 	c.netMon = opts.NetMon
 	c.health = opts.HealthTracker
-	c.onPortUpdate = opts.OnPortUpdate
 	c.getPeerByKey = opts.PeerByKeyFunc
 
 	if err := c.rebind(keepCurrentPort); err != nil {
@@ -837,6 +807,21 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 	metricRecvDataPacketsDERP.Register(&m.inboundPacketsDERPTotal)
 	metricRecvDataPacketsPeerRelayIPv4.Register(&m.inboundPacketsPeerRelayIPv4Total)
 	metricRecvDataPacketsPeerRelayIPv6.Register(&m.inboundPacketsPeerRelayIPv6Total)
+	metricRecvDataBytesIPv4.Register(&m.inboundBytesIPv4Total)
+	metricRecvDataBytesIPv6.Register(&m.inboundBytesIPv6Total)
+	metricRecvDataBytesDERP.Register(&m.inboundBytesDERPTotal)
+	metricRecvDataBytesPeerRelayIPv4.Register(&m.inboundBytesPeerRelayIPv4Total)
+	metricRecvDataBytesPeerRelayIPv6.Register(&m.inboundBytesPeerRelayIPv6Total)
+	metricSendDataPacketsIPv4.Register(&m.outboundPacketsIPv4Total)
+	metricSendDataPacketsIPv6.Register(&m.outboundPacketsIPv6Total)
+	metricSendDataPacketsDERP.Register(&m.outboundPacketsDERPTotal)
+	metricSendDataPacketsPeerRelayIPv4.Register(&m.outboundPacketsPeerRelayIPv4Total)
+	metricSendDataPacketsPeerRelayIPv6.Register(&m.outboundPacketsPeerRelayIPv6Total)
+	metricSendDataBytesIPv4.Register(&m.outboundBytesIPv4Total)
+	metricSendDataBytesIPv6.Register(&m.outboundBytesIPv6Total)
+	metricSendDataBytesDERP.Register(&m.outboundBytesDERPTotal)
+	metricSendDataBytesPeerRelayIPv4.Register(&m.outboundBytesPeerRelayIPv4Total)
+	metricSendDataBytesPeerRelayIPv6.Register(&m.outboundBytesPeerRelayIPv6Total)
 	metricSendUDP.Register(&m.outboundPacketsIPv4Total)
 	metricSendUDP.Register(&m.outboundPacketsIPv6Total)
 	metricSendDERP.Register(&m.outboundPacketsDERPTotal)
@@ -874,12 +859,27 @@ func registerMetrics(reg *usermetric.Registry) *metrics {
 
 // deregisterMetrics unregisters the underlying usermetrics expvar counters
 // from clientmetrics.
-func deregisterMetrics(m *metrics) {
+func deregisterMetrics() {
 	metricRecvDataPacketsIPv4.UnregisterAll()
 	metricRecvDataPacketsIPv6.UnregisterAll()
 	metricRecvDataPacketsDERP.UnregisterAll()
 	metricRecvDataPacketsPeerRelayIPv4.UnregisterAll()
 	metricRecvDataPacketsPeerRelayIPv6.UnregisterAll()
+	metricRecvDataBytesIPv4.UnregisterAll()
+	metricRecvDataBytesIPv6.UnregisterAll()
+	metricRecvDataBytesDERP.UnregisterAll()
+	metricRecvDataBytesPeerRelayIPv4.UnregisterAll()
+	metricRecvDataBytesPeerRelayIPv6.UnregisterAll()
+	metricSendDataPacketsIPv4.UnregisterAll()
+	metricSendDataPacketsIPv6.UnregisterAll()
+	metricSendDataPacketsDERP.UnregisterAll()
+	metricSendDataPacketsPeerRelayIPv4.UnregisterAll()
+	metricSendDataPacketsPeerRelayIPv6.UnregisterAll()
+	metricSendDataBytesIPv4.UnregisterAll()
+	metricSendDataBytesIPv6.UnregisterAll()
+	metricSendDataBytesDERP.UnregisterAll()
+	metricSendDataBytesPeerRelayIPv4.UnregisterAll()
+	metricSendDataBytesPeerRelayIPv6.UnregisterAll()
 	metricSendUDP.UnregisterAll()
 	metricSendDERP.UnregisterAll()
 	metricSendPeerRelay.UnregisterAll()
@@ -1710,7 +1710,7 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 	var epCache epAddrEndpointCache
 
 	return func(buffs [][]byte, sizes []int, eps []conn.Endpoint) (_ int, retErr error) {
-		if healthItem != nil {
+		if buildfeatures.HasHealth && healthItem != nil {
 			healthItem.Enter()
 			defer healthItem.Exit()
 			defer func() {
@@ -1865,8 +1865,10 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 	now := mono.Now()
 	ep.lastRecvUDPAny.StoreAtomic(now)
 	connNoted := ep.noteRecvActivity(src, now)
-	if stats := c.stats.Load(); stats != nil {
-		stats.UpdateRxPhysical(ep.nodeAddr, ipp, 1, geneveInclusivePacketLen)
+	if buildfeatures.HasNetLog {
+		if update := c.connCounter.Load(); update != nil {
+			update(0, netip.AddrPortFrom(ep.nodeAddr, 0), ipp, 1, geneveInclusivePacketLen, true)
+		}
 	}
 	if src.vni.IsSet() && (connNoted || looksLikeInitiationMsg(b)) {
 		// connNoted is periodic, but we also want to verify if the peer is who
@@ -2980,7 +2982,12 @@ func (c *Conn) onNodeViewsUpdate(update NodeViewsUpdate) {
 	filt := c.filt
 	self := c.self
 	peers := c.peers
+	isClosed := c.closed
 	c.mu.Unlock() // release c.mu before potentially calling c.updateRelayServersSet which is O(m * n)
+
+	if isClosed {
+		return // nothing to do here, the conn is closed and the update is no longer relevant
+	}
 
 	if peersChanged || relayClientChanged {
 		if !relayClientEnabled {
@@ -3311,13 +3318,12 @@ func (c *connBind) isClosed() bool {
 //
 // Only the first close does anything. Any later closes return nil.
 func (c *Conn) Close() error {
-	// Close the [eventbus.Client] and wait for c.consumeEventbusTopics to
+	// Close the [eventbus.Client] to wait for subscribers to
 	// return before acquiring c.mu:
-	//  1. Conn.consumeEventbusTopics event handlers also acquire c.mu, they can
-	//     deadlock with c.Close().
-	//  2. Conn.consumeEventbusTopics event handlers may not guard against
-	//     undesirable post/in-progress Conn.Close() behaviors.
-	c.eventSubs.Close()
+	//  1. Event handlers also acquire c.mu, they can deadlock with c.Close().
+	//  2. Event handlers may not guard against undesirable post/in-progress
+	//     Conn.Close() behaviors.
+	c.eventClient.Close()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -3362,7 +3368,7 @@ func (c *Conn) Close() error {
 		pinger.Close()
 	}
 
-	deregisterMetrics(c.metrics)
+	deregisterMetrics()
 
 	return nil
 }
@@ -3414,7 +3420,7 @@ func (c *Conn) shouldDoPeriodicReSTUNLocked() bool {
 	return true
 }
 
-func (c *Conn) onPortMapChanged() { c.ReSTUN("portmap-changed") }
+func (c *Conn) onPortMapChanged(portmappertype.Mapping) { c.ReSTUN("portmap-changed") }
 
 // ReSTUN triggers an address discovery.
 // The provided why string is for debug logging only.
@@ -3531,7 +3537,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 			c.logf("magicsock: unable to bind %v port %d: %v", network, port, err)
 			continue
 		}
-		if c.onPortUpdate != nil {
+		if c.portUpdatePub.ShouldPublish() {
 			_, gotPortStr, err := net.SplitHostPort(pconn.LocalAddr().String())
 			if err != nil {
 				c.logf("could not parse port from %s: %w", pconn.LocalAddr().String(), err)
@@ -3540,7 +3546,10 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 				if err != nil {
 					c.logf("could not parse port from %s: %w", gotPort, err)
 				} else {
-					c.onPortUpdate(uint16(gotPort), network)
+					c.portUpdatePub.Publish(router.PortUpdate{
+						UDPPort:         uint16(gotPort),
+						EndpointNetwork: network,
+					})
 				}
 			}
 		}
@@ -3740,10 +3749,12 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 	})
 }
 
-// SetStatistics specifies a per-connection statistics aggregator.
+// SetConnectionCounter specifies a per-connection statistics aggregator.
 // Nil may be specified to disable statistics gathering.
-func (c *Conn) SetStatistics(stats *connstats.Statistics) {
-	c.stats.Store(stats)
+func (c *Conn) SetConnectionCounter(fn netlogfunc.ConnectionCounter) {
+	if buildfeatures.HasNetLog {
+		c.connCounter.Store(fn)
+	}
 }
 
 // SetHomeless sets whether magicsock should idle harder and not have a DERP
@@ -3947,12 +3958,19 @@ var (
 	metricSendDERPErrorClosed = clientmetric.NewCounter("magicsock_send_derp_error_closed")
 	metricSendDERPErrorQueue  = clientmetric.NewCounter("magicsock_send_derp_error_queue")
 	metricSendDERPDropped     = clientmetric.NewCounter("magicsock_send_derp_dropped")
-	metricSendUDP             = clientmetric.NewAggregateCounter("magicsock_send_udp")
 	metricSendUDPError        = clientmetric.NewCounter("magicsock_send_udp_error")
-	metricSendPeerRelay       = clientmetric.NewAggregateCounter("magicsock_send_peer_relay")
 	metricSendPeerRelayError  = clientmetric.NewCounter("magicsock_send_peer_relay_error")
-	metricSendDERP            = clientmetric.NewAggregateCounter("magicsock_send_derp")
 	metricSendDERPError       = clientmetric.NewCounter("magicsock_send_derp_error")
+
+	// Sends (data)
+	//
+	// Note: Prior to v1.78 metricSendUDP & metricSendDERP counted sends of data
+	// AND disco packets. They were updated in v1.78 to only count data packets.
+	// metricSendPeerRelay was added in v1.86 and has always counted only data
+	// packets.
+	metricSendUDP       = clientmetric.NewAggregateCounter("magicsock_send_udp")
+	metricSendPeerRelay = clientmetric.NewAggregateCounter("magicsock_send_peer_relay")
+	metricSendDERP      = clientmetric.NewAggregateCounter("magicsock_send_derp")
 
 	// Data packets (non-disco)
 	metricSendData                     = clientmetric.NewCounter("magicsock_send_data")
@@ -3962,6 +3980,23 @@ var (
 	metricRecvDataPacketsIPv6          = clientmetric.NewAggregateCounter("magicsock_recv_data_ipv6")
 	metricRecvDataPacketsPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_recv_data_peer_relay_ipv4")
 	metricRecvDataPacketsPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_recv_data_peer_relay_ipv6")
+	metricSendDataPacketsDERP          = clientmetric.NewAggregateCounter("magicsock_send_data_derp")
+	metricSendDataPacketsIPv4          = clientmetric.NewAggregateCounter("magicsock_send_data_ipv4")
+	metricSendDataPacketsIPv6          = clientmetric.NewAggregateCounter("magicsock_send_data_ipv6")
+	metricSendDataPacketsPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_send_data_peer_relay_ipv4")
+	metricSendDataPacketsPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_send_data_peer_relay_ipv6")
+
+	// Data bytes (non-disco)
+	metricRecvDataBytesDERP          = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_derp")
+	metricRecvDataBytesIPv4          = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_ipv4")
+	metricRecvDataBytesIPv6          = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_ipv6")
+	metricRecvDataBytesPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_peer_relay_ipv4")
+	metricRecvDataBytesPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_recv_data_bytes_peer_relay_ipv6")
+	metricSendDataBytesDERP          = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_derp")
+	metricSendDataBytesIPv4          = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_ipv4")
+	metricSendDataBytesIPv6          = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_ipv6")
+	metricSendDataBytesPeerRelayIPv4 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv4")
+	metricSendDataBytesPeerRelayIPv6 = clientmetric.NewAggregateCounter("magicsock_send_data_bytes_peer_relay_ipv6")
 
 	// Disco packets
 	metricSendDiscoUDP                           = clientmetric.NewCounter("magicsock_disco_send_udp")

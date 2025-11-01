@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/creachadair/msync/trigger"
 	"github.com/go-json-experiment/json/jsontext"
 	"tailscale.com/envknob"
 	"tailscale.com/net/netmon"
@@ -32,6 +33,7 @@ import (
 	"tailscale.com/tstime"
 	tslogger "tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/util/set"
 	"tailscale.com/util/truncate"
 	"tailscale.com/util/zstdframe"
@@ -120,6 +122,12 @@ func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
 		shutdownStart: make(chan struct{}),
 		shutdownDone:  make(chan struct{}),
 	}
+
+	if cfg.Bus != nil {
+		l.eventClient = cfg.Bus.Client("logtail.Logger")
+		// Subscribe to change deltas from NetMon to detect when the network comes up.
+		eventbus.SubscribeFunc(l.eventClient, l.onChangeDelta)
+	}
 	l.SetSockstatsLabel(sockstats.LabelLogtailLogger)
 	l.compressLogs = cfg.CompressLogs
 
@@ -156,6 +164,8 @@ type Logger struct {
 	privateID      logid.PrivateID
 	httpDoCalls    atomic.Int32
 	sockstatsLabel atomicSocktatsLabel
+	eventClient    *eventbus.Client
+	networkIsUp    trigger.Cond // set/reset by netmon.ChangeDelta events
 
 	procID              uint32
 	includeProcSequence bool
@@ -221,6 +231,9 @@ func (l *Logger) Shutdown(ctx context.Context) error {
 		l.httpc.CloseIdleConnections()
 	}()
 
+	if l.eventClient != nil {
+		l.eventClient.Close()
+	}
 	l.shutdownStartMu.Lock()
 	select {
 	case <-l.shutdownStart:
@@ -409,14 +422,38 @@ func (l *Logger) uploading(ctx context.Context) {
 }
 
 func (l *Logger) internetUp() bool {
-	if l.netMonitor == nil {
-		// No way to tell, so assume it is.
+	select {
+	case <-l.networkIsUp.Ready():
 		return true
+	default:
+		if l.netMonitor == nil {
+			return true // No way to tell, so assume it is.
+		}
+		return l.netMonitor.InterfaceState().AnyInterfaceUp()
 	}
-	return l.netMonitor.InterfaceState().AnyInterfaceUp()
+}
+
+// onChangeDelta is an eventbus subscriber function that handles
+// [netmon.ChangeDelta] events to detect whether the Internet is expected to be
+// reachable.
+func (l *Logger) onChangeDelta(delta *netmon.ChangeDelta) {
+	if delta.New.AnyInterfaceUp() {
+		fmt.Fprintf(l.stderr, "logtail: internet back up\n")
+		l.networkIsUp.Set()
+	} else {
+		fmt.Fprintf(l.stderr, "logtail: network changed, but is not up\n")
+		l.networkIsUp.Reset()
+	}
 }
 
 func (l *Logger) awaitInternetUp(ctx context.Context) {
+	if l.eventClient != nil {
+		select {
+		case <-l.networkIsUp.Ready():
+		case <-ctx.Done():
+		}
+		return
+	}
 	upc := make(chan bool, 1)
 	defer l.netMonitor.RegisterChangeCallback(func(delta *netmon.ChangeDelta) {
 		if delta.New.AnyInterfaceUp() {

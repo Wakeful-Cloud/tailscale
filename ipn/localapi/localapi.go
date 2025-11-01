@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
-	"tailscale.com/appc"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
 	"tailscale.com/feature"
@@ -38,6 +37,7 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
+	"tailscale.com/types/appctype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
@@ -71,50 +71,90 @@ var handler = map[string]LocalAPIHandler{
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
 	// without a trailing slash:
-	"alpha-set-device-attrs":       (*Handler).serveSetDeviceAttrs, // see tailscale/corp#24690
-	"bugreport":                    (*Handler).serveBugReport,
-	"check-ip-forwarding":          (*Handler).serveCheckIPForwarding,
-	"check-prefs":                  (*Handler).serveCheckPrefs,
-	"check-reverse-path-filtering": (*Handler).serveCheckReversePathFiltering,
-	"check-udp-gro-forwarding":     (*Handler).serveCheckUDPGROForwarding,
-	"derpmap":                      (*Handler).serveDERPMap,
-	"dial":                         (*Handler).serveDial,
-	"disconnect-control":           (*Handler).disconnectControl,
-	"dns-osconfig":                 (*Handler).serveDNSOSConfig,
-	"dns-query":                    (*Handler).serveDNSQuery,
-	"goroutines":                   (*Handler).serveGoroutines,
-	"handle-push-message":          (*Handler).serveHandlePushMessage,
-	"id-token":                     (*Handler).serveIDToken,
-	"login-interactive":            (*Handler).serveLoginInteractive,
-	"logout":                       (*Handler).serveLogout,
-	"logtap":                       (*Handler).serveLogTap,
-	"metrics":                      (*Handler).serveMetrics,
-	"ping":                         (*Handler).servePing,
-	"pprof":                        (*Handler).servePprof,
-	"prefs":                        (*Handler).servePrefs,
-	"query-feature":                (*Handler).serveQueryFeature,
-	"reload-config":                (*Handler).reloadConfig,
-	"reset-auth":                   (*Handler).serveResetAuth,
-	"set-dns":                      (*Handler).serveSetDNS,
-	"set-expiry-sooner":            (*Handler).serveSetExpirySooner,
-	"set-gui-visible":              (*Handler).serveSetGUIVisible,
-	"set-push-device-token":        (*Handler).serveSetPushDeviceToken,
-	"set-udp-gro-forwarding":       (*Handler).serveSetUDPGROForwarding,
-	"set-use-exit-node-enabled":    (*Handler).serveSetUseExitNodeEnabled,
-	"shutdown":                     (*Handler).serveShutdown,
-	"start":                        (*Handler).serveStart,
-	"status":                       (*Handler).serveStatus,
-	"suggest-exit-node":            (*Handler).serveSuggestExitNode,
-	"update/check":                 (*Handler).serveUpdateCheck,
-	"upload-client-metrics":        (*Handler).serveUploadClientMetrics,
-	"usermetrics":                  (*Handler).serveUserMetrics,
-	"watch-ipn-bus":                (*Handler).serveWatchIPNBus,
-	"whois":                        (*Handler).serveWhoIs,
+	"check-prefs":       (*Handler).serveCheckPrefs,
+	"derpmap":           (*Handler).serveDERPMap,
+	"goroutines":        (*Handler).serveGoroutines,
+	"login-interactive": (*Handler).serveLoginInteractive,
+	"logout":            (*Handler).serveLogout,
+	"ping":              (*Handler).servePing,
+	"prefs":             (*Handler).servePrefs,
+	"reload-config":     (*Handler).reloadConfig,
+	"reset-auth":        (*Handler).serveResetAuth,
+	"set-expiry-sooner": (*Handler).serveSetExpirySooner,
+	"shutdown":          (*Handler).serveShutdown,
+	"start":             (*Handler).serveStart,
+	"status":            (*Handler).serveStatus,
+	"whois":             (*Handler).serveWhoIs,
 }
 
 func init() {
 	if buildfeatures.HasAppConnectors {
 		Register("appc-route-info", (*Handler).serveGetAppcRouteInfo)
+	}
+	if buildfeatures.HasAdvertiseRoutes {
+		Register("check-ip-forwarding", (*Handler).serveCheckIPForwarding)
+		Register("check-udp-gro-forwarding", (*Handler).serveCheckUDPGROForwarding)
+		Register("set-udp-gro-forwarding", (*Handler).serveSetUDPGROForwarding)
+	}
+	if buildfeatures.HasUseExitNode && runtime.GOOS == "linux" {
+		Register("check-reverse-path-filtering", (*Handler).serveCheckReversePathFiltering)
+	}
+	if buildfeatures.HasClientMetrics {
+		Register("upload-client-metrics", (*Handler).serveUploadClientMetrics)
+	}
+	if buildfeatures.HasClientUpdate {
+		Register("update/check", (*Handler).serveUpdateCheck)
+	}
+	if buildfeatures.HasUseExitNode {
+		Register("suggest-exit-node", (*Handler).serveSuggestExitNode)
+		Register("set-use-exit-node-enabled", (*Handler).serveSetUseExitNodeEnabled)
+	}
+	if buildfeatures.HasACME {
+		Register("set-dns", (*Handler).serveSetDNS)
+	}
+	if buildfeatures.HasDebug {
+		Register("bugreport", (*Handler).serveBugReport)
+		Register("pprof", (*Handler).servePprof)
+	}
+	if buildfeatures.HasDebug || buildfeatures.HasServe {
+		Register("watch-ipn-bus", (*Handler).serveWatchIPNBus)
+	}
+	if buildfeatures.HasDNS {
+		Register("dns-osconfig", (*Handler).serveDNSOSConfig)
+		Register("dns-query", (*Handler).serveDNSQuery)
+	}
+	if buildfeatures.HasUserMetrics {
+		Register("usermetrics", (*Handler).serveUserMetrics)
+	}
+	if buildfeatures.HasServe {
+		Register("query-feature", (*Handler).serveQueryFeature)
+	}
+	if buildfeatures.HasOutboundProxy || buildfeatures.HasSSH {
+		Register("dial", (*Handler).serveDial)
+	}
+	if buildfeatures.HasClientMetrics || buildfeatures.HasDebug {
+		Register("metrics", (*Handler).serveMetrics)
+	}
+	if buildfeatures.HasDebug || buildfeatures.HasAdvertiseRoutes {
+		Register("disconnect-control", (*Handler).disconnectControl)
+	}
+	// Alpha/experimental/debug features. These should be moved to
+	// their own features if/when they graduate.
+	if buildfeatures.HasDebug {
+		Register("id-token", (*Handler).serveIDToken)
+		Register("alpha-set-device-attrs", (*Handler).serveSetDeviceAttrs) // see tailscale/corp#24690
+		Register("handle-push-message", (*Handler).serveHandlePushMessage)
+		Register("set-push-device-token", (*Handler).serveSetPushDeviceToken)
+	}
+	if buildfeatures.HasDebug || runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		Register("set-gui-visible", (*Handler).serveSetGUIVisible)
+	}
+	if buildfeatures.HasLogTail {
+		// TODO(bradfitz): separate out logtail tap functionality from upload
+		// functionality to make this possible? But seems unlikely people would
+		// want just this. They could "tail -f" or "journalctl -f" their logs
+		// themselves.
+		Register("logtap", (*Handler).serveLogTap)
 	}
 }
 
@@ -384,7 +424,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	// OS-specific details
 	h.logf.JSON(1, "UserBugReportOS", osdiag.SupportInfo(osdiag.LogSupportInfoReasonBugReport))
 
-	// Tailnet lock details
+	// Tailnet Lock details
 	st := h.b.NetworkLockStatus()
 	if st.Enabled {
 		h.logf.JSON(1, "UserBugReportTailnetLockStatus", st)
@@ -568,15 +608,6 @@ func (h *Handler) serveGoroutines(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveLogTap(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	if !buildfeatures.HasLogTail {
-		// TODO(bradfitz): separate out logtail tap functionality from upload
-		// functionality to make this possible? But seems unlikely people would
-		// want just this. They could "tail -f" or "journalctl -f" their logs
-		// themselves.
-		http.Error(w, "logtap not supported in this build", http.StatusNotImplemented)
-		return
-	}
-
 	// Require write access (~root) as the logs could contain something
 	// sensitive.
 	if !h.PermitWrite {
@@ -650,7 +681,7 @@ func (h *Handler) servePprof(w http.ResponseWriter, r *http.Request) {
 
 // disconnectControl is the handler for local API /disconnect-control endpoint that shuts down control client, so that
 // node no longer communicates with control. Doing this makes control consider this node inactive. This can be used
-// before shutting down a replica of HA subnet  router or app connector deployments to ensure that control tells the
+// before shutting down a replica of HA subnet router or app connector deployments to ensure that control tells the
 // peers to switch over to another replica whilst still maintaining th existing peer connections.
 func (h *Handler) disconnectControl(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
@@ -1286,6 +1317,10 @@ func (h *Handler) serveSetGUIVisible(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serveSetUseExitNodeEnabled(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasUseExitNode {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
+		return
+	}
 	if r.Method != httpm.POST {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
@@ -1477,13 +1512,6 @@ func (h *Handler) serveUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	if !feature.CanAutoUpdate() {
-		// if we don't support auto-update, just say that we're up to date
-		json.NewEncoder(w).Encode(tailcfg.ClientVersion{RunningLatest: true})
-		return
-	}
-
 	cv := h.b.StatusWithoutPeers().ClientVersion
 	// ipnstate.Status documentation notes that ClientVersion may be nil on some
 	// platforms where this information is unavailable. In that case, return a
@@ -1624,6 +1652,10 @@ func dnsMessageTypeForString(s string) (t dnsmessage.Type, err error) {
 
 // serveSuggestExitNode serves a POST endpoint for returning a suggested exit node.
 func (h *Handler) serveSuggestExitNode(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasUseExitNode {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
+		return
+	}
 	if r.Method != httpm.GET {
 		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
 		return
@@ -1684,7 +1716,7 @@ func (h *Handler) serveGetAppcRouteInfo(w http.ResponseWriter, r *http.Request) 
 	res, err := h.b.ReadRouteInfo()
 	if err != nil {
 		if errors.Is(err, ipn.ErrStateNotExist) {
-			res = &appc.RouteInfo{}
+			res = &appctype.RouteInfo{}
 		} else {
 			WriteErrorJSON(w, err)
 			return

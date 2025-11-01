@@ -67,6 +67,9 @@ import (
 // Generate static manifests for deploying Tailscale operator on Kubernetes from the operator's Helm chart.
 //go:generate go run tailscale.com/cmd/k8s-operator/generate staticmanifests
 
+// Generate the helm chart's CRDs (which are ignored from git).
+//go:generate go run tailscale.com/cmd/k8s-operator/generate helmcrd
+
 // Generate CRD API docs.
 //go:generate go run github.com/elastic/crd-ref-docs --renderer=markdown --source-path=../../k8s-operator/apis/ --config=../../k8s-operator/api-docs-config.yaml --output-path=../../k8s-operator/api.md
 
@@ -633,7 +636,7 @@ func runReconcilers(opts reconcilerOpts) {
 			recorder:    eventRecorder,
 			tsNamespace: opts.tailscaleNamespace,
 			Client:      mgr.GetClient(),
-			l:           opts.log.Named("recorder-reconciler"),
+			log:         opts.log.Named("recorder-reconciler"),
 			clock:       tstime.DefaultClock{},
 			tsClient:    opts.tsClient,
 			loginServer: opts.loginServer,
@@ -688,7 +691,7 @@ func runReconcilers(opts reconcilerOpts) {
 		Complete(&ProxyGroupReconciler{
 			recorder: eventRecorder,
 			Client:   mgr.GetClient(),
-			l:        opts.log.Named("proxygroup-reconciler"),
+			log:      opts.log.Named("proxygroup-reconciler"),
 			clock:    tstime.DefaultClock{},
 			tsClient: opts.tsClient,
 

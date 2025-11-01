@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/views"
 )
 
 func TestServeDevConfigMutations(t *testing.T) {
@@ -33,10 +35,11 @@ func TestServeDevConfigMutations(t *testing.T) {
 	}
 
 	// group is a group of steps that share the same
-	// config mutation, but always starts from an empty config
+	// config mutation
 	type group struct {
-		name  string
-		steps []step
+		name         string
+		steps        []step
+		initialState fakeLocalServeClient // use the zero value for empty config
 	}
 
 	// creaet a temporary directory for path-based destinations
@@ -814,17 +817,119 @@ func TestServeDevConfigMutations(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "advertise_service",
+			initialState: fakeLocalServeClient{
+				statusWithoutPeers: &ipnstate.Status{
+					BackendState: ipn.Running.String(),
+					Self: &ipnstate.PeerStatus{
+						DNSName: "foo.test.ts.net",
+						CapMap: tailcfg.NodeCapMap{
+							tailcfg.NodeAttrFunnel:                            nil,
+							tailcfg.CapabilityFunnelPorts + "?ports=443,8443": nil,
+						},
+						Tags: ptrToReadOnlySlice([]string{"some-tag"}),
+					},
+					CurrentTailnet: &ipnstate.TailnetStatus{MagicDNSSuffix: "test.ts.net"},
+				},
+			},
+			steps: []step{{
+				command: cmd("serve --service=svc:foo --http=80 text:foo"),
+				want: &ipn.ServeConfig{
+					Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+						"svc:foo": {
+							TCP: map[uint16]*ipn.TCPPortHandler{
+								80: {HTTP: true},
+							},
+							Web: map[ipn.HostPort]*ipn.WebServerConfig{
+								"foo.test.ts.net:80": {Handlers: map[string]*ipn.HTTPHandler{
+									"/": {Text: "foo"},
+								}},
+							},
+						},
+					},
+				},
+			}},
+		},
+		{
+			name: "advertise_service_from_untagged_node",
+			steps: []step{{
+				command: cmd("serve --service=svc:foo --http=80 text:foo"),
+				wantErr: anyErr(),
+			}},
+		},
+		{
+			name: "forward_grant_header",
+			steps: []step{
+				{
+					command: cmd("serve --bg --accept-app-caps=example.com/cap/foo 3000"),
+					want: &ipn.ServeConfig{
+						TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"foo.test.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+								"/": {
+									Proxy:         "http://127.0.0.1:3000",
+									AcceptAppCaps: []tailcfg.PeerCapability{"example.com/cap/foo"},
+								},
+							}},
+						},
+					},
+				},
+				{
+					command: cmd("serve --bg --accept-app-caps=example.com/cap/foo,example.com/cap/bar 3000"),
+					want: &ipn.ServeConfig{
+						TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"foo.test.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+								"/": {
+									Proxy:         "http://127.0.0.1:3000",
+									AcceptAppCaps: []tailcfg.PeerCapability{"example.com/cap/foo", "example.com/cap/bar"},
+								},
+							}},
+						},
+					},
+				},
+				{
+					command: cmd("serve --bg --accept-app-caps=example.com/cap/bar 3000"),
+					want: &ipn.ServeConfig{
+						TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"foo.test.ts.net:443": {Handlers: map[string]*ipn.HTTPHandler{
+								"/": {
+									Proxy:         "http://127.0.0.1:3000",
+									AcceptAppCaps: []tailcfg.PeerCapability{"example.com/cap/bar"},
+								},
+							}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid_accept_caps_invalid_app_cap",
+			steps: []step{
+				{
+					command: cmd("serve --bg --accept-app-caps=example.com/cap/fine,NOTFINE 3000"), // should be {domain.tld}/{name}
+					wantErr: func(err error) (badErrMsg string) {
+						if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q does not match", "NOTFINE")) {
+							return fmt.Sprintf("wanted validation error that quotes the non-matching capability (and nothing more) but got %q", err.Error())
+						}
+						return ""
+					},
+				},
+			},
+		},
 	}
 
 	for _, group := range groups {
 		t.Run(group.name, func(t *testing.T) {
-			lc := &fakeLocalServeClient{}
+			lc := group.initialState
 			for i, st := range group.steps {
 				var stderr bytes.Buffer
 				var stdout bytes.Buffer
 				var flagOut bytes.Buffer
 				e := &serveEnv{
-					lc:          lc,
+					lc:          &lc,
 					testFlagOut: &flagOut,
 					testStdout:  &stdout,
 					testStderr:  &stderr,
@@ -1125,6 +1230,118 @@ func TestSrcTypeFromFlags(t *testing.T) {
 			}
 			if srcPort != tt.expectedPort {
 				t.Errorf("Expected srcPort: %d, got: %d", tt.expectedPort, srcPort)
+			}
+		})
+	}
+}
+
+func TestAcceptSetAppCapsFlag(t *testing.T) {
+	testCases := []struct {
+		name             string
+		inputs           []string
+		expectErr        bool
+		expectErrToMatch *regexp.Regexp
+		expectedValue    []tailcfg.PeerCapability
+	}{
+		{
+			name:          "valid_simple",
+			inputs:        []string{"example.com/name"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"example.com/name"},
+		},
+		{
+			name:          "valid_unicode",
+			inputs:        []string{"bücher.de/something"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"bücher.de/something"},
+		},
+		{
+			name:          "more_valid_unicode",
+			inputs:        []string{"example.tw/某某某"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"example.tw/某某某"},
+		},
+		{
+			name:          "valid_path_slashes",
+			inputs:        []string{"domain.com/path/to/name"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"domain.com/path/to/name"},
+		},
+		{
+			name:          "valid_multiple_sets",
+			inputs:        []string{"one.com/foo,two.com/bar"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"one.com/foo", "two.com/bar"},
+		},
+		{
+			name:          "valid_empty_string",
+			inputs:        []string{""},
+			expectErr:     false,
+			expectedValue: nil, // Empty string should be a no-op and not append anything.
+		},
+		{
+			name:             "invalid_path_chars",
+			inputs:           []string{"domain.com/path_with_underscore"},
+			expectErr:        true,
+			expectErrToMatch: regexp.MustCompile(`"domain.com/path_with_underscore"`),
+			expectedValue:    nil, // Slice should remain empty.
+		},
+		{
+			name:          "valid_subdomain",
+			inputs:        []string{"sub.domain.com/name"},
+			expectErr:     false,
+			expectedValue: []tailcfg.PeerCapability{"sub.domain.com/name"},
+		},
+		{
+			name:             "invalid_no_path",
+			inputs:           []string{"domain.com/"},
+			expectErr:        true,
+			expectErrToMatch: regexp.MustCompile(`"domain.com/"`),
+			expectedValue:    nil,
+		},
+		{
+			name:             "invalid_no_domain",
+			inputs:           []string{"/path/only"},
+			expectErr:        true,
+			expectErrToMatch: regexp.MustCompile(`"/path/only"`),
+			expectedValue:    nil,
+		},
+		{
+			name:             "some_invalid_some_valid",
+			inputs:           []string{"one.com/foo,bad/bar,two.com/baz"},
+			expectErr:        true,
+			expectErrToMatch: regexp.MustCompile(`"bad/bar"`),
+			expectedValue:    []tailcfg.PeerCapability{"one.com/foo"}, // Parsing will stop after first error
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var v []tailcfg.PeerCapability
+			flag := &acceptAppCapsFlag{Value: &v}
+
+			var err error
+			for _, s := range tc.inputs {
+				err = flag.Set(s)
+				if err != nil {
+					break
+				}
+			}
+
+			if tc.expectErr && err == nil {
+				t.Errorf("expected an error, but got none")
+			}
+			if tc.expectErrToMatch != nil {
+				if !tc.expectErrToMatch.MatchString(err.Error()) {
+					t.Errorf("expected error to match %q, but was %q", tc.expectErrToMatch, err)
+				}
+			}
+			if !tc.expectErr && err != nil {
+				t.Errorf("did not expect an error, but got: %v", err)
+			}
+
+			if !reflect.DeepEqual(tc.expectedValue, v) {
+				t.Errorf("unexpected value, got: %q, want: %q", v, tc.expectedValue)
 			}
 		})
 	}
@@ -1966,7 +2183,7 @@ func TestSetServe(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := e.setServe(tt.cfg, tt.dnsName, tt.srvType, tt.srvPort, tt.mountPath, tt.target, tt.allowFunnel, magicDNSSuffix)
+			err := e.setServe(tt.cfg, tt.dnsName, tt.srvType, tt.srvPort, tt.mountPath, tt.target, tt.allowFunnel, magicDNSSuffix, nil)
 			if err != nil && !tt.expectErr {
 				t.Fatalf("got error: %v; did not expect error.", err)
 			}
@@ -2248,4 +2465,9 @@ func exactErrMsg(want error) func(error) string {
 		}
 		return fmt.Sprintf("\ngot:  %v\nwant: %v\n", got, want)
 	}
+}
+
+func ptrToReadOnlySlice[T any](s []T) *views.Slice[T] {
+	vs := views.SliceOf(s)
+	return &vs
 }

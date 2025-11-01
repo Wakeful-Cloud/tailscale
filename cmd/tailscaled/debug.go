@@ -28,7 +28,9 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsweb/varz"
 	"tailscale.com/types/key"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
 )
 
@@ -56,6 +58,12 @@ func newDebugMux() *http.ServeMux {
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	return mux
+}
+
+func servePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	varz.Handler(w, r)
+	clientmetric.WritePrometheusExpositionFormat(w)
 }
 
 func debugMode(args []string) error {
@@ -104,14 +112,10 @@ func runMonitor(ctx context.Context, loop bool) error {
 	}
 	defer mon.Close()
 
-	mon.RegisterChangeCallback(func(delta *netmon.ChangeDelta) {
-		if !delta.Major {
-			log.Printf("Network monitor fired; not a major change")
-			return
-		}
-		log.Printf("Network monitor fired. New state:")
-		dump(delta.New)
-	})
+	eventClient := b.Client("debug.runMonitor")
+	m := eventClient.Monitor(changeDeltaWatcher(eventClient, ctx, dump))
+	defer m.Close()
+
 	if loop {
 		log.Printf("Starting link change monitor; initial state:")
 	}
@@ -122,6 +126,27 @@ func runMonitor(ctx context.Context, loop bool) error {
 	mon.Start()
 	log.Printf("Started link change monitor; waiting...")
 	select {}
+}
+
+func changeDeltaWatcher(ec *eventbus.Client, ctx context.Context, dump func(st *netmon.State)) func(*eventbus.Client) {
+	changeSub := eventbus.Subscribe[netmon.ChangeDelta](ec)
+	return func(ec *eventbus.Client) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ec.Done():
+				return
+			case delta := <-changeSub.Events():
+				if !delta.Major {
+					log.Printf("Network monitor fired; not a major change")
+					return
+				}
+				log.Printf("Network monitor fired. New state:")
+				dump(delta.New)
+			}
+		}
+	}
 }
 
 func getURL(ctx context.Context, urlStr string) error {

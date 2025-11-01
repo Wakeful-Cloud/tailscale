@@ -51,12 +51,10 @@ import (
 	"tailscale.com/safesocket"
 	"tailscale.com/syncs"
 	"tailscale.com/tsd"
-	"tailscale.com/tsweb/varz"
 	"tailscale.com/types/flagtype"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
-	"tailscale.com/util/clientmetric"
-	"tailscale.com/util/multierr"
 	"tailscale.com/util/osshare"
 	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/policyclient"
@@ -82,13 +80,11 @@ func defaultTunName() string {
 	case "aix", "solaris", "illumos":
 		return "userspace-networking"
 	case "linux":
-		switch distro.Get() {
-		case distro.Synology:
+		if buildfeatures.HasSynology && buildfeatures.HasNetstack && distro.Get() == distro.Synology {
 			// Try TUN, but fall back to userspace networking if needed.
 			// See https://github.com/tailscale/tailscale-synology/issues/35
 			return "tailscale0,userspace-networking"
 		}
-
 	}
 	return "tailscale0"
 }
@@ -116,19 +112,20 @@ var args struct {
 	// or comma-separated list thereof.
 	tunname string
 
-	cleanUp        bool
-	confFile       string // empty, file path, or "vm:user-data"
-	debug          string
-	port           uint16
-	statepath      string
-	encryptState   bool
-	statedir       string
-	socketpath     string
-	birdSocketPath string
-	verbose        int
-	socksAddr      string // listen address for SOCKS5 server
-	httpProxyAddr  string // listen address for HTTP proxy server
-	disableLogs    bool
+	cleanUp             bool
+	confFile            string // empty, file path, or "vm:user-data"
+	debug               string
+	port                uint16
+	statepath           string
+	encryptState        boolFlag
+	statedir            string
+	socketpath          string
+	birdSocketPath      string
+	verbose             int
+	socksAddr           string // listen address for SOCKS5 server
+	httpProxyAddr       string // listen address for HTTP proxy server
+	disableLogs         bool
+	hardwareAttestation boolFlag
 }
 
 var (
@@ -198,13 +195,20 @@ func main() {
 	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
 	flag.Var(flagtype.PortValue(&args.port, defaultPort()), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
 	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an ephemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
-	flag.BoolVar(&args.encryptState, "encrypt-state", defaultEncryptState(), "encrypt the state file on disk; uses TPM on Linux and Windows, on all other platforms this flag is not supported")
+	if buildfeatures.HasTPM {
+		flag.Var(&args.encryptState, "encrypt-state", `encrypt the state file on disk; when not set encryption will be enabled if supported on this platform; uses TPM on Linux and Windows, on all other platforms this flag is not supported`)
+	}
 	flag.StringVar(&args.statedir, "statedir", "", "path to directory for storage of config state, TLS certs, temporary incoming Taildrop files, etc. If empty, it's derived from --state when possible.")
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
-	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
+	if buildfeatures.HasBird {
+		flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
+	}
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
 	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
 	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2)")
+	if buildfeatures.HasTPM {
+		flag.Var(&args.hardwareAttestation, "hardware-attestation", "use hardware-backed keys to bind node identity to this device when supported by the OS and hardware. Uses TPM 2.0 on Linux and Windows; SecureEnclave on macOS and iOS; and Keystore on Android")
+	}
 	if f, ok := hookRegisterOutboundProxyFlags.GetOk(); ok {
 		f()
 	}
@@ -255,7 +259,7 @@ func main() {
 		log.Fatalf("--socket is required")
 	}
 
-	if args.birdSocketPath != "" && createBIRDClient == nil {
+	if buildfeatures.HasBird && args.birdSocketPath != "" && createBIRDClient == nil {
 		log.SetFlags(0)
 		log.Fatalf("--bird-socket is not supported on %s", runtime.GOOS)
 	}
@@ -276,26 +280,8 @@ func main() {
 		}
 	}
 
-	if args.encryptState {
-		if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
-			log.SetFlags(0)
-			log.Fatalf("--encrypt-state is not supported on %s", runtime.GOOS)
-		}
-		// Check if we have TPM support in this build.
-		if !store.HasKnownProviderPrefix(store.TPMPrefix + "/") {
-			log.SetFlags(0)
-			log.Fatal("--encrypt-state is not supported in this build of tailscaled")
-		}
-		// Check if we have TPM access.
-		if !hostinfo.New().TPM.Present() {
-			log.SetFlags(0)
-			log.Fatal("--encrypt-state is not supported on this device or a TPM is not accessible")
-		}
-		// Check for conflicting prefix in --state, like arn: or kube:.
-		if args.statepath != "" && store.HasKnownProviderPrefix(args.statepath) {
-			log.SetFlags(0)
-			log.Fatal("--encrypt-state can only be used with --state set to a local file path")
-		}
+	if buildfeatures.HasTPM {
+		handleTPMFlags()
 	}
 
 	if args.disableLogs {
@@ -308,8 +294,10 @@ func main() {
 
 	err := run()
 
-	// Remove file sharing from Windows shell (noop in non-windows)
-	osshare.SetFileSharingEnabled(false, logger.Discard)
+	if buildfeatures.HasTaildrop {
+		// Remove file sharing from Windows shell (noop in non-windows)
+		osshare.SetFileSharingEnabled(false, logger.Discard)
+	}
 
 	if err != nil {
 		log.Fatal(err)
@@ -352,7 +340,7 @@ func statePathOrDefault() string {
 	if path == "" && args.statedir != "" {
 		path = filepath.Join(args.statedir, "tailscaled.state")
 	}
-	if path != "" && !store.HasKnownProviderPrefix(path) && args.encryptState {
+	if path != "" && !store.HasKnownProviderPrefix(path) && args.encryptState.v {
 		path = store.TPMPrefix + path
 	}
 	return path
@@ -434,7 +422,13 @@ func run() (err error) {
 
 	var publicLogID logid.PublicID
 	if buildfeatures.HasLogTail {
-		pol := logpolicy.New(logtail.CollectionNode, netMon, sys.HealthTracker.Get(), nil /* use log.Printf */)
+
+		pol := logpolicy.Options{
+			Collection: logtail.CollectionNode,
+			NetMon:     netMon,
+			Health:     sys.HealthTracker.Get(),
+			Bus:        sys.Bus.Get(),
+		}.New()
 		pol.SetVerbosityLevel(args.verbose)
 		publicLogID = pol.PublicID
 		logPol = pol
@@ -471,7 +465,7 @@ func run() (err error) {
 	// Always clean up, even if we're going to run the server. This covers cases
 	// such as when a system was rebooted without shutting down, or tailscaled
 	// crashed, and would for example restore system DNS configuration.
-	dns.CleanUp(logf, netMon, sys.HealthTracker.Get(), args.tunname)
+	dns.CleanUp(logf, netMon, sys.Bus.Get(), sys.HealthTracker.Get(), args.tunname)
 	router.CleanUp(logf, netMon, args.tunname)
 	// If the cleanUp flag was passed, then exit.
 	if args.cleanUp {
@@ -617,6 +611,7 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 	}
 
 	dialer := &tsdial.Dialer{Logf: logf} // mutated below (before used)
+	dialer.SetBus(sys.Bus.Get())
 	sys.Set(dialer)
 
 	onlyNetstack, err := createEngine(logf, sys)
@@ -677,6 +672,9 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 			log.Fatalf("failed to start netstack: %v", err)
 		}
 	}
+	if buildfeatures.HasTPM && args.hardwareAttestation.v {
+		lb.SetHardwareAttested()
+	}
 	return lb, nil
 }
 
@@ -701,7 +699,7 @@ func createEngine(logf logger.Logf, sys *tsd.System) (onlyNetstack bool, err err
 		logf("wgengine.NewUserspaceEngine(tun %q) error: %v", name, err)
 		errs = append(errs, err)
 	}
-	return false, multierr.New(errs...)
+	return false, errors.Join(errs...)
 }
 
 // handleSubnetsInNetstack reports whether netstack should handle subnet routers
@@ -822,12 +820,6 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 
 var hookNewDebugMux feature.Hook[func() *http.ServeMux]
 
-func servePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
-	varz.Handler(w, r)
-	clientmetric.WritePrometheusExpositionFormat(w)
-}
-
 func runDebugServer(logf logger.Logf, mux *http.ServeMux, addr string) {
 	if !buildfeatures.HasDebug {
 		return
@@ -895,14 +887,64 @@ func applyIntegrationTestEnvKnob() {
 	}
 }
 
-func defaultEncryptState() bool {
+// handleTPMFlags validates the --encrypt-state and --hardware-attestation flags
+// if set, and defaults both to on if supported and compatible with other
+// settings.
+func handleTPMFlags() {
+	switch {
+	case args.hardwareAttestation.v:
+		if _, err := key.NewEmptyHardwareAttestationKey(); err == key.ErrUnsupported {
+			log.SetFlags(0)
+			log.Fatalf("--hardware-attestation is not supported on this platform or in this build of tailscaled")
+		}
+	case !args.hardwareAttestation.set:
+		policyHWAttestation, _ := policyclient.Get().GetBoolean(pkey.HardwareAttestation, feature.HardwareAttestationAvailable())
+		if !policyHWAttestation {
+			break
+		}
+		if feature.TPMAvailable() {
+			args.hardwareAttestation.v = true
+		}
+	}
+
+	switch {
+	case args.encryptState.v:
+		// Explicitly enabled, validate.
+		if err := canEncryptState(); err != nil {
+			log.SetFlags(0)
+			log.Fatal(err)
+		}
+	case !args.encryptState.set:
+		policyEncrypt, _ := policyclient.Get().GetBoolean(pkey.EncryptState, feature.TPMAvailable())
+		if !policyEncrypt {
+			// Default disabled, no need to validate.
+			return
+		}
+		// Default enabled if available.
+		if err := canEncryptState(); err == nil {
+			args.encryptState.v = true
+		}
+	}
+}
+
+// canEncryptState returns an error if state encryption can't be enabled,
+// either due to availability or compatibility with other settings.
+func canEncryptState() error {
 	if runtime.GOOS != "windows" && runtime.GOOS != "linux" {
 		// TPM encryption is only configurable on Windows and Linux. Other
 		// platforms either use system APIs and are not configurable
 		// (Android/Apple), or don't support any form of encryption yet
 		// (plan9/FreeBSD/etc).
-		return false
+		return fmt.Errorf("--encrypt-state is not supported on %s", runtime.GOOS)
 	}
-	v, _ := policyclient.Get().GetBoolean(pkey.EncryptState, false)
-	return v
+	// Check if we have TPM access.
+	if !feature.TPMAvailable() {
+		return errors.New("--encrypt-state is not supported on this device or a TPM is not accessible")
+	}
+	// Check for conflicting prefix in --state, like arn: or kube:.
+	if args.statepath != "" && store.HasKnownProviderPrefix(args.statepath) {
+		return errors.New("--encrypt-state can only be used with --state set to a local file path")
+	}
+
+	return nil
 }

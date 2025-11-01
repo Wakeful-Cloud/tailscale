@@ -183,6 +183,10 @@ func (ifaces InterfaceList) ForeachInterfaceAddress(fn func(Interface, netip.Pre
 				if pfx, ok := netaddr.FromStdIPNet(v); ok {
 					fn(iface, pfx)
 				}
+			case *net.IPAddr:
+				if ip, ok := netip.AddrFromSlice(v.IP); ok {
+					fn(iface, netip.PrefixFrom(ip, ip.BitLen()))
+				}
 			}
 		}
 	}
@@ -214,6 +218,10 @@ func (ifaces InterfaceList) ForeachInterface(fn func(Interface, []netip.Prefix))
 			case *net.IPNet:
 				if pfx, ok := netaddr.FromStdIPNet(v); ok {
 					pfxs = append(pfxs, pfx)
+				}
+			case *net.IPAddr:
+				if ip, ok := netip.AddrFromSlice(v.IP); ok {
+					pfxs = append(pfxs, netip.PrefixFrom(ip, ip.BitLen()))
 				}
 			}
 		}
@@ -573,6 +581,9 @@ var disableLikelyHomeRouterIPSelf = envknob.RegisterBool("TS_DEBUG_DISABLE_LIKEL
 // the LAN using that gateway.
 // This is used as the destination for UPnP, NAT-PMP, PCP, etc queries.
 func LikelyHomeRouterIP() (gateway, myIP netip.Addr, ok bool) {
+	if !buildfeatures.HasPortMapper {
+		return
+	}
 	// If we don't have a way to get the home router IP, then we can't do
 	// anything; just return.
 	if likelyHomeRouterIP == nil {

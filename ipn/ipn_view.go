@@ -891,11 +891,27 @@ func (v HTTPHandlerView) Proxy() string { return v.ж.Proxy }
 // plaintext to serve (primarily for testing)
 func (v HTTPHandlerView) Text() string { return v.ж.Text }
 
+// peer capabilities to forward in grant header, e.g. example.com/cap/mon
+func (v HTTPHandlerView) AcceptAppCaps() views.Slice[tailcfg.PeerCapability] {
+	return views.SliceOf(v.ж.AcceptAppCaps)
+}
+
+// Redirect, if not empty, is the target URL to redirect requests to.
+// By default, we redirect with HTTP 302 (Found) status.
+// If Redirect starts with '<httpcode>:', then we use that status instead.
+//
+// The target URL supports the following expansion variables:
+//   - ${HOST}: replaced with the request's Host header value
+//   - ${REQUEST_URI}: replaced with the request's full URI (path and query string)
+func (v HTTPHandlerView) Redirect() string { return v.ж.Redirect }
+
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _HTTPHandlerViewNeedsRegeneration = HTTPHandler(struct {
-	Path  string
-	Proxy string
-	Text  string
+	Path          string
+	Proxy         string
+	Text          string
+	AcceptAppCaps []tailcfg.PeerCapability
+	Redirect      string
 }{})
 
 // View returns a read-only view of WebServerConfig.

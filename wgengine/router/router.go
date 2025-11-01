@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"reflect"
 	"runtime"
+	"slices"
 
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/feature"
@@ -34,14 +35,6 @@ type Router interface {
 	// implementation should handle gracefully.
 	Set(*Config) error
 
-	// UpdateMagicsockPort tells the OS network stack what port magicsock
-	// is currently listening on, so it can be threaded through firewalls
-	// and such. This is distinct from Set() since magicsock may rebind
-	// ports independently from the Config changing.
-	//
-	// network should be either "udp4" or "udp6".
-	UpdateMagicsockPort(port uint16, network string) error
-
 	// Close closes the router.
 	Close() error
 }
@@ -53,6 +46,14 @@ type NewOpts struct {
 	NetMon *netmon.Monitor // optional
 	Health *health.Tracker // required (but TODO: support optional later)
 	Bus    *eventbus.Bus   // required
+}
+
+// PortUpdate is an eventbus value, reporting the port and address family
+// magicsock is currently listening on, so it can be threaded through firewalls
+// and such.
+type PortUpdate struct {
+	UDPPort         uint16
+	EndpointNetwork string // either "udp4" or "udp6".
 }
 
 // HookNewUserspaceRouter is the registration point for router implementations
@@ -145,4 +146,16 @@ func (a *Config) Equal(b *Config) bool {
 		return false
 	}
 	return reflect.DeepEqual(a, b)
+}
+
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+	c2 := *c
+	c2.LocalAddrs = slices.Clone(c.LocalAddrs)
+	c2.Routes = slices.Clone(c.Routes)
+	c2.LocalRoutes = slices.Clone(c.LocalRoutes)
+	c2.SubnetRoutes = slices.Clone(c.SubnetRoutes)
+	return &c2
 }

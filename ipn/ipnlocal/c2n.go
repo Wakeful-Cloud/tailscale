@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"tailscale.com/control/controlclient"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
+	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
@@ -31,28 +33,42 @@ import (
 // c2nHandlers maps an HTTP method and URI path (without query parameters) to
 // its handler. The exact method+path match is preferred, but if no entry
 // exists for that, a map entry with an empty method is used as a fallback.
-var c2nHandlers = map[methodAndPath]c2nHandler{
-	// Debug.
-	req("/echo"):                    handleC2NEcho,
-	req("/debug/goroutines"):        handleC2NDebugGoroutines,
-	req("/debug/prefs"):             handleC2NDebugPrefs,
-	req("/debug/metrics"):           handleC2NDebugMetrics,
-	req("/debug/component-logging"): handleC2NDebugComponentLogging,
-	req("/debug/logheap"):           handleC2NDebugLogHeap,
-	req("/debug/netmap"):            handleC2NDebugNetMap,
+var c2nHandlers map[methodAndPath]c2nHandler
 
-	// PPROF - We only expose a subset of typical pprof endpoints for security.
-	req("/debug/pprof/heap"):   handleC2NPprof,
-	req("/debug/pprof/allocs"): handleC2NPprof,
+func init() {
+	c2nHandlers = map[methodAndPath]c2nHandler{}
+	if buildfeatures.HasC2N {
+		// Echo is the basic "ping" handler as used by the control plane to probe
+		// whether a node is reachable. In particular, it's important for
+		// high-availability subnet routers for the control plane to probe which of
+		// several candidate nodes is reachable and actually alive.
+		RegisterC2N("/echo", handleC2NEcho)
+	}
+	if buildfeatures.HasSSH {
+		RegisterC2N("/ssh/usernames", handleC2NSSHUsernames)
+	}
+	if buildfeatures.HasLogTail {
+		RegisterC2N("POST /logtail/flush", handleC2NLogtailFlush)
+	}
+	if buildfeatures.HasDebug {
+		RegisterC2N("POST /sockstats", handleC2NSockStats)
 
-	req("POST /logtail/flush"): handleC2NLogtailFlush,
-	req("POST /sockstats"):     handleC2NSockStats,
+		// pprof:
+		// we only expose a subset of typical pprof endpoints for security.
+		RegisterC2N("/debug/pprof/heap", handleC2NPprof)
+		RegisterC2N("/debug/pprof/allocs", handleC2NPprof)
 
-	// SSH
-	req("/ssh/usernames"): handleC2NSSHUsernames,
-
-	// Linux netfilter.
-	req("POST /netfilter-kind"): handleC2NSetNetfilterKind,
+		RegisterC2N("/debug/goroutines", handleC2NDebugGoroutines)
+		RegisterC2N("/debug/prefs", handleC2NDebugPrefs)
+		RegisterC2N("/debug/metrics", handleC2NDebugMetrics)
+		RegisterC2N("/debug/component-logging", handleC2NDebugComponentLogging)
+		RegisterC2N("/debug/logheap", handleC2NDebugLogHeap)
+		RegisterC2N("/debug/netmap", handleC2NDebugNetMap)
+		RegisterC2N("/debug/health", handleC2NDebugHealth)
+	}
+	if runtime.GOOS == "linux" && buildfeatures.HasOSRouter {
+		RegisterC2N("POST /netfilter-kind", handleC2NSetNetfilterKind)
+	}
 }
 
 // RegisterC2N registers a new c2n handler for the given pattern.
@@ -60,6 +76,9 @@ var c2nHandlers = map[methodAndPath]c2nHandler{
 // A pattern is like "GET /foo" (specific to an HTTP method) or "/foo" (all
 // methods). It panics if the pattern is already registered.
 func RegisterC2N(pattern string, h func(*LocalBackend, http.ResponseWriter, *http.Request)) {
+	if !buildfeatures.HasC2N {
+		return
+	}
 	k := req(pattern)
 	if _, ok := c2nHandlers[k]; ok {
 		panic(fmt.Sprintf("c2n: duplicate handler for %q", pattern))
@@ -126,6 +145,14 @@ func handleC2NLogtailFlush(b *LocalBackend, w http.ResponseWriter, r *http.Reque
 	} else {
 		http.Error(w, "no log flusher wired up", http.StatusInternalServerError)
 	}
+}
+
+func handleC2NDebugHealth(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
+	var st *health.State
+	if buildfeatures.HasDebug && b.health != nil {
+		st = b.health.CurrentState()
+	}
+	writeJSON(w, st)
 }
 
 func handleC2NDebugNetMap(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
@@ -265,6 +292,10 @@ func handleC2NPprof(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
 }
 
 func handleC2NSSHUsernames(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasSSH {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
+		return
+	}
 	var req tailcfg.C2NSSHUsernamesRequest
 	if r.Method == "POST" {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

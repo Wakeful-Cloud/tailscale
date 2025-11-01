@@ -29,6 +29,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
+	_ "tailscale.com/feature/c2n"
 	_ "tailscale.com/feature/condregister/oauthkey"
 	_ "tailscale.com/feature/condregister/portmapper"
 	_ "tailscale.com/feature/condregister/useproxy"
@@ -592,6 +593,7 @@ func (s *Server) start() (reterr error) {
 	closePool.add(s.netMon)
 
 	s.dialer = &tsdial.Dialer{Logf: tsLogf} // mutated below (before used)
+	s.dialer.SetBus(sys.Bus.Get())
 	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
 		EventBus:      sys.Bus.Get(),
 		ListenPort:    s.Port,
@@ -767,6 +769,7 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 		Stderr:       io.Discard, // log everything to Buffer
 		Buffer:       s.logbuffer,
 		CompressLogs: true,
+		Bus:          s.sys.Bus.Get(),
 		HTTPC:        &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, health, tsLogf)},
 		MetricsDelta: clientmetric.EncodeLogTailMetricsDelta,
 	}
@@ -929,41 +932,6 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 		return nil, true // don't handle, don't forward to localhost
 	}
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
-}
-
-// I_Acknowledge_This_API_Is_Experimental must be set true to use AuthenticatedAPITransport()
-// for now.
-var I_Acknowledge_This_API_Is_Experimental = false
-
-// AuthenticatedAPITransport provides an HTTP transport that can be used with
-// the control server API without needing additional authentication details. It
-// authenticates using the current client's nodekey.
-//
-// It requires the user to set I_Acknowledge_This_API_Is_Experimental.
-//
-// For example:
-//
-//	import "net/http"
-//	import "tailscale.com/client/tailscale/v2"
-//	import "tailscale.com/tsnet"
-//
-//	var s *tsnet.Server
-//	...
-//	rt, err := s.AuthenticatedAPITransport()
-//	// handler err ...
-//	var client tailscale.Client{HTTP: http.Client{
-//	    Timeout: 1*time.Minute,
-//	    UserAgent: "your-useragent-here",
-//	    Transport: rt,
-//	}}
-func (s *Server) AuthenticatedAPITransport() (http.RoundTripper, error) {
-	if !I_Acknowledge_This_API_Is_Experimental {
-		return nil, errors.New("use of AuthenticatedAPITransport without setting I_Acknowledge_This_API_Is_Experimental")
-	}
-	if err := s.Start(); err != nil {
-		return nil, err
-	}
-	return s.lb.KeyProvingNoiseRoundTripper(), nil
 }
 
 // Listen announces only on the Tailscale network.

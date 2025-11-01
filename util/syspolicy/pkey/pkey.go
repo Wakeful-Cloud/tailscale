@@ -136,8 +136,14 @@ const (
 	FlushDNSOnSessionUnlock Key = "FlushDNSOnSessionUnlock"
 
 	// EncryptState is a boolean setting that specifies whether to encrypt the
-	// tailscaled state file with a TPM device.
+	// tailscaled state file.
+	// Windows and Linux use a TPM device, Apple uses the Keychain.
+	// It's a noop on other platforms.
 	EncryptState Key = "EncryptState"
+
+	// HardwareAttestation is a boolean key that controls whether to use a
+	// hardware-backed key to bind the node identity to this device.
+	HardwareAttestation Key = "HardwareAttestation"
 
 	// PostureChecking indicates if posture checking is enabled and the client shall gather
 	// posture data.

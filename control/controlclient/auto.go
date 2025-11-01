@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tailscale.com/health"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
@@ -23,7 +22,6 @@ import (
 	"tailscale.com/types/structs"
 	"tailscale.com/util/backoff"
 	"tailscale.com/util/clientmetric"
-	"tailscale.com/util/eventbus"
 	"tailscale.com/util/execqueue"
 )
 
@@ -123,8 +121,6 @@ type Auto struct {
 	observerQueue execqueue.ExecQueue
 	shutdownFn    func() // to be called prior to shutdown or nil
 
-	eventSubs eventbus.Monitor
-
 	mu sync.Mutex // mutex guards the following fields
 
 	wantLoggedIn bool   // whether the user wants to be logged in per last method call
@@ -195,10 +191,6 @@ func NewNoStart(opts Options) (_ *Auto, err error) {
 		shutdownFn: opts.Shutdown,
 	}
 
-	// Set up eventbus client and subscriber
-	ec := opts.Bus.Client("controlClient.Auto")
-	c.eventSubs = ec.Monitor(c.consumeEventbusTopics(ec))
-
 	c.authCtx, c.authCancel = context.WithCancel(context.Background())
 	c.authCtx = sockstats.WithSockStats(c.authCtx, sockstats.LabelControlClientAuto, opts.Logf)
 
@@ -206,27 +198,6 @@ func NewNoStart(opts Options) (_ *Auto, err error) {
 	c.mapCtx = sockstats.WithSockStats(c.mapCtx, sockstats.LabelControlClientAuto, opts.Logf)
 
 	return c, nil
-}
-
-// consumeEventbusTopics consumes events from all relevant
-// [eventbus.Subscriber]'s and passes them to their related handler. Events are
-// always handled in the order they are received, i.e. the next event is not
-// read until the previous event's handler has returned. It returns when the
-// [eventbus.Client] is closed.
-func (c *Auto) consumeEventbusTopics(ec *eventbus.Client) func(*eventbus.Client) {
-	healthChangeSub := eventbus.Subscribe[health.Change](ec)
-	return func(cli *eventbus.Client) {
-		for {
-			select {
-			case <-cli.Done():
-				return
-			case change := <-healthChangeSub.Events():
-				if change.WarnableChanged {
-					c.direct.ReportWarnableChange(change.Warnable, change.UnhealthyState)
-				}
-			}
-		}
-	}
 }
 
 // SetPaused controls whether HTTP activity should be paused.
@@ -462,7 +433,6 @@ func (mrs mapRoutineState) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	c := mrs.c
 
 	c.mu.Lock()
-	ctx := c.mapCtx
 	c.inMapPoll = true
 	if c.loggedIn {
 		c.state = StateSynchronized
@@ -476,7 +446,7 @@ func (mrs mapRoutineState) UpdateFullNetmap(nm *netmap.NetworkMap) {
 		c.sendStatus("mapRoutine-got-netmap", nil, "", nm)
 	}
 	// Reset the backoff timer if we got a netmap.
-	mrs.bo.BackOff(ctx, nil)
+	mrs.bo.Reset()
 }
 
 func (mrs mapRoutineState) UpdateNetmapDelta(muts []netmap.NodeMutation) bool {
@@ -782,8 +752,6 @@ func (c *Auto) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 }
 
 func (c *Auto) Shutdown() {
-	c.eventSubs.Close()
-
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -844,14 +812,4 @@ func (c *Auto) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) error {
 
 func (c *Auto) DoNoiseRequest(req *http.Request) (*http.Response, error) {
 	return c.direct.DoNoiseRequest(req)
-}
-
-// GetSingleUseNoiseRoundTripper returns a RoundTripper that can be only be used
-// once (and must be used once) to make a single HTTP request over the noise
-// channel to the coordination server.
-//
-// In addition to the RoundTripper, it returns the HTTP/2 channel's early noise
-// payload, if any.
-func (c *Auto) GetSingleUseNoiseRoundTripper(ctx context.Context) (http.RoundTripper, *tailcfg.EarlyNoise, error) {
-	return c.direct.GetSingleUseNoiseRoundTripper(ctx)
 }

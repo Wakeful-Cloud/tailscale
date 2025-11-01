@@ -27,7 +27,6 @@ import (
 	"sync"
 	"time"
 
-	"tailscale.com/appc"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/drive"
 	"tailscale.com/envknob"
@@ -40,6 +39,7 @@ import (
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/appctype"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/util/eventbus"
@@ -381,6 +381,9 @@ func (lc *Client) UserMetrics(ctx context.Context) ([]byte, error) {
 //
 // IncrementCounter does not support gauge metrics or negative delta values.
 func (lc *Client) IncrementCounter(ctx context.Context, name string, delta int) error {
+	if !buildfeatures.HasClientMetrics {
+		return nil
+	}
 	type metricUpdate struct {
 		Name  string `json:"name"`
 		Type  string `json:"type"`
@@ -593,6 +596,19 @@ func (lc *Client) DebugResultJSON(ctx context.Context, action string) (any, erro
 	return x, nil
 }
 
+// QueryOptionalFeatures queries the optional features supported by the Tailscale daemon.
+func (lc *Client) QueryOptionalFeatures(ctx context.Context) (*apitype.OptionalFeatures, error) {
+	body, err := lc.send(ctx, "POST", "/localapi/v0/debug-optional-features", 200, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error %w: %s", err, body)
+	}
+	var x apitype.OptionalFeatures
+	if err := json.Unmarshal(body, &x); err != nil {
+		return nil, err
+	}
+	return &x, nil
+}
+
 // SetDevStoreKeyValue set a statestore key/value. It's only meant for development.
 // The schema (including when keys are re-read) is not a stable interface.
 func (lc *Client) SetDevStoreKeyValue(ctx context.Context, key, value string) error {
@@ -752,6 +768,9 @@ func (lc *Client) PushFile(ctx context.Context, target tailcfg.StableNodeID, siz
 // machine is properly configured to forward IP packets as a subnet router
 // or exit node.
 func (lc *Client) CheckIPForwarding(ctx context.Context) error {
+	if !buildfeatures.HasAdvertiseRoutes {
+		return nil
+	}
 	body, err := lc.get200(ctx, "/localapi/v0/check-ip-forwarding")
 	if err != nil {
 		return err
@@ -1387,10 +1406,10 @@ func (lc *Client) ShutdownTailscaled(ctx context.Context) error {
 	return err
 }
 
-func (lc *Client) GetAppConnectorRouteInfo(ctx context.Context) (appc.RouteInfo, error) {
+func (lc *Client) GetAppConnectorRouteInfo(ctx context.Context) (appctype.RouteInfo, error) {
 	body, err := lc.get200(ctx, "/localapi/v0/appc-route-info")
 	if err != nil {
-		return appc.RouteInfo{}, err
+		return appctype.RouteInfo{}, err
 	}
-	return decodeJSON[appc.RouteInfo](body)
+	return decodeJSON[appctype.RouteInfo](body)
 }

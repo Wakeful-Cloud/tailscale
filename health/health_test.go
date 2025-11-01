@@ -5,17 +5,21 @@ package health
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"maps"
 	"reflect"
 	"slices"
 	"strconv"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"tailscale.com/metrics"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsconst"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime"
 	"tailscale.com/types/opt"
@@ -24,6 +28,8 @@ import (
 	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
 )
+
+var doDebug = flag.Bool("debug", false, "Enable debug logging")
 
 func wantChange(c Change) func(c Change) (bool, error) {
 	return func(cEv Change) (bool, error) {
@@ -497,7 +503,11 @@ func TestHealthMetric(t *testing.T) {
 			tr.applyUpdates = tt.apply
 			tr.latestVersion = tt.cv
 			tr.SetMetricsRegistry(&usermetric.Registry{})
-			if val := tr.metricHealthMessage.Get(metricHealthMessageLabel{Type: MetricLabelWarning}).String(); val != strconv.Itoa(tt.wantMetricCount) {
+			m, ok := tr.metricHealthMessage.(*metrics.MultiLabelMap[metricHealthMessageLabel])
+			if !ok {
+				t.Fatal("metricHealthMessage has wrong type or is nil")
+			}
+			if val := m.Get(metricHealthMessageLabel{Type: MetricLabelWarning}).String(); val != strconv.Itoa(tt.wantMetricCount) {
 				t.Fatalf("metric value: %q, want: %q", val, strconv.Itoa(tt.wantMetricCount))
 			}
 			for _, w := range tr.CurrentState().Warnings {
@@ -634,7 +644,11 @@ func TestControlHealth(t *testing.T) {
 		var r usermetric.Registry
 		ht.SetMetricsRegistry(&r)
 
-		got := ht.metricHealthMessage.Get(metricHealthMessageLabel{
+		m, ok := ht.metricHealthMessage.(*metrics.MultiLabelMap[metricHealthMessageLabel])
+		if !ok {
+			t.Fatal("metricHealthMessage has wrong type or is nil")
+		}
+		got := m.Get(metricHealthMessageLabel{
 			Type: MetricLabelWarning,
 		}).String()
 		want := strconv.Itoa(
@@ -715,72 +729,105 @@ func TestControlHealthNotifies(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			bus := eventbustest.NewBus(t)
-			tw := eventbustest.NewWatcher(t, bus)
-			tw.TimeOut = time.Second
-
-			ht := NewTracker(bus)
-			ht.SetIPNState("NeedsLogin", true)
-			ht.GotStreamedMapResponse()
-
-			// Expect events at starup, before doing anything else
-			if err := eventbustest.ExpectExactly(tw,
-				eventbustest.Type[Change](), // warming-up
-				eventbustest.Type[Change](), // is-using-unstable-version
-				eventbustest.Type[Change](), // not-in-map-poll
-			); err != nil {
-				t.Errorf("startup error: %v", err)
-			}
-
-			// Only set initial state if we need to
-			if len(test.initialState) != 0 {
-				ht.SetControlHealth(test.initialState)
-				if err := eventbustest.ExpectExactly(tw, eventbustest.Type[Change]()); err != nil {
-					t.Errorf("initial state error: %v", err)
+			synctest.Test(t, func(t *testing.T) {
+				bus := eventbustest.NewBus(t)
+				if *doDebug {
+					eventbustest.LogAllEvents(t, bus)
 				}
-			}
+				tw := eventbustest.NewWatcher(t, bus)
 
-			ht.SetControlHealth(test.newState)
+				ht := NewTracker(bus)
+				ht.SetIPNState("NeedsLogin", true)
+				ht.GotStreamedMapResponse()
 
-			if err := eventbustest.ExpectExactly(tw, test.wantEvents...); err != nil {
-				t.Errorf("event error: %v", err)
-			}
+				// Expect events at starup, before doing anything else, skip unstable
+				// event and no warning event as they show up at different times.
+				synctest.Wait()
+				if err := eventbustest.Expect(tw,
+					CompareWarnableCode(t, tsconst.HealthWarnableWarmingUp),
+					CompareWarnableCode(t, tsconst.HealthWarnableNotInMapPoll),
+					CompareWarnableCode(t, tsconst.HealthWarnableWarmingUp),
+				); err != nil {
+					t.Errorf("startup error: %v", err)
+				}
+
+				// Only set initial state if we need to
+				if len(test.initialState) != 0 {
+					t.Log("Setting initial state")
+					ht.SetControlHealth(test.initialState)
+					synctest.Wait()
+					if err := eventbustest.Expect(tw,
+						CompareWarnableCode(t, tsconst.HealthWarnableMagicsockReceiveFuncError),
+						// Skip event with no warnable
+						CompareWarnableCode(t, tsconst.HealthWarnableNoDERPHome),
+					); err != nil {
+						t.Errorf("initial state error: %v", err)
+					}
+				}
+
+				ht.SetControlHealth(test.newState)
+				// Close the bus early to avoid timers triggering more events.
+				bus.Close()
+
+				synctest.Wait()
+				if err := eventbustest.ExpectExactly(tw, test.wantEvents...); err != nil {
+					t.Errorf("event error: %v", err)
+				}
+			})
 		})
 	}
 }
 
-func TestControlHealthIgnoredOutsideMapPoll(t *testing.T) {
-	bus := eventbustest.NewBus(t)
-	tw := eventbustest.NewWatcher(t, bus)
-	tw.TimeOut = 100 * time.Millisecond
-	ht := NewTracker(bus)
-	ht.SetIPNState("NeedsLogin", true)
-
-	ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
-		"control-health": {},
-	})
-
-	state := ht.CurrentState()
-	_, ok := state.Warnings["control-health"]
-
-	if ok {
-		t.Error("got a warning with code 'control-health', want none")
-	}
-
-	// An event is emitted when SetIPNState is run above,
-	// so only fail on the second event.
-	eventCounter := 0
-	expectOne := func(c *Change) error {
-		eventCounter++
-		if eventCounter == 1 {
-			return nil
+func CompareWarnableCode(t *testing.T, code string) func(Change) bool {
+	t.Helper()
+	return func(c Change) bool {
+		t.Helper()
+		if c.Warnable != nil {
+			t.Logf("Warnable code: %s", c.Warnable.Code)
+			if string(c.Warnable.Code) == code {
+				return true
+			}
+		} else {
+			t.Log("No Warnable")
 		}
-		return errors.New("saw more than 1 event")
+		return false
 	}
+}
 
-	if err := eventbustest.Expect(tw, expectOne); err == nil {
-		t.Error("event got emitted, want it to not be called")
-	}
+func TestControlHealthIgnoredOutsideMapPoll(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		bus := eventbustest.NewBus(t)
+		tw := eventbustest.NewWatcher(t, bus)
+		ht := NewTracker(bus)
+		ht.SetIPNState("NeedsLogin", true)
+
+		ht.SetControlHealth(map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+			"control-health": {},
+		})
+
+		state := ht.CurrentState()
+		_, ok := state.Warnings["control-health"]
+
+		if ok {
+			t.Error("got a warning with code 'control-health', want none")
+		}
+
+		// An event is emitted when SetIPNState is run above,
+		// so only fail on the second event.
+		eventCounter := 0
+		expectOne := func(c *Change) error {
+			eventCounter++
+			if eventCounter == 1 {
+				return nil
+			}
+			return errors.New("saw more than 1 event")
+		}
+
+		synctest.Wait()
+		if err := eventbustest.Expect(tw, expectOne); err == nil {
+			t.Error("event got emitted, want it to not be called")
+		}
+	})
 }
 
 // TestCurrentStateETagControlHealth tests that the ETag on an [UnhealthyState]
