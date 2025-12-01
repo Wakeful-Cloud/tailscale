@@ -47,9 +47,11 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
+	"tailscale.com/util/backoff"
 	"tailscale.com/util/checkchange"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/execqueue"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 	"tailscale.com/util/testenv"
@@ -96,6 +98,8 @@ type userspaceEngine struct {
 	// eventBus will eventually become required, but for now may be nil.
 	eventBus    *eventbus.Bus
 	eventClient *eventbus.Client
+
+	linkChangeQueue execqueue.ExecQueue
 
 	logf           logger.Logf
 	wgLogger       *wglog.Logger // a wireguard-go logging wrapper
@@ -145,7 +149,7 @@ type userspaceEngine struct {
 	netMap         *netmap.NetworkMap // or nil
 	closing        bool               // Close was called (even if we're still closing)
 	statusCallback StatusCallback
-	peerSequence   []key.NodePublic
+	peerSequence   views.Slice[key.NodePublic]
 	endpoints      []tailcfg.Endpoint
 	pendOpen       map[flowtrackTuple]*pendingOpenFlow // see pendopen.go
 
@@ -319,9 +323,9 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 
 	var tsTUNDev *tstun.Wrapper
 	if conf.IsTAP {
-		tsTUNDev = tstun.WrapTAP(logf, conf.Tun, conf.Metrics)
+		tsTUNDev = tstun.WrapTAP(logf, conf.Tun, conf.Metrics, conf.EventBus)
 	} else {
-		tsTUNDev = tstun.Wrap(logf, conf.Tun, conf.Metrics)
+		tsTUNDev = tstun.Wrap(logf, conf.Tun, conf.Metrics, conf.EventBus)
 	}
 	closePool.add(tsTUNDev)
 
@@ -543,7 +547,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		if f, ok := feature.HookProxyInvalidateCache.GetOk(); ok {
 			f()
 		}
-		e.linkChange(&cd)
+		e.linkChangeQueue.Add(func() { e.linkChange(&cd) })
 	})
 	e.eventClient = ec
 	e.logf("Engine created.")
@@ -924,6 +928,32 @@ func hasOverlap(aips, rips views.Slice[netip.Prefix]) bool {
 	return false
 }
 
+// ResetAndStop resets the engine to a clean state (like calling Reconfig
+// with all pointers to zero values) and waits for it to be fully stopped,
+// with no live peers or DERPs.
+//
+// Unlike Reconfig, it does not return ErrNoChanges.
+//
+// If the engine stops, returns the status. NB that this status will not be sent
+// to the registered status callback, it is on the caller to ensure this status
+// is handled appropriately.
+func (e *userspaceEngine) ResetAndStop() (*Status, error) {
+	if err := e.Reconfig(&wgcfg.Config{}, &router.Config{}, &dns.Config{}); err != nil && !errors.Is(err, ErrNoChanges) {
+		return nil, err
+	}
+	bo := backoff.NewBackoff("UserspaceEngineResetAndStop", e.logf, 1*time.Second)
+	for {
+		st, err := e.getStatus()
+		if err != nil {
+			return nil, err
+		}
+		if len(st.Peers) == 0 && st.DERPs == 0 {
+			return st, nil
+		}
+		bo.BackOff(context.Background(), fmt.Errorf("waiting for engine to stop: peers=%d derps=%d", len(st.Peers), st.DERPs))
+	}
+}
+
 func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config) error {
 	if routerCfg == nil {
 		panic("routerCfg must not be nil")
@@ -939,12 +969,15 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	e.tundev.SetWGConfig(cfg)
 
 	peerSet := make(set.Set[key.NodePublic], len(cfg.Peers))
+
 	e.mu.Lock()
-	e.peerSequence = e.peerSequence[:0]
+	seq := make([]key.NodePublic, 0, len(cfg.Peers))
 	for _, p := range cfg.Peers {
-		e.peerSequence = append(e.peerSequence, p.PublicKey)
+		seq = append(seq, p.PublicKey)
 		peerSet.Add(p.PublicKey)
 	}
+	e.peerSequence = views.SliceOf(seq)
+
 	nm := e.netMap
 	e.mu.Unlock()
 
@@ -1199,7 +1232,7 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 
 	e.mu.Lock()
 	closing := e.closing
-	peerKeys := slices.Clone(e.peerSequence)
+	peerKeys := e.peerSequence
 	localAddrs := slices.Clone(e.endpoints)
 	e.mu.Unlock()
 
@@ -1207,8 +1240,8 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 		return nil, ErrEngineClosing
 	}
 
-	peers := make([]ipnstate.PeerStatusLite, 0, len(peerKeys))
-	for _, key := range peerKeys {
+	peers := make([]ipnstate.PeerStatusLite, 0, peerKeys.Len())
+	for _, key := range peerKeys.All() {
 		if status, ok := e.getPeerStatusLite(key); ok {
 			peers = append(peers, status)
 		}
@@ -1258,6 +1291,9 @@ func (e *userspaceEngine) RequestStatus() {
 
 func (e *userspaceEngine) Close() {
 	e.eventClient.Close()
+	// TODO(cmol): Should we wait for it too?
+	// Same question raised in appconnector.go.
+	e.linkChangeQueue.Shutdown()
 	e.mu.Lock()
 	if e.closing {
 		e.mu.Unlock()
@@ -1400,6 +1436,7 @@ func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size in
 		e.magicConn.Ping(peer, res, size, cb)
 	case "TSMP":
 		e.sendTSMPPing(ip, peer, res, cb)
+		e.sendTSMPDiscoAdvertisement(ip)
 	case "ICMP":
 		e.sendICMPEchoRequest(ip, peer, res, cb)
 	}
@@ -1518,6 +1555,29 @@ func (e *userspaceEngine) sendTSMPPing(ip netip.Addr, peer tailcfg.NodeView, res
 
 	tsmpPing := packet.Generate(iph, tsmpPayload[:])
 	e.tundev.InjectOutbound(tsmpPing)
+}
+
+func (e *userspaceEngine) sendTSMPDiscoAdvertisement(ip netip.Addr) {
+	srcIP, err := e.mySelfIPMatchingFamily(ip)
+	if err != nil {
+		e.logf("getting matching node: %s", err)
+		return
+	}
+	tdka := packet.TSMPDiscoKeyAdvertisement{
+		Src: srcIP,
+		Dst: ip,
+		Key: e.magicConn.DiscoPublicKey(),
+	}
+	payload, err := tdka.Marshal()
+	if err != nil {
+		e.logf("error generating TSMP Advertisement: %s", err)
+		metricTSMPDiscoKeyAdvertisementError.Add(1)
+	} else if err := e.tundev.InjectOutbound(payload); err != nil {
+		e.logf("error sending TSMP Advertisement: %s", err)
+		metricTSMPDiscoKeyAdvertisementError.Add(1)
+	} else {
+		metricTSMPDiscoKeyAdvertisementSent.Add(1)
+	}
 }
 
 func (e *userspaceEngine) setTSMPPongCallback(data [8]byte, cb func(packet.TSMPPongReply)) {
@@ -1686,6 +1746,9 @@ var (
 
 	metricNumMajorChanges = clientmetric.NewCounter("wgengine_major_changes")
 	metricNumMinorChanges = clientmetric.NewCounter("wgengine_minor_changes")
+
+	metricTSMPDiscoKeyAdvertisementSent  = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_sent")
+	metricTSMPDiscoKeyAdvertisementError = clientmetric.NewCounter("magicsock_tsmp_disco_key_advertisement_error")
 )
 
 func (e *userspaceEngine) InstallCaptureHook(cb packet.CaptureCallback) {
