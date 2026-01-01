@@ -245,6 +245,8 @@ type LocalBackend struct {
 	// to prevent state changes while invoking callbacks.
 	extHost *ExtensionHost
 
+	peerAPIPorts syncs.AtomicValue[map[netip.Addr]int] // can be read without b.mu held; TODO(nickkhyl): remove or move to nodeBackend?
+
 	// The mutex protects the following elements.
 	mu syncs.Mutex
 
@@ -294,9 +296,9 @@ type LocalBackend struct {
 	authURLTime       time.Time     // when the authURL was received from the control server; TODO(nickkhyl): move to nodeBackend
 	authActor         ipnauth.Actor // an actor who called [LocalBackend.StartLoginInteractive] last, or nil; TODO(nickkhyl): move to nodeBackend
 	egg               bool
-	prevIfState       *netmon.State
-	peerAPIServer     *peerAPIServer // or nil
-	peerAPIListeners  []*peerAPIListener
+	interfaceState    *netmon.State      // latest network interface state or nil
+	peerAPIServer     *peerAPIServer     // or nil
+	peerAPIListeners  []*peerAPIListener // TODO(nickkhyl): move to nodeBackend
 	loginFlags        controlclient.LoginFlags
 	notifyWatchers    map[string]*watchSession // by session ID
 	lastStatusTime    time.Time                // status.AsOf value of the last processed status update
@@ -559,10 +561,16 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 
 	b.e.SetStatusCallback(b.setWgengineStatus)
 
-	b.prevIfState = netMon.InterfaceState()
+	b.interfaceState = netMon.InterfaceState()
+
 	// Call our linkChange code once with the current state.
 	// Following changes are triggered via the eventbus.
-	b.linkChange(&netmon.ChangeDelta{New: netMon.InterfaceState()})
+	cd, err := netmon.NewChangeDelta(nil, b.interfaceState, false, netMon.TailscaleInterfaceName(), false)
+	if err != nil {
+		b.logf("[unexpected] setting initial netmon state failed: %v", err)
+	} else {
+		b.linkChange(cd)
+	}
 
 	if buildfeatures.HasPeerAPIServer {
 		if tunWrap, ok := b.sys.Tun.GetOK(); ok {
@@ -934,7 +942,7 @@ func (b *LocalBackend) pauseOrResumeControlClientLocked() {
 	if b.cc == nil {
 		return
 	}
-	networkUp := b.prevIfState.AnyInterfaceUp()
+	networkUp := b.interfaceState.AnyInterfaceUp()
 	pauseForNetwork := (b.state == ipn.Stopped && b.NetMap() != nil) || (!networkUp && !testenv.InTest() && !assumeNetworkUpdateForTest())
 
 	prefs := b.pm.CurrentPrefs()
@@ -961,24 +969,23 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	ifst := delta.New
-	hadPAC := b.prevIfState.HasPAC()
-	b.prevIfState = ifst
+	b.interfaceState = delta.CurrentState()
+
 	b.pauseOrResumeControlClientLocked()
 	prefs := b.pm.CurrentPrefs()
-	if delta.Major && prefs.AutoExitNode().IsSet() {
+	if delta.RebindLikelyRequired && prefs.AutoExitNode().IsSet() {
 		b.refreshAutoExitNode = true
 	}
 
 	var needReconfig bool
 	// If the network changed and we're using an exit node and allowing LAN access, we may need to reconfigure.
-	if delta.Major && prefs.ExitNodeID() != "" && prefs.ExitNodeAllowLANAccess() {
+	if delta.RebindLikelyRequired && prefs.ExitNodeID() != "" && prefs.ExitNodeAllowLANAccess() {
 		b.logf("linkChange: in state %v; updating LAN routes", b.state)
 		needReconfig = true
 	}
 	// If the PAC-ness of the network changed, reconfig wireguard+route to add/remove subnets.
-	if hadPAC != ifst.HasPAC() {
-		b.logf("linkChange: in state %v; PAC changed from %v->%v", b.state, hadPAC, ifst.HasPAC())
+	if delta.HasPACOrProxyConfigChanged {
+		b.logf("linkChange: in state %v; PAC or proxyConfig changed; updating routes", b.state)
 		needReconfig = true
 	}
 	if needReconfig {
@@ -996,7 +1003,7 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	// If the local network configuration has changed, our filter may
 	// need updating to tweak default routes.
 	b.updateFilterLocked(prefs)
-	updateExitNodeUsageWarning(prefs, delta.New, b.health)
+	updateExitNodeUsageWarning(prefs, delta.CurrentState(), b.health)
 
 	if buildfeatures.HasPeerAPIServer {
 		cn := b.currentNode()
@@ -2538,7 +2545,7 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 	if inServerMode := prefs.ForceDaemon(); inServerMode || runtime.GOOS == "windows" {
 		logf("serverMode=%v", inServerMode)
 	}
-	b.applyPrefsToHostinfoLocked(hostinfo, prefs)
+	b.applyPrefsToHostinfoLocked(b.hostinfo, prefs)
 	b.updateWarnSync(prefs)
 
 	persistv := prefs.Persist().AsStruct()
@@ -2576,7 +2583,7 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 		Persist:              *persistv,
 		ServerURL:            serverURL,
 		AuthKey:              opts.AuthKey,
-		Hostinfo:             hostinfo,
+		Hostinfo:             b.hostInfoWithServicesLocked(),
 		HTTPTestClient:       httpTestClient,
 		DiscoPublicKey:       discoPublic,
 		DebugFlags:           debugFlags,
@@ -4722,14 +4729,8 @@ func (b *LocalBackend) GetPeerAPIPort(ip netip.Addr) (port uint16, ok bool) {
 	if !buildfeatures.HasPeerAPIServer {
 		return 0, false
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, pln := range b.peerAPIListeners {
-		if pln.ip == ip {
-			return uint16(pln.port), true
-		}
-	}
-	return 0, false
+	portInt, ok := b.peerAPIPorts.Load()[ip]
+	return uint16(portInt), ok
 }
 
 // handlePeerAPIConn serves an already-accepted connection c.
@@ -4846,6 +4847,17 @@ func (b *LocalBackend) doSetHostinfoFilterServicesLocked() {
 		b.logf("[unexpected] doSetHostinfoFilterServices with nil hostinfo")
 		return
 	}
+
+	hi := b.hostInfoWithServicesLocked()
+
+	cc.SetHostinfo(hi)
+}
+
+// hostInfoWithServicesLocked returns a shallow clone of b.hostinfo with
+// services added.
+//
+// b.mu must be held.
+func (b *LocalBackend) hostInfoWithServicesLocked() *tailcfg.Hostinfo {
 	peerAPIServices := b.peerAPIServicesLocked()
 	if b.egg {
 		peerAPIServices = append(peerAPIServices, tailcfg.Service{Proto: "egg", Port: 1})
@@ -4873,7 +4885,7 @@ func (b *LocalBackend) doSetHostinfoFilterServicesLocked() {
 		b.logf("Hostinfo peerAPI ports changed: expected %v, got %v", expectedPorts, actualPorts)
 	}
 
-	cc.SetHostinfo(&hi)
+	return &hi
 }
 
 type portPair struct {
@@ -5052,7 +5064,7 @@ func (b *LocalBackend) authReconfigLocked() {
 	}
 
 	prefs := b.pm.CurrentPrefs()
-	hasPAC := b.prevIfState.HasPAC()
+	hasPAC := b.interfaceState.HasPAC()
 	disableSubnetsIfPAC := cn.SelfHasCap(tailcfg.NodeAttrDisableSubnetsIfPAC)
 	dohURL, dohURLOK := cn.exitNodeCanProxyDNS(prefs.ExitNodeID())
 	dcfg := cn.dnsConfigForNetmap(prefs, b.keyExpired, version.OS())
@@ -5221,6 +5233,7 @@ func (b *LocalBackend) closePeerAPIListenersLocked() {
 		pln.Close()
 	}
 	b.peerAPIListeners = nil
+	b.peerAPIPorts.Store(nil)
 }
 
 // peerAPIListenAsync is whether the operating system requires that we
@@ -5272,6 +5285,9 @@ func (b *LocalBackend) initPeerAPIListenerLocked() {
 		if allSame {
 			// Nothing to do.
 			b.logf("[v1] initPeerAPIListener: %d netmap addresses match existing listeners", addrs.Len())
+			// TODO(zofrex): This is fragile. It doesn't check what's actually in hostinfo, and if
+			// peerAPIListeners gets out of sync with hostinfo.Services, we won't get back into a good
+			// state. E.G. see tailscale/corp#27173.
 			return
 		}
 	}
@@ -5293,12 +5309,13 @@ func (b *LocalBackend) initPeerAPIListenerLocked() {
 	b.peerAPIServer = ps
 
 	isNetstack := b.sys.IsNetstack()
+	peerAPIPorts := make(map[netip.Addr]int)
 	for i, a := range addrs.All() {
 		var ln net.Listener
 		var err error
 		skipListen := i > 0 && isNetstack
 		if !skipListen {
-			ln, err = ps.listen(a.Addr(), b.prevIfState)
+			ln, err = ps.listen(a.Addr(), b.interfaceState.TailscaleInterfaceIndex)
 			if err != nil {
 				if peerAPIListenAsync {
 					b.logf("[v1] possibly transient peerapi listen(%q) error, will try again on linkChange: %v", a.Addr(), err)
@@ -5325,7 +5342,9 @@ func (b *LocalBackend) initPeerAPIListenerLocked() {
 		b.logf("peerapi: serving on %s", pln.urlStr)
 		go pln.serve()
 		b.peerAPIListeners = append(b.peerAPIListeners, pln)
+		peerAPIPorts[a.Addr()] = pln.port
 	}
+	b.peerAPIPorts.Store(peerAPIPorts)
 
 	b.goTracker.Go(b.doSetHostinfoFilterServices)
 }
@@ -5795,7 +5814,14 @@ func (b *LocalBackend) stateMachineLocked() {
 func (b *LocalBackend) stopEngineAndWaitLocked() {
 	syncs.RequiresMutex(&b.mu)
 	b.logf("stopEngineAndWait...")
-	st, _ := b.e.ResetAndStop() // TODO: what should we do if this returns an error?
+	st, err := b.e.ResetAndStop()
+	if err != nil {
+		// TODO(braditz): our caller, popBrowserAuthNowLocked, probably
+		// should handle this somehow. For now, just log it.
+		// See tailscale/tailscale#18187
+		b.logf("stopEngineAndWait: ResetAndStop error: %v", err)
+		return
+	}
 	b.setWgengineStatusLocked(st)
 	b.logf("stopEngineAndWait: done.")
 }

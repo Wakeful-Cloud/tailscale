@@ -18,8 +18,10 @@ import (
 	"golang.org/x/crypto/blake2s"
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
+	"tailscale.com/util/usermetric"
 )
 
 type testClient struct {
@@ -208,7 +210,9 @@ func TestServer(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			server, err := NewServer(t.Logf, 0, true)
+			reg := new(usermetric.Registry)
+			deregisterMetrics()
+			server, err := NewServer(t.Logf, 0, true, reg)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -338,19 +342,18 @@ func TestServer_getNextVNILocked(t *testing.T) {
 	c := qt.New(t)
 	s := &Server{
 		nextVNI: minVNI,
-		byVNI:   make(map[uint32]*serverEndpoint),
 	}
 	for i := uint64(0); i < uint64(totalPossibleVNI); i++ {
 		vni, err := s.getNextVNILocked()
 		if err != nil { // using quicktest here triples test time
 			t.Fatal(err)
 		}
-		s.byVNI[vni] = nil
+		s.serverEndpointByVNI.Store(vni, nil)
 	}
 	c.Assert(s.nextVNI, qt.Equals, minVNI)
 	_, err := s.getNextVNILocked()
 	c.Assert(err, qt.IsNotNil)
-	delete(s.byVNI, minVNI)
+	s.serverEndpointByVNI.Delete(minVNI)
 	_, err = s.getNextVNILocked()
 	c.Assert(err, qt.IsNil)
 }
@@ -452,19 +455,19 @@ func Benchmark_blakeMACFromBindMsg(b *testing.B) {
 
 func TestServer_maybeRotateMACSecretLocked(t *testing.T) {
 	s := &Server{}
-	start := time.Now()
+	start := mono.Now()
 	s.maybeRotateMACSecretLocked(start)
-	qt.Assert(t, len(s.macSecrets), qt.Equals, 1)
-	macSecret := s.macSecrets[0]
+	qt.Assert(t, s.macSecrets.Len(), qt.Equals, 1)
+	macSecret := s.macSecrets.At(0)
 	s.maybeRotateMACSecretLocked(start.Add(macSecretRotationInterval - time.Nanosecond))
-	qt.Assert(t, len(s.macSecrets), qt.Equals, 1)
-	qt.Assert(t, s.macSecrets[0], qt.Equals, macSecret)
+	qt.Assert(t, s.macSecrets.Len(), qt.Equals, 1)
+	qt.Assert(t, s.macSecrets.At(0), qt.Equals, macSecret)
 	s.maybeRotateMACSecretLocked(start.Add(macSecretRotationInterval))
-	qt.Assert(t, len(s.macSecrets), qt.Equals, 2)
-	qt.Assert(t, s.macSecrets[1], qt.Equals, macSecret)
-	qt.Assert(t, s.macSecrets[0], qt.Not(qt.Equals), s.macSecrets[1])
+	qt.Assert(t, s.macSecrets.Len(), qt.Equals, 2)
+	qt.Assert(t, s.macSecrets.At(1), qt.Equals, macSecret)
+	qt.Assert(t, s.macSecrets.At(0), qt.Not(qt.Equals), s.macSecrets.At(1))
 	s.maybeRotateMACSecretLocked(s.macSecretRotatedAt.Add(macSecretRotationInterval))
-	qt.Assert(t, macSecret, qt.Not(qt.Equals), s.macSecrets[0])
-	qt.Assert(t, macSecret, qt.Not(qt.Equals), s.macSecrets[1])
-	qt.Assert(t, s.macSecrets[0], qt.Not(qt.Equals), s.macSecrets[1])
+	qt.Assert(t, macSecret, qt.Not(qt.Equals), s.macSecrets.At(0))
+	qt.Assert(t, macSecret, qt.Not(qt.Equals), s.macSecrets.At(1))
+	qt.Assert(t, s.macSecrets.At(0), qt.Not(qt.Equals), s.macSecrets.At(1))
 }

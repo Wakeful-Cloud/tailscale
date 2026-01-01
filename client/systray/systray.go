@@ -66,8 +66,8 @@ func (menu *Menu) Run(client *local.Client) {
 		case <-menu.bgCtx.Done():
 		}
 	}()
-	go menu.lc.IncrementGauge(menu.bgCtx, "systray_running", 1)
-	defer menu.lc.IncrementGauge(menu.bgCtx, "systray_running", -1)
+	go menu.lc.SetGauge(menu.bgCtx, "systray_running", 1)
+	defer menu.lc.SetGauge(menu.bgCtx, "systray_running", 0)
 
 	systray.Run(menu.onReady, menu.onExit)
 }
@@ -372,6 +372,7 @@ func setRemoteIcon(menu *systray.MenuItem, urlStr string) {
 	}
 
 	cacheMu.Lock()
+	defer cacheMu.Unlock()
 	b, ok := httpCache[urlStr]
 	if !ok {
 		resp, err := http.Get(urlStr)
@@ -395,7 +396,6 @@ func setRemoteIcon(menu *systray.MenuItem, urlStr string) {
 			resp.Body.Close()
 		}
 	}
-	cacheMu.Unlock()
 
 	if len(b) > 0 {
 		menu.SetIcon(b)
