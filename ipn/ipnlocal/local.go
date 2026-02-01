@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package ipnlocal is the heart of the Tailscale node agent that controls
@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
@@ -165,6 +166,10 @@ var (
 	// errManagedByPolicy indicates the operation is blocked
 	// because the target state is managed by a GP/MDM policy.
 	errManagedByPolicy = errors.New("managed by policy")
+
+	// ErrProfileStorageUnavailable indicates that profile-specific local data
+	// storage is not available; see [LocalBackend.ProfileMkdirAll].
+	ErrProfileStorageUnavailable = errors.New("profile local data storage unavailable")
 )
 
 // LocalBackend is the glue between the major pieces of the Tailscale
@@ -399,6 +404,10 @@ type LocalBackend struct {
 	// hardwareAttested is whether backend should use a hardware-backed key to
 	// bind the node identity to this device.
 	hardwareAttested atomic.Bool
+
+	// getCertForTest is used to retrieve TLS certificates in tests.
+	// See [LocalBackend.ConfigureCertsForTest].
+	getCertForTest func(hostname string) (*TLSCertKeyPair, error)
 }
 
 // SetHardwareAttested enables hardware attestation key signatures in map
@@ -565,7 +574,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 
 	// Call our linkChange code once with the current state.
 	// Following changes are triggered via the eventbus.
-	cd, err := netmon.NewChangeDelta(nil, b.interfaceState, false, netMon.TailscaleInterfaceName(), false)
+	cd, err := netmon.NewChangeDelta(nil, b.interfaceState, false, false)
 	if err != nil {
 		b.logf("[unexpected] setting initial netmon state failed: %v", err)
 	} else {
@@ -910,6 +919,22 @@ func (b *LocalBackend) setStateLocked(state ipn.State) {
 	b.state = state
 	for _, f := range b.extHost.Hooks().BackendStateChange {
 		f(state)
+	}
+}
+
+func (b *LocalBackend) IPServiceMappings() netmap.IPServiceMappings {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ipVIPServiceMap
+}
+
+func (b *LocalBackend) SetIPServiceMappingsForTest(m netmap.IPServiceMappings) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	testenv.AssertInTest()
+	b.ipVIPServiceMap = m
+	if ns, ok := b.sys.Netstack.GetOK(); ok {
+		ns.UpdateIPServiceMappings(m)
 	}
 }
 
@@ -2507,7 +2532,7 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 	// neither UpdatePrefs or reconciliation should change Persist
 	newPrefs.Persist = b.pm.CurrentPrefs().Persist().AsStruct()
 
-	if buildfeatures.HasTPM {
+	if buildfeatures.HasTPM && b.HardwareAttested() {
 		if genKey, ok := feature.HookGenerateAttestationKeyIfEmpty.GetOk(); ok {
 			newKey, err := genKey(newPrefs.Persist, logf)
 			if err != nil {
@@ -2518,6 +2543,12 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 				prefsChangedWhy = append(prefsChangedWhy, "newKey")
 			}
 		}
+	}
+	// Remove any existing attestation key if HardwareAttested is false.
+	if !b.HardwareAttested() && newPrefs.Persist != nil && newPrefs.Persist.AttestationKey != nil && !newPrefs.Persist.AttestationKey.IsZero() {
+		newPrefs.Persist.AttestationKey = nil
+		prefsChanged = true
+		prefsChangedWhy = append(prefsChangedWhy, "removeAttestationKey")
 	}
 
 	if prefsChanged {
@@ -4487,6 +4518,12 @@ func (b *LocalBackend) onEditPrefsLocked(_ ipnauth.Actor, mp *ipn.MaskedPrefs, o
 		}
 	}
 
+	if mp.AdvertiseServicesSet {
+		if ns, ok := b.sys.Netstack.GetOK(); ok {
+			ns.UpdateActiveVIPServices(newPrefs.AdvertiseServices())
+		}
+	}
+
 	// This is recorded here in the EditPrefs path, not the setPrefs path on purpose.
 	// recordForEdit records metrics related to edits and changes, not the final state.
 	// If, in the future, we want to record gauge-metrics related to the state of prefs,
@@ -5110,7 +5147,7 @@ func (b *LocalBackend) authReconfigLocked() {
 	}
 
 	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.NetMon.Get(), b.sys.ControlKnobs(), version.OS())
-	rcfg := b.routerConfigLocked(cfg, prefs, oneCGNATRoute)
+	rcfg := b.routerConfigLocked(cfg, prefs, nm, oneCGNATRoute)
 
 	err = b.e.Reconfig(cfg, rcfg, dcfg)
 	if err == wgengine.ErrNoChanges {
@@ -5218,6 +5255,56 @@ func (b *LocalBackend) TailscaleVarRoot() string {
 	return ""
 }
 
+// ProfileMkdirAll creates (if necessary) and returns the path of a directory
+// specific to the specified login profile, inside Tailscale's writable storage
+// area. If subs are provided, they are joined to the base path to form the
+// subdirectory path.
+//
+// It reports [ErrProfileStorageUnavailable] if there's no configured or
+// discovered storage location, or if there was an error making the
+// subdirectory.
+func (b *LocalBackend) ProfileMkdirAll(id ipn.ProfileID, subs ...string) (string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.profileMkdirAllLocked(id, subs...)
+}
+
+// profileDataPathLocked returns a path of a profile-specific (sub)directory
+// inside the writable storage area for the given profile ID. It does not
+// create or verify the existence of the path in the filesystem.
+// If b.varRoot == "", it returns "". It panics if id is empty.
+//
+// The caller must hold b.mu.
+func (b *LocalBackend) profileDataPathLocked(id ipn.ProfileID, subs ...string) string {
+	if id == "" {
+		panic("invalid empty profile ID")
+	}
+	vr := b.TailscaleVarRoot()
+	if vr == "" {
+		return ""
+	}
+	return filepath.Join(append([]string{vr, "profile-data", string(id)}, subs...)...)
+}
+
+// profileMkdirAllLocked implements ProfileMkdirAll.
+// The caller must hold b.mu.
+func (b *LocalBackend) profileMkdirAllLocked(id ipn.ProfileID, subs ...string) (string, error) {
+	if id == "" {
+		return "", errProfileNotFound
+	}
+	if vr := b.TailscaleVarRoot(); vr == "" {
+		return "", ErrProfileStorageUnavailable
+	}
+
+	// Use the LoginProfile ID rather than the UserProfile ID, as the latter may
+	// change over time.
+	dir := b.profileDataPathLocked(id, subs...)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("create profile directory: %w", err)
+	}
+	return dir, nil
+}
+
 // closePeerAPIListenersLocked closes any existing PeerAPI listeners
 // and clears out the PeerAPI server state.
 //
@@ -5315,12 +5402,21 @@ func (b *LocalBackend) initPeerAPIListenerLocked() {
 		var err error
 		skipListen := i > 0 && isNetstack
 		if !skipListen {
-			ln, err = ps.listen(a.Addr(), b.interfaceState.TailscaleInterfaceIndex)
+			// We don't care about the error here.  Not all platforms set this.
+			// If ps.listen needs it, it will check for zero values and error out.
+			tsIfIndex, _ := netmon.TailscaleInterfaceIndex()
+
+			ln, err = ps.listen(a.Addr(), tsIfIndex)
 			if err != nil {
 				if peerAPIListenAsync {
 					b.logf("[v1] possibly transient peerapi listen(%q) error, will try again on linkChange: %v", a.Addr(), err)
 					// Expected. But we fix it later in linkChange
 					// ("peerAPIListeners too low").
+					continue
+				}
+				// Sandboxed macOS specifically requires the interface index to be non-zero.
+				if version.IsSandboxedMacOS() && tsIfIndex == 0 {
+					b.logf("[v1] peerapi listen(%q) error: interface index is 0 on darwin; try restarting tailscaled", a.Addr())
 					continue
 				}
 				b.logf("[unexpected] peerapi listen(%q) error: %v", a.Addr(), err)
@@ -5377,7 +5473,7 @@ func magicDNSRootDomains(nm *netmap.NetworkMap) []dnsname.FQDN {
 // peerRoutes returns the routerConfig.Routes to access peers.
 // If there are over cgnatThreshold CGNAT routes, one big CGNAT route
 // is used instead.
-func peerRoutes(logf logger.Logf, peers []wgcfg.Peer, cgnatThreshold int) (routes []netip.Prefix) {
+func peerRoutes(logf logger.Logf, peers []wgcfg.Peer, cgnatThreshold int, routeAll bool) (routes []netip.Prefix) {
 	tsULA := tsaddr.TailscaleULARange()
 	cgNAT := tsaddr.CGNATRange()
 	var didULA bool
@@ -5407,7 +5503,7 @@ func peerRoutes(logf logger.Logf, peers []wgcfg.Peer, cgnatThreshold int) (route
 			}
 			if aip.IsSingleIP() && cgNAT.Contains(aip.Addr()) {
 				cgNATIPs = append(cgNATIPs, aip)
-			} else {
+			} else if routeAll {
 				routes = append(routes, aip)
 			}
 		}
@@ -5426,7 +5522,7 @@ func peerRoutes(logf logger.Logf, peers []wgcfg.Peer, cgnatThreshold int) (route
 // routerConfig produces a router.Config from a wireguard config and IPN prefs.
 //
 // b.mu must be held.
-func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView, oneCGNATRoute bool) *router.Config {
+func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView, nm *netmap.NetworkMap, oneCGNATRoute bool) *router.Config {
 	singleRouteThreshold := 10_000
 	if oneCGNATRoute {
 		singleRouteThreshold = 1
@@ -5455,7 +5551,7 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 		SNATSubnetRoutes:  !prefs.NoSNAT(),
 		StatefulFiltering: doStatefulFiltering,
 		NetfilterMode:     prefs.NetfilterMode(),
-		Routes:            peerRoutes(b.logf, cfg.Peers, singleRouteThreshold),
+		Routes:            peerRoutes(b.logf, cfg.Peers, singleRouteThreshold, prefs.RouteAll()),
 		NetfilterKind:     netfilterKind,
 	}
 
@@ -5511,11 +5607,23 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 		}
 	}
 
+	// Get the VIPs for VIP services this node hosts. We will add all locally served VIPs to routes then
+	// we terminate these connection locally in netstack instead of routing to peer.
+	vipServiceIPs := nm.GetIPVIPServiceMap()
+	v4, v6 := false, false
+
 	if slices.ContainsFunc(rs.LocalAddrs, tsaddr.PrefixIs4) {
 		rs.Routes = append(rs.Routes, netip.PrefixFrom(tsaddr.TailscaleServiceIP(), 32))
+		v4 = true
 	}
 	if slices.ContainsFunc(rs.LocalAddrs, tsaddr.PrefixIs6) {
 		rs.Routes = append(rs.Routes, netip.PrefixFrom(tsaddr.TailscaleServiceIPv6(), 128))
+		v6 = true
+	}
+	for vip := range vipServiceIPs {
+		if (vip.Is4() && v4) || (vip.Is6() && v6) {
+			rs.Routes = append(rs.Routes, netip.PrefixFrom(vip, vip.BitLen()))
+		}
 	}
 
 	return rs
@@ -6193,7 +6301,15 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 
 	b.setTCPPortsInterceptedFromNetmapAndPrefsLocked(b.pm.CurrentPrefs())
 	if buildfeatures.HasServe {
-		b.ipVIPServiceMap = nm.GetIPVIPServiceMap()
+		m := nm.GetIPVIPServiceMap()
+		b.ipVIPServiceMap = m
+		if ns, ok := b.sys.Netstack.GetOK(); ok {
+			ns.UpdateIPServiceMappings(m)
+			// In case the prefs reloaded from Profile Manager but didn't change,
+			// we still need to load the active VIP services into netstack.
+			ns.UpdateActiveVIPServices(b.pm.CurrentPrefs().AdvertiseServices())
+		}
+
 	}
 
 	if !oldSelf.Equal(nm.SelfNodeOrZero()) {
@@ -6991,6 +7107,12 @@ func (b *LocalBackend) DeleteProfile(p ipn.ProfileID) error {
 			return nil
 		}
 		return err
+	}
+	// Make a best-effort to remove the profile-specific data directory, if one exists.
+	if pd := b.profileDataPathLocked(p); pd != "" {
+		if err := os.RemoveAll(pd); err != nil {
+			b.logf("warning: removing profile data for %q: %v", p, err)
+		}
 	}
 	if !needToRestart {
 		return nil

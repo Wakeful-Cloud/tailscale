@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
@@ -1229,6 +1229,9 @@ func NetmapFromMapResponseForDebug(ctx context.Context, pr persist.PersistView, 
 	}
 	if resp.Node == nil {
 		return nil, errors.New("MapResponse lacks Node")
+	}
+	if !pr.Valid() {
+		return nil, errors.New("PersistView invalid")
 	}
 
 	nu := &rememberLastNetmapUpdater{}

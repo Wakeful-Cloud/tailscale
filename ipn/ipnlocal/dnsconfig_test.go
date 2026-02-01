@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
@@ -10,14 +10,17 @@ import (
 	"reflect"
 	"testing"
 
+	"tailscale.com/appc"
 	"tailscale.com/ipn"
 	"tailscale.com/net/dns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/opt"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/set"
 )
 
 func ipps(ippStrs ...string) (ipps []netip.Prefix) {
@@ -101,6 +104,39 @@ func TestDNSConfigForNetmap(t *testing.T) {
 					"peera.net.":   ips("100.102.0.1", "100.102.0.2"),
 					"v6-only.net.": ips("fe75::3"),
 				},
+			},
+		},
+		{
+			name: "subdomain_resolve_capability",
+			nm: &netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Name:      "myname.net.",
+					Addresses: ipps("100.101.101.101"),
+				}).View(),
+				AllCaps: set.SetOf([]tailcfg.NodeCapability{tailcfg.NodeAttrDNSSubdomainResolve}),
+			},
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					Name:      "peer-with-cap.net.",
+					Addresses: ipps("100.102.0.1"),
+					CapMap:    tailcfg.NodeCapMap{tailcfg.NodeAttrDNSSubdomainResolve: nil},
+				},
+				{
+					ID:        2,
+					Name:      "peer-without-cap.net.",
+					Addresses: ipps("100.102.0.2"),
+				},
+			}),
+			prefs: &ipn.Prefs{},
+			want: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts: map[dnsname.FQDN][]netip.Addr{
+					"myname.net.":           ips("100.101.101.101"),
+					"peer-with-cap.net.":    ips("100.102.0.1"),
+					"peer-without-cap.net.": ips("100.102.0.2"),
+				},
+				SubdomainHosts: set.Of[dnsname.FQDN]("myname.net.", "peer-with-cap.net."),
 			},
 		},
 		{
@@ -348,6 +384,94 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			}),
 			prefs: &ipn.Prefs{},
 			want:  &dns.Config{},
+		},
+		{
+			name: "conn25-split-dns",
+			nm: &netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Name:      "a",
+					Addresses: ipps("100.101.101.101"),
+					CapMap: tailcfg.NodeCapMap{
+						tailcfg.NodeCapability(appc.AppConnectorsExperimentalAttrName): []tailcfg.RawMessage{
+							tailcfg.RawMessage(`{"name":"app1","connectors":["tag:woo"],"domains":["example.com"]}`),
+						},
+					},
+				}).View(),
+				AllCaps: set.Of(tailcfg.NodeCapability(appc.AppConnectorsExperimentalAttrName)),
+			},
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					Name:      "p1",
+					Addresses: ipps("100.102.0.1"),
+					Tags:      []string{"tag:woo"},
+					Hostinfo: (&tailcfg.Hostinfo{
+						Services: []tailcfg.Service{
+							{
+								Proto: tailcfg.PeerAPI4,
+								Port:  1234,
+							},
+						},
+						AppConnector: opt.NewBool(true),
+					}).View(),
+				},
+			}),
+			prefs: &ipn.Prefs{
+				CorpDNS: true,
+			},
+			want: &dns.Config{
+				Hosts: map[dnsname.FQDN][]netip.Addr{
+					"a.":  ips("100.101.101.101"),
+					"p1.": ips("100.102.0.1"),
+				},
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+					dnsname.FQDN("example.com."): {
+						{Addr: "http://100.102.0.1:1234/dns-query"},
+					},
+				},
+			},
+		},
+		{
+			name: "conn25-split-dns-no-matching-peers",
+			nm: &netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					Name:      "a",
+					Addresses: ipps("100.101.101.101"),
+					CapMap: tailcfg.NodeCapMap{
+						tailcfg.NodeCapability(appc.AppConnectorsExperimentalAttrName): []tailcfg.RawMessage{
+							tailcfg.RawMessage(`{"name":"app1","connectors":["tag:woo"],"domains":["example.com"]}`),
+						},
+					},
+				}).View(),
+				AllCaps: set.Of(tailcfg.NodeCapability(appc.AppConnectorsExperimentalAttrName)),
+			},
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					Name:      "p1",
+					Addresses: ipps("100.102.0.1"),
+					Tags:      []string{"tag:nomatch"},
+					Hostinfo: (&tailcfg.Hostinfo{
+						Services: []tailcfg.Service{
+							{
+								Proto: tailcfg.PeerAPI4,
+								Port:  1234,
+							},
+						},
+						AppConnector: opt.NewBool(true),
+					}).View(),
+				},
+			}),
+			prefs: &ipn.Prefs{
+				CorpDNS: true,
+			},
+			want: &dns.Config{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts: map[dnsname.FQDN][]netip.Addr{
+					"a.":  ips("100.101.101.101"),
+					"p1.": ips("100.102.0.1"),
+				},
+			},
 		},
 	}
 	for _, tt := range tests {

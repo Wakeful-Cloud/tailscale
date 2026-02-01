@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
@@ -31,6 +31,7 @@ import (
 
 	gossh "golang.org/x/crypto/ssh"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
@@ -56,6 +57,10 @@ var (
 	// authentication methods that may proceed), which results in the SSH
 	// server immediately disconnecting the client.
 	errTerminal = &gossh.PartialSuccessError{}
+
+	// hookSSHLoginSuccess is called after successful SSH authentication.
+	// It is set by platform-specific code (e.g., auditd_linux.go).
+	hookSSHLoginSuccess feature.Hook[func(logf logger.Logf, c *conn)]
 )
 
 const (
@@ -647,6 +652,11 @@ func (c *conn) handleSessionPostSSHAuth(s ssh.Session) {
 	ss := c.newSSHSession(s)
 	ss.logf("handling new SSH connection from %v (%v) to ssh-user %q", c.info.uprof.LoginName, c.info.src.Addr(), c.localUser.Username)
 	ss.logf("access granted to %v as ssh-user %q", c.info.uprof.LoginName, c.localUser.Username)
+
+	if f, ok := hookSSHLoginSuccess.GetOk(); ok {
+		f(c.srv.logf, c)
+	}
+
 	ss.run()
 }
 
