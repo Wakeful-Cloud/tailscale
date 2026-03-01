@@ -41,7 +41,12 @@ func isProblematicInterface(nif *net.Interface) bool {
 	// DoS each other by doing traffic amplification, both of them
 	// preferring/trying to use each other for transport. See:
 	// https://github.com/tailscale/tailscale/issues/1208
-	if strings.HasPrefix(name, "zt") || (runtime.GOOS == "windows" && strings.Contains(name, "ZeroTier")) {
+	// TODO(https://github.com/tailscale/tailscale/issues/18824): maybe exclude
+	// "WireGuard tunnel 0" as well on Windows (NetBird), but the name seems too
+	// generic where there is not a platform standard (on Linux wt0 is at least
+	// explicitly different from the WireGuard conventional default of wg0).
+	if strings.HasPrefix(name, "zt") || name == "wt0" /* NetBird */ ||
+		(runtime.GOOS == "windows" && strings.Contains(name, "ZeroTier")) {
 		return true
 	}
 	return false

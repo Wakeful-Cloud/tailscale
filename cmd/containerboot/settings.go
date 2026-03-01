@@ -107,7 +107,12 @@ func configFromEnv() (*settings, error) {
 		UserspaceMode:                         defaultBool("TS_USERSPACE", true),
 		StateDir:                              defaultEnv("TS_STATE_DIR", ""),
 		AcceptDNS:                             defaultEnvBoolPointer("TS_ACCEPT_DNS"),
-		KubeSecret:                            defaultEnv("TS_KUBE_SECRET", "tailscale"),
+		KubeSecret: func() string {
+			if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+				return defaultEnv("TS_KUBE_SECRET", "tailscale")
+			}
+			return defaultEnv("TS_KUBE_SECRET", "")
+		}(),
 		SOCKSProxyAddr:                        defaultEnv("TS_SOCKS5_SERVER", ""),
 		HTTPProxyAddr:                         defaultEnv("TS_OUTBOUND_HTTP_PROXY_LISTEN", ""),
 		Socket:                                defaultEnv("TS_SOCKET", "/tmp/tailscaled.sock"),
@@ -126,6 +131,7 @@ func configFromEnv() (*settings, error) {
 		IngressProxiesCfgPath:                 defaultEnv("TS_INGRESS_PROXIES_CONFIG_PATH", ""),
 		PodUID:                                defaultEnv("POD_UID", ""),
 	}
+
 	podIPs, ok := os.LookupEnv("POD_IPS")
 	if ok {
 		ips := strings.Split(podIPs, ",")
@@ -144,6 +150,7 @@ func configFromEnv() (*settings, error) {
 			cfg.PodIPv6 = parsed.String()
 		}
 	}
+
 	// If cert share is enabled, set the replica as read or write. Only 0th
 	// replica should be able to write.
 	isInCertShareMode := defaultBool("TS_EXPERIMENTAL_CERT_SHARE", false)
@@ -165,9 +172,19 @@ func configFromEnv() (*settings, error) {
 		cfg.AcceptDNS = &acceptDNSNew
 	}
 
+	// In Kubernetes clusters, people like to use the "$(POD_IP):PORT" combination to configure the TS_LOCAL_ADDR_PORT
+	// environment variable (we even do this by default in the operator when enabling metrics), leading to a v6 address
+	// and port combo we cannot parse, as netip.ParseAddrPort expects the host segment to be enclosed in square brackets.
+	// We perform a check here to see if TS_LOCAL_ADDR_PORT is using the pod's IPv6 address and is not using brackets,
+	// adding the brackets in if need be.
+	if cfg.PodIPv6 != "" && strings.Contains(cfg.LocalAddrPort, cfg.PodIPv6) && !strings.ContainsAny(cfg.LocalAddrPort, "[]") {
+		cfg.LocalAddrPort = strings.Replace(cfg.LocalAddrPort, cfg.PodIPv6, "["+cfg.PodIPv6+"]", 1)
+	}
+
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %v", err)
 	}
+
 	return cfg, nil
 }
 

@@ -16,6 +16,8 @@
 - [ProxyClassList](#proxyclasslist)
 - [ProxyGroup](#proxygroup)
 - [ProxyGroupList](#proxygrouplist)
+- [ProxyGroupPolicy](#proxygrouppolicy)
+- [ProxyGroupPolicyList](#proxygrouppolicylist)
 - [Recorder](#recorder)
 - [RecorderList](#recorderlist)
 - [Tailnet](#tailnet)
@@ -725,6 +727,81 @@ _Appears in:_
 | `items` _[ProxyGroup](#proxygroup) array_ |  |  |  |
 
 
+#### ProxyGroupPolicy
+
+
+
+
+
+
+
+_Appears in:_
+- [ProxyGroupPolicyList](#proxygrouppolicylist)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `ProxyGroupPolicy` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[ProxyGroupPolicySpec](#proxygrouppolicyspec)_ | Spec describes the desired state of the ProxyGroupPolicy.<br />More info:<br />https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status |  |  |
+| `status` _[ProxyGroupPolicyStatus](#proxygrouppolicystatus)_ | Status describes the status of the ProxyGroupPolicy. This is set<br />and managed by the Tailscale operator. |  |  |
+
+
+#### ProxyGroupPolicyList
+
+
+
+
+
+
+
+
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `apiVersion` _string_ | `tailscale.com/v1alpha1` | | |
+| `kind` _string_ | `ProxyGroupPolicyList` | | |
+| `kind` _string_ | Kind is a string value representing the REST resource this object represents.<br />Servers may infer this from the endpoint the client submits requests to.<br />Cannot be updated.<br />In CamelCase.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds |  |  |
+| `apiVersion` _string_ | APIVersion defines the versioned schema of this representation of an object.<br />Servers should convert recognized schemas to the latest internal value, and<br />may reject unrecognized values.<br />More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources |  |  |
+| `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `items` _[ProxyGroupPolicy](#proxygrouppolicy) array_ |  |  |  |
+
+
+#### ProxyGroupPolicySpec
+
+
+
+
+
+
+
+_Appears in:_
+- [ProxyGroupPolicy](#proxygrouppolicy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `ingress` _string array_ | Names of ProxyGroup resources that can be used by Ingress resources within this namespace. An empty list<br />denotes that no ingress via ProxyGroups is allowed within this namespace. |  |  |
+| `egress` _string array_ | Names of ProxyGroup resources that can be used by Service resources within this namespace. An empty list<br />denotes that no egress via ProxyGroups is allowed within this namespace. |  |  |
+
+
+#### ProxyGroupPolicyStatus
+
+
+
+
+
+
+
+_Appears in:_
+- [ProxyGroupPolicy](#proxygrouppolicy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.3/#condition-v1-meta) array_ |  |  |  |
+
+
 #### ProxyGroupSpec
 
 
@@ -904,7 +981,7 @@ _Appears in:_
 | `tags` _[Tags](#tags)_ | Tags that the Tailscale device will be tagged with. Defaults to [tag:k8s].<br />If you specify custom tags here, make sure you also make the operator<br />an owner of these tags.<br />See  https://tailscale.com/kb/1236/kubernetes-operator/#setting-up-the-kubernetes-operator.<br />Tags cannot be changed once a Recorder node has been created.<br />Tag values must be in form ^tag:[a-zA-Z][a-zA-Z0-9-]*$. |  | Pattern: `^tag:[a-zA-Z][a-zA-Z0-9-]*$` <br />Type: string <br /> |
 | `enableUI` _boolean_ | Set to true to enable the Recorder UI. The UI lists and plays recorded sessions.<br />The UI will be served at <MagicDNS name of the recorder>:443. Defaults to false.<br />Corresponds to --ui tsrecorder flag https://tailscale.com/kb/1246/tailscale-ssh-session-recording#deploy-a-recorder-node.<br />Required if S3 storage is not set up, to ensure that recordings are accessible. |  |  |
 | `storage` _[Storage](#storage)_ | Configure where to store session recordings. By default, recordings will<br />be stored in a local ephemeral volume, and will not be persisted past the<br />lifetime of a specific pod. |  |  |
-| `replicas` _integer_ | Replicas specifies how many instances of tsrecorder to run. Defaults to 1. |  | Minimum: 0 <br /> |
+| `replicas` _integer_ | Replicas specifies how many instances of tsrecorder to run. Defaults to 1. | 1 | Minimum: 0 <br /> |
 | `tailnet` _string_ | Tailnet specifies the tailnet this Recorder should join. If blank, the default tailnet is used. When set, this<br />name must match that of a valid Tailnet resource. This field is immutable and cannot be changed once set. |  |  |
 
 

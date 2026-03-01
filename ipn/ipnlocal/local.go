@@ -6,6 +6,7 @@
 package ipnlocal
 
 import (
+	"bufio"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -98,6 +99,7 @@ import (
 	"tailscale.com/util/syspolicy/ptype"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
+	"tailscale.com/util/vizerror"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
@@ -269,6 +271,7 @@ type LocalBackend struct {
 	// of [LocalBackend]'s own state that is not tied to the node context.
 	currentNodeAtomic atomic.Pointer[nodeBackend]
 
+	diskCache        diskCache
 	conf             *conffile.Config // latest parsed config, or nil if not in declarative mode
 	pm               *profileManager  // mu guards access
 	lastFilterInputs *filterInputs
@@ -1562,22 +1565,6 @@ func (b *LocalBackend) GetFilterForTest() *filter.Filter {
 	return nb.filterAtomic.Load()
 }
 
-func (b *LocalBackend) settleEventBus() {
-	// The move to eventbus made some things racy that
-	// weren't before so we have to wait for it to all be settled
-	// before we call certain things.
-	// See https://github.com/tailscale/tailscale/issues/16369
-	// But we can't do this while holding b.mu without deadlocks,
-	// (https://github.com/tailscale/tailscale/pull/17804#issuecomment-3514426485) so
-	// now we just do it in lots of places before acquiring b.mu.
-	// Is this winning??
-	if b.sys != nil {
-		if ms, ok := b.sys.MagicSock.GetOK(); ok {
-			ms.Synchronize()
-		}
-	}
-}
-
 // SetControlClientStatus is the callback invoked by the control client whenever it posts a new status.
 // Among other things, this is where we update the netmap, packet filters, DNS and DERP maps.
 func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st controlclient.Status) {
@@ -1587,7 +1574,13 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.setControlClientStatusLocked(c, st)
+}
 
+// setControlClientStatusLocked is the locked version of SetControlClientStatus.
+//
+// b.mu must be held.
+func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st controlclient.Status) {
 	if b.cc != c {
 		b.logf("Ignoring SetControlClientStatus from old client")
 		return
@@ -1598,9 +1591,8 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 			return
 		}
 		b.logf("Received error: %v", st.Err)
-		var uerr controlclient.UserVisibleError
-		if errors.As(st.Err, &uerr) {
-			s := uerr.UserVisibleError()
+		if vizerr, ok := vizerror.As(st.Err); ok {
+			s := vizerr.Error()
 			b.sendLocked(ipn.Notify{ErrMessage: &s})
 		}
 		return
@@ -2115,15 +2107,15 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 		}
 	}()
 
-	// Gross. See https://github.com/tailscale/tailscale/issues/16369
-	b.settleEventBus()
-	defer b.settleEventBus()
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	cn := b.currentNode()
 	cn.UpdateNetmapDelta(muts)
+
+	if ms, ok := b.sys.MagicSock.GetOK(); ok {
+		ms.UpdateNetmapDelta(muts)
+	}
 
 	// If auto exit nodes are enabled and our exit node went offline,
 	// we need to schedule picking a new one.
@@ -2429,6 +2421,14 @@ func (b *LocalBackend) initOnce() {
 	b.extHost.Init()
 }
 
+func (b *LocalBackend) controlDebugFlags() []string {
+	debugFlags := controlDebugFlags
+	if b.sys.IsNetstackRouter() {
+		return append([]string{"netstack"}, debugFlags...)
+	}
+	return debugFlags
+}
+
 // Start applies the configuration specified in opts, and starts the
 // state machine.
 //
@@ -2440,7 +2440,6 @@ func (b *LocalBackend) initOnce() {
 // actually a supported operation (it should be, but it's very unclear
 // from the following whether or not that is a safe transition).
 func (b *LocalBackend) Start(opts ipn.Options) error {
-	defer b.settleEventBus() // with b.mu unlocked
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.startLocked(opts)
@@ -2478,7 +2477,9 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 
 	if b.state != ipn.Running && b.conf == nil && opts.AuthKey == "" {
 		sysak, _ := b.polc.GetString(pkey.AuthKey, "")
-		if sysak != "" {
+		if sysak != "" && len(b.pm.Profiles()) > 0 && b.state != ipn.NeedsLogin {
+			logf("not setting opts.AuthKey from syspolicy; login profiles exist, state=%v", b.state)
+		} else if sysak != "" {
 			logf("setting opts.AuthKey by syspolicy, len=%v", len(sysak))
 			opts.AuthKey = strings.TrimSpace(sysak)
 		}
@@ -2584,13 +2585,17 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 		persistv = new(persist.Persist)
 	}
 
-	discoPublic := b.MagicConn().DiscoPublicKey()
-
-	isNetstack := b.sys.IsNetstackRouter()
-	debugFlags := controlDebugFlags
-	if isNetstack {
-		debugFlags = append([]string{"netstack"}, debugFlags...)
+	if envknob.Bool("TS_USE_CACHED_NETMAP") {
+		if nm, ok := b.loadDiskCacheLocked(); ok {
+			logf("loaded netmap from disk cache; %d peers", len(nm.Peers))
+			b.setControlClientStatusLocked(nil, controlclient.Status{
+				NetMap:   nm,
+				LoggedIn: true, // sure
+			})
+		}
 	}
+
+	discoPublic := b.MagicConn().DiscoPublicKey()
 
 	var ccShutdownCbs []func()
 	ccShutdown := func() {
@@ -2617,7 +2622,7 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 		Hostinfo:             b.hostInfoWithServicesLocked(),
 		HTTPTestClient:       httpTestClient,
 		DiscoPublicKey:       discoPublic,
-		DebugFlags:           debugFlags,
+		DebugFlags:           b.controlDebugFlags(),
 		HealthTracker:        b.health,
 		PolicyClient:         b.sys.PolicyClientOrDefault(),
 		Pinger:               b,
@@ -2633,7 +2638,7 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 
 		// Don't warn about broken Linux IP forwarding when
 		// netstack is being used.
-		SkipIPForwardingCheck: isNetstack,
+		SkipIPForwardingCheck: b.sys.IsNetstackRouter(),
 	})
 	if err != nil {
 		return err
@@ -2879,7 +2884,11 @@ func (b *LocalBackend) updateFilterLocked(prefs ipn.PrefsView) {
 		b.setFilter(filter.NewShieldsUpFilter(localNets, logNets, oldFilter, b.logf))
 	} else {
 		b.logf("[v1] netmap packet filter: %v filters", len(packetFilter))
-		b.setFilter(filter.New(packetFilter, b.srcIPHasCapForFilter, localNets, logNets, oldFilter, b.logf))
+		filt := filter.New(packetFilter, b.srcIPHasCapForFilter, localNets, logNets, oldFilter, b.logf)
+
+		filt.IngressAllowHooks = b.extHost.Hooks().Filter.IngressAllowHooks
+		filt.LinkLocalAllowHooks = b.extHost.Hooks().Filter.LinkLocalAllowHooks
+		b.setFilter(filt)
 	}
 	// The filter for a jailed node is the exact same as a ShieldsUp filter.
 	oldJailedFilter := b.e.GetJailedFilter()
@@ -2934,6 +2943,9 @@ func packetFilterPermitsUnlockedNodes(peers map[tailcfg.NodeID]tailcfg.NodeView,
 func (b *LocalBackend) setFilter(f *filter.Filter) {
 	b.currentNode().setFilter(f)
 	b.e.SetFilter(f)
+	if ms, ok := b.sys.MagicSock.GetOK(); ok {
+		ms.SetFilter(f)
+	}
 }
 
 var removeFromDefaultRoute = []netip.Prefix{
@@ -4350,7 +4362,6 @@ func (b *LocalBackend) EditPrefsAs(mp *ipn.MaskedPrefs, actor ipnauth.Actor) (ip
 	if mp.SetsInternal() {
 		return ipn.PrefsView{}, errors.New("can't set Internal fields")
 	}
-	defer b.settleEventBus()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -5590,7 +5601,7 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 			b.logf("failed to discover interface ips: %v", err)
 		}
 		switch runtime.GOOS {
-		case "linux", "windows", "darwin", "ios", "android":
+		case "linux", "windows", "darwin", "ios", "android", "openbsd":
 			rs.LocalRoutes = internalIPs // unconditionally allow access to guest VM networks
 			if prefs.ExitNodeAllowLANAccess() {
 				rs.LocalRoutes = append(rs.LocalRoutes, externalIPs...)
@@ -5668,6 +5679,10 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 		}
 	}
 	hi.SSH_HostKeys = sshHostKeys
+
+	if buildfeatures.HasRelayServer {
+		hi.PeerRelay = prefs.RelayServerPort().Valid()
+	}
 
 	for _, f := range hookMaybeMutateHostinfoLocked {
 		f(b, hi, prefs)
@@ -6256,8 +6271,18 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	var login string
 	if nm != nil {
 		login = cmp.Or(profileFromView(nm.UserProfiles[nm.User()]).LoginName, "<missing-profile>")
+		if err := b.writeNetmapToDiskLocked(nm); err != nil {
+			b.logf("write netmap to cache: %v", err)
+		}
 	}
 	b.currentNode().SetNetMap(nm)
+	if ms, ok := b.sys.MagicSock.GetOK(); ok {
+		if nm != nil {
+			ms.SetNetworkMap(nm.SelfNode, nm.Peers)
+		} else {
+			ms.SetNetworkMap(tailcfg.NodeView{}, nil)
+		}
+	}
 	if login != b.activeLogin {
 		b.logf("active login: %v", login)
 		b.activeLogin = login
@@ -7486,13 +7511,20 @@ func suggestExitNode(report *netcheck.Report, nb *nodeBackend, prevSuggestion ta
 	switch {
 	case nb.SelfHasCap(tailcfg.NodeAttrTrafficSteering):
 		// The traffic-steering feature flag is enabled on this tailnet.
-		return suggestExitNodeUsingTrafficSteering(nb, allowList)
+		res, err = suggestExitNodeUsingTrafficSteering(nb, allowList)
 	default:
 		// The control plane will always strip the `traffic-steering`
 		// node attribute if it isn’t enabled for this tailnet, even if
 		// it is set in the policy file: tailscale/corp#34401
-		return suggestExitNodeUsingDERP(report, nb, prevSuggestion, selectRegion, selectNode, allowList)
+		res, err = suggestExitNodeUsingDERP(report, nb, prevSuggestion, selectRegion, selectNode, allowList)
 	}
+	if err != nil {
+		nb.logf("netmap: suggested exit node: %v", err)
+	} else {
+		name, _, _ := strings.Cut(res.Name, ".")
+		nb.logf("netmap: suggested exit node: %s (%s)", name, res.ID)
+	}
+	return res, err
 }
 
 // suggestExitNodeUsingDERP is the classic algorithm used to suggest exit nodes,
@@ -7724,6 +7756,21 @@ func suggestExitNodeUsingTrafficSteering(nb *nodeBackend, allowed set.Set[tailcf
 		// a chance of picking the next best option.
 		pick = nodes[0]
 	}
+
+	nb.logf("netmap: traffic steering: exit node scores: %v", logger.ArgWriter(func(bw *bufio.Writer) {
+		const max = 10
+		for i, n := range nodes {
+			if i == max {
+				fmt.Fprintf(bw, "... +%d", len(nodes)-max)
+				return
+			}
+			if i > 0 {
+				bw.WriteString(", ")
+			}
+			name, _, _ := strings.Cut(n.Name(), ".")
+			fmt.Fprintf(bw, "%d:%s", score(n), name)
+		}
+	}))
 
 	if !pick.Valid() {
 		return apitype.ExitNodeSuggestionResponse{}, nil

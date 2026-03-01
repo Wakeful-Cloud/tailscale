@@ -613,7 +613,7 @@ func (ns *Impl) Start(b LocalBackend) error {
 	}
 	ns.lb = lb
 	tcpFwd := tcp.NewForwarder(ns.ipstack, tcpRXBufDefSize, maxInFlightConnectionAttempts(), ns.acceptTCP)
-	udpFwd := udp.NewForwarder(ns.ipstack, ns.acceptUDP)
+	udpFwd := udp.NewForwarder(ns.ipstack, ns.acceptUDPNoICMP)
 	ns.ipstack.SetTransportProtocolHandler(tcp.ProtocolNumber, ns.wrapTCPProtocolHandler(tcpFwd.HandlePacket))
 	ns.ipstack.SetTransportProtocolHandler(udp.ProtocolNumber, ns.wrapUDPProtocolHandler(udpFwd.HandlePacket))
 	go ns.inject()
@@ -1037,6 +1037,16 @@ func (ns *Impl) inject() {
 				return
 			}
 		} else {
+			// Self-addressed packet: deliver back into gVisor directly
+			// via the link endpoint's dispatcher, but only if the packet is not
+			// earmarked for the host. Neither the inbound path (fakeTUN Write is a
+			// no-op) nor the outbound path (WireGuard has no peer for our own IP)
+			// can handle these.
+			if ns.isSelfDst(pkt) {
+				ns.linkEP.DeliverLoopback(pkt)
+				continue
+			}
+
 			if err := ns.tundev.InjectOutboundPacketBuffer(pkt); err != nil {
 				ns.logf("netstack inject outbound: %v", err)
 				return
@@ -1113,6 +1123,20 @@ func (ns *Impl) shouldSendToHost(pkt *stack.PacketBuffer) bool {
 		}
 	}
 
+	return false
+}
+
+// isSelfDst reports whether pkt's destination IP is a local Tailscale IP
+// assigned to this node. This is used by inject() to detect self-addressed
+// packets that need loopback delivery.
+func (ns *Impl) isSelfDst(pkt *stack.PacketBuffer) bool {
+	hdr := pkt.Network()
+	switch v := hdr.(type) {
+	case header.IPv4:
+		return ns.isLocalIP(netip.AddrFrom4(v.DestinationAddress().As4()))
+	case header.IPv6:
+		return ns.isLocalIP(netip.AddrFrom16(v.DestinationAddress().As16()))
+	}
 	return false
 }
 
@@ -1767,6 +1791,19 @@ func (ns *Impl) ListenTCP(network, address string) (*gonet.TCPListener, error) {
 	}
 
 	return gonet.ListenTCP(ns.ipstack, localAddress, networkProto)
+}
+
+// acceptUDPNoICMP wraps acceptUDP to satisfy udp.ForwarderHandler.
+// A gvisor bump from 9414b50a to 573d5e71 on 2026-02-27 changed
+// udp.ForwarderHandler from func(*ForwarderRequest) to
+// func(*ForwarderRequest) bool, where returning false means unhandled
+// and causes gvisor to send an ICMP port unreachable. Previously there
+// was no such distinction and all packets were implicitly treated as
+// handled. Always returning true preserves the old behavior of silently
+// dropping packets we don't service rather than sending ICMP errors.
+func (ns *Impl) acceptUDPNoICMP(r *udp.ForwarderRequest) bool {
+	ns.acceptUDP(r)
+	return true
 }
 
 func (ns *Impl) acceptUDP(r *udp.ForwarderRequest) {

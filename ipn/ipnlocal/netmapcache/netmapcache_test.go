@@ -10,6 +10,8 @@ import (
 	"flag"
 	"fmt"
 	"iter"
+	"maps"
+	"net/netip"
 	"os"
 	"reflect"
 	"slices"
@@ -22,10 +24,13 @@ import (
 	"tailscale.com/ipn/ipnlocal/netmapcache"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tka"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/set"
+	"tailscale.com/wgengine/filter"
+	"tailscale.com/wgengine/filter/filtertype"
 )
 
 // Input values for valid-looking placeholder values for keys, hashes, etc.
@@ -67,6 +72,27 @@ func init() {
 		panic(fmt.Sprintf("invalid test AUM hash %q: %v", testAUMHashString, err))
 	}
 
+	pfRules := []tailcfg.FilterRule{
+		{
+			SrcIPs: []string{"192.168.0.0/16"},
+			DstPorts: []tailcfg.NetPortRange{{
+				IP:    "*",
+				Ports: tailcfg.PortRange{First: 2000, Last: 9999},
+			}},
+			IPProto: []int{1, 6, 17}, // ICMPv4, TCP, UDP
+			CapGrant: []tailcfg.CapGrant{{
+				Dsts: []netip.Prefix{netip.MustParsePrefix("192.168.4.0/24")},
+				CapMap: tailcfg.PeerCapMap{
+					"tailscale.com/testcap": []tailcfg.RawMessage{`"apple"`, `"pear"`},
+				},
+			}},
+		},
+	}
+	pfMatch, err := filter.MatchesFromFilterRules(pfRules)
+	if err != nil {
+		panic(fmt.Sprintf("invalid packet filter rules: %v", err))
+	}
+
 	// The following network map must have a non-zero non-empty value for every
 	// field that is to be stored in the cache. The test checks for this using
 	// reflection, as a way to ensure that new fields added to the type are
@@ -78,8 +104,9 @@ func init() {
 	testMap = &netmap.NetworkMap{
 		Cached: false, // not cached, this is metadata for the cache machinery
 
-		PacketFilter:      nil,                               // not cached
-		PacketFilterRules: views.Slice[tailcfg.FilterRule]{}, // not cached
+		// These two fields must contain compatible data.
+		PacketFilterRules: views.SliceOf(pfRules),
+		PacketFilter:      pfMatch,
 
 		// Fields stored under the "self" key.
 		// Note that SelfNode must have a valid user in order to be considered
@@ -181,6 +208,24 @@ func TestRoundTrip(t *testing.T) {
 
 		})
 	}
+
+	t.Run("Twice", func(t *testing.T) {
+		// Verify that storing the same network map twice results in no change.
+
+		s := make(testStore)
+		c := netmapcache.NewCache(s)
+		if err := c.Store(t.Context(), testMap); err != nil {
+			t.Fatalf("Store 1 netmap failed: %v", err)
+		}
+		scp := maps.Clone(s) // for comparison, see below
+
+		if err := c.Store(t.Context(), testMap); err != nil {
+			t.Fatalf("Store 2 netmap failed; %v", err)
+		}
+		if diff := cmp.Diff(s, scp); diff != "" {
+			t.Errorf("Updated store (-got, +want):\n%s", diff)
+		}
+	})
 }
 
 func TestInvalidCache(t *testing.T) {
@@ -216,7 +261,7 @@ func TestInvalidCache(t *testing.T) {
 // skippedMapFields are the names of fields that should not be considered by
 // network map caching, and thus skipped when comparing test results.
 var skippedMapFields = []string{
-	"Cached", "PacketFilter", "PacketFilterRules",
+	"Cached",
 }
 
 // checkFieldCoverage logs an error in t if any of the fields of nm are zero
@@ -347,6 +392,27 @@ func (t testStore) Remove(_ context.Context, key string) error { delete(t, key);
 func diffNetMaps(got, want *netmap.NetworkMap) string {
 	return cmp.Diff(got, want,
 		cmpopts.IgnoreFields(netmap.NetworkMap{}, skippedMapFields...),
-		cmpopts.EquateComparable(key.NodePublic{}, key.MachinePublic{}),
+		cmpopts.IgnoreFields(filtertype.Match{}, "SrcsContains"), // function pointer
+		cmpopts.EquateComparable(key.NodePublic{}, key.MachinePublic{}, netip.Prefix{}),
+		cmp.Comparer(eqViewsSlice(eqFilterRules)),
+		cmp.Comparer(eqViewsSlice(func(a, b ipproto.Proto) bool { return a == b })),
 	)
+}
+
+func eqViewsSlice[T any](eqVal func(x, y T) bool) func(a, b views.Slice[T]) bool {
+	return func(a, b views.Slice[T]) bool {
+		if a.Len() != b.Len() {
+			return false
+		}
+		for i := range a.Len() {
+			if !eqVal(a.At(i), b.At(i)) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func eqFilterRules(a, b tailcfg.FilterRule) bool {
+	return cmp.Equal(a, b, cmpopts.EquateComparable(netip.Prefix{}))
 }

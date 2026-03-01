@@ -52,6 +52,7 @@ import (
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/cmd"
+
 	"tailscale.com/internal/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
@@ -69,6 +70,7 @@ const (
 var (
 	tsClient   *tailscale.Client // For API calls to control.
 	tnClient   *tsnet.Server     // For testing real tailnet traffic.
+	restCfg    *rest.Config      // For constructing a client-go client if necessary.
 	kubeClient client.WithWatch  // For k8s API calls.
 
 	//go:embed certs/pebble.minica.crt
@@ -140,7 +142,7 @@ func runTests(m *testing.M) (int, error) {
 	}
 
 	// Cluster client setup.
-	restCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	restCfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return 0, fmt.Errorf("error loading kubeconfig: %w", err)
 	}

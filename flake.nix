@@ -4,7 +4,7 @@
 # environment for working on tailscale, for use with "nix develop".
 #
 # For more information about this and why this file is useful, see:
-# https://nixos.wiki/wiki/Flakes
+# https://wiki.nixos.org/wiki/Flakes
 #
 # Also look into direnv: https://direnv.net/, this can make it so that you can
 # automatically get your environment set up when you change folders into the
@@ -132,7 +132,7 @@
     });
 
     devShells = eachSystem (pkgs: {
-      devShell = pkgs.mkShell {
+      default = pkgs.mkShell {
         packages = with pkgs; [
           curl
           git
@@ -151,4 +151,4 @@
     });
   };
 }
-# nix-direnv cache busting line: sha256-+tOYqRV8ZUA95dfVyRpjnJvwuSMobu/EhtXxq4bwvio=
+# nix-direnv cache busting line: sha256-Lr+5B0LEFk66WahPczRcfzH8rSL5Cc2qvNJuW6B0Llc=
