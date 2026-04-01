@@ -22,13 +22,12 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"tailscale.com/ipn/ipnstate"
+
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/ingressservices"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tstest"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
 
 	"tailscale.com/tailcfg"
@@ -195,14 +194,6 @@ func setupServiceTest(t *testing.T) (*HAServiceReconciler, *corev1.Secret, clien
 		t.Fatal(err)
 	}
 
-	lc := &fakeLocalClient{
-		status: &ipnstate.Status{
-			CurrentTailnet: &ipnstate.TailnetStatus{
-				MagicDNSSuffix: "ts.net",
-			},
-		},
-	}
-
 	cl := tstest.NewClock(tstest.ClockOpts{})
 	svcPGR := &HAServiceReconciler{
 		Client:      fc,
@@ -212,7 +203,6 @@ func setupServiceTest(t *testing.T) (*HAServiceReconciler, *corev1.Secret, clien
 		tsNamespace: "operator-ns",
 		logger:      zl.Sugar(),
 		recorder:    record.NewFakeRecorder(10),
-		lc:          lc,
 	}
 
 	return svcPGR, pgStateSecret, fc, ft, cl
@@ -235,7 +225,7 @@ func TestValidateService(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			ClusterIP:         "1.2.3.4",
 			Type:              corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass: ptr.To("tailscale"),
+			LoadBalancerClass: new("tailscale"),
 		},
 	}
 	svc2 := &corev1.Service{
@@ -252,7 +242,7 @@ func TestValidateService(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			ClusterIP:         "1.2.3.5",
 			Type:              corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass: ptr.To("tailscale"),
+			LoadBalancerClass: new("tailscale"),
 		},
 	}
 	wantSvc := &corev1.Service{
@@ -280,15 +270,12 @@ func TestValidateService(t *testing.T) {
 
 func TestServicePGReconciler_MultiCluster(t *testing.T) {
 	var ft *fakeTSClient
-	var lc localClient
 	for i := 0; i <= 10; i++ {
 		pgr, stateSecret, fc, fti, _ := setupServiceTest(t)
 		if i == 0 {
 			ft = fti
-			lc = pgr.lc
 		} else {
 			pgr.tsClient = ft
-			pgr.lc = lc
 		}
 
 		svc, _ := setupTestService(t, "test-multi-cluster", "", "4.3.2.1", fc, stateSecret)
@@ -392,7 +379,7 @@ func setupTestService(t *testing.T, svcName string, hostname string, clusterIP s
 		},
 		Spec: corev1.ServiceSpec{
 			Type:              corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass: ptr.To("tailscale"),
+			LoadBalancerClass: new("tailscale"),
 			ClusterIP:         clusterIP,
 			ClusterIPs:        []string{clusterIP},
 		},
@@ -412,7 +399,7 @@ func setupTestService(t *testing.T, svcName string, hostname string, clusterIP s
 			{
 				Addresses: []string{"4.3.2.1"},
 				Conditions: discoveryv1.EndpointConditions{
-					Ready: ptr.To(true),
+					Ready: new(true),
 				},
 			},
 		},

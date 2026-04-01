@@ -99,14 +99,9 @@ func (r *RecorderReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, nil
 	}
 
-	tailscaleClient := r.tsClient
-	if tsr.Spec.Tailnet != "" {
-		tc, err := clientForTailnet(ctx, r.Client, r.tsNamespace, tsr.Spec.Tailnet)
-		if err != nil {
-			return setStatusReady(tsr, metav1.ConditionFalse, reasonRecorderTailnetUnavailable, err.Error())
-		}
-
-		tailscaleClient = tc
+	tailscaleClient, loginUrl, err := r.getClientAndLoginURL(ctx, tsr.Spec.Tailnet)
+	if err != nil {
+		return setStatusReady(tsr, metav1.ConditionFalse, reasonRecorderTailnetUnavailable, err.Error())
 	}
 
 	if markedForDeletion(tsr) {
@@ -149,7 +144,7 @@ func (r *RecorderReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 		return setStatusReady(tsr, metav1.ConditionFalse, reasonRecorderInvalid, message)
 	}
 
-	if err = r.maybeProvision(ctx, tailscaleClient, tsr); err != nil {
+	if err = r.maybeProvision(ctx, tailscaleClient, loginUrl, tsr); err != nil {
 		reason := reasonRecorderCreationFailed
 		message := fmt.Sprintf("failed creating Recorder: %s", err)
 		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
@@ -167,7 +162,30 @@ func (r *RecorderReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 	return setStatusReady(tsr, metav1.ConditionTrue, reasonRecorderCreated, reasonRecorderCreated)
 }
 
-func (r *RecorderReconciler) maybeProvision(ctx context.Context, tailscaleClient tsClient, tsr *tsapi.Recorder) error {
+// getClientAndLoginURL returns the appropriate Tailscale client and resolved login URL
+// for the given tailnet name. If no tailnet is specified, returns the default client
+// and login server. Applies fallback to the operator's login server if the tailnet
+// doesn't specify a custom login URL.
+func (r *RecorderReconciler) getClientAndLoginURL(ctx context.Context, tailnetName string) (tsClient,
+	string, error) {
+	if tailnetName == "" {
+		return r.tsClient, r.loginServer, nil
+	}
+
+	tc, loginUrl, err := clientForTailnet(ctx, r.Client, r.tsNamespace, tailnetName)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Apply fallback if tailnet doesn't specify custom login URL
+	if loginUrl == "" {
+		loginUrl = r.loginServer
+	}
+
+	return tc, loginUrl, nil
+}
+
+func (r *RecorderReconciler) maybeProvision(ctx context.Context, tailscaleClient tsClient, loginUrl string, tsr *tsapi.Recorder) error {
 	logger := r.logger(tsr.Name)
 
 	r.mu.Lock()
@@ -234,7 +252,7 @@ func (r *RecorderReconciler) maybeProvision(ctx context.Context, tailscaleClient
 		return fmt.Errorf("error creating RoleBinding: %w", err)
 	}
 
-	ss := tsrStatefulSet(tsr, r.tsNamespace, r.loginServer)
+	ss := tsrStatefulSet(tsr, r.tsNamespace, loginUrl)
 	_, err = createOrUpdate(ctx, r.Client, r.tsNamespace, ss, func(s *appsv1.StatefulSet) {
 		s.ObjectMeta.Labels = ss.ObjectMeta.Labels
 		s.ObjectMeta.Annotations = ss.ObjectMeta.Annotations
@@ -363,15 +381,12 @@ func (r *RecorderReconciler) maybeCleanupSecrets(ctx context.Context, tailscaleC
 		}
 
 		if ok {
-			var errResp *tailscale.ErrResponse
-
 			r.log.Debugf("deleting device %s", devicePrefs.Config.NodeID)
 			err = tailscaleClient.DeleteDevice(ctx, string(devicePrefs.Config.NodeID))
-			switch {
-			case errors.As(err, &errResp) && errResp.Status == http.StatusNotFound:
+			if errResp, ok := errors.AsType[*tailscale.ErrResponse](err); ok && errResp.Status == http.StatusNotFound {
 				// This device has possibly already been deleted in the admin console. So we can ignore this
 				// and move on to removing the secret.
-			case err != nil:
+			} else if err != nil {
 				return err
 			}
 		}
@@ -412,8 +427,7 @@ func (r *RecorderReconciler) maybeCleanup(ctx context.Context, tsr *tsapi.Record
 		nodeID := string(devicePrefs.Config.NodeID)
 		logger.Debugf("deleting device %s from control", nodeID)
 		if err = tailscaleClient.DeleteDevice(ctx, nodeID); err != nil {
-			errResp := &tailscale.ErrResponse{}
-			if errors.As(err, errResp) && errResp.Status == http.StatusNotFound {
+			if errResp, ok := errors.AsType[tailscale.ErrResponse](err); ok && errResp.Status == http.StatusNotFound {
 				logger.Debugf("device %s not found, likely because it has already been deleted from control", nodeID)
 				continue
 			}

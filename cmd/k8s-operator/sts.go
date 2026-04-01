@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"path"
@@ -38,7 +39,6 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
 )
 
@@ -198,14 +198,9 @@ func IsHTTPSEnabledOnTailnet(tsnetServer tsnetServer) bool {
 // Provision ensures that the StatefulSet for the given service is running and
 // up to date.
 func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig) (*corev1.Service, error) {
-	tailscaleClient := a.tsClient
-	if sts.Tailnet != "" {
-		tc, err := clientForTailnet(ctx, a.Client, a.operatorNamespace, sts.Tailnet)
-		if err != nil {
-			return nil, err
-		}
-
-		tailscaleClient = tc
+	tailscaleClient, loginUrl, err := a.getClientAndLoginURL(ctx, sts.Tailnet)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tailscale client and loginUrl: %w", err)
 	}
 
 	// Do full reconcile.
@@ -227,7 +222,7 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 	}
 	sts.ProxyClass = proxyClass
 
-	secretNames, err := a.provisionSecrets(ctx, tailscaleClient, logger, sts, hsvc)
+	secretNames, err := a.provisionSecrets(ctx, tailscaleClient, loginUrl, sts, hsvc, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create or get API key secret: %w", err)
 	}
@@ -248,13 +243,36 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 	return hsvc, nil
 }
 
+// getClientAndLoginURL returns the appropriate Tailscale client and resolved login URL
+// for the given tailnet name. If no tailnet is specified, returns the default client
+// and login server. Applies fallback to the operator's login server if the tailnet
+// doesn't specify a custom login URL.
+func (a *tailscaleSTSReconciler) getClientAndLoginURL(ctx context.Context, tailnetName string) (tsClient,
+	string, error) {
+	if tailnetName == "" {
+		return a.tsClient, a.loginServer, nil
+	}
+
+	tc, loginUrl, err := clientForTailnet(ctx, a.Client, a.operatorNamespace, tailnetName)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Apply fallback if tailnet doesn't specify custom login URL
+	if loginUrl == "" {
+		loginUrl = a.loginServer
+	}
+
+	return tc, loginUrl, nil
+}
+
 // Cleanup removes all resources associated that were created by Provision with
 // the given labels. It returns true when all resources have been removed,
 // otherwise it returns false and the caller should retry later.
 func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, tailnet string, logger *zap.SugaredLogger, labels map[string]string, typ string) (done bool, _ error) {
 	tailscaleClient := a.tsClient
 	if tailnet != "" {
-		tc, err := clientForTailnet(ctx, a.Client, a.operatorNamespace, tailnet)
+		tc, _, err := clientForTailnet(ctx, a.Client, a.operatorNamespace, tailnet)
 		if err != nil {
 			logger.Errorf("failed to get tailscale client: %v", err)
 			return false, nil
@@ -305,8 +323,7 @@ func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, tailnet string, lo
 		if dev.id != "" {
 			logger.Debugf("deleting device %s from control", string(dev.id))
 			if err = tailscaleClient.DeleteDevice(ctx, string(dev.id)); err != nil {
-				errResp := &tailscale.ErrResponse{}
-				if ok := errors.As(err, errResp); ok && errResp.Status == http.StatusNotFound {
+				if errResp, ok := errors.AsType[tailscale.ErrResponse](err); ok && errResp.Status == http.StatusNotFound {
 					logger.Debugf("device %s not found, likely because it has already been deleted from control", string(dev.id))
 				} else {
 					return false, fmt.Errorf("deleting device: %w", err)
@@ -378,14 +395,14 @@ func (a *tailscaleSTSReconciler) reconcileHeadlessService(ctx context.Context, l
 			Selector: map[string]string{
 				"app": sts.ParentResourceUID,
 			},
-			IPFamilyPolicy: ptr.To(corev1.IPFamilyPolicyPreferDualStack),
+			IPFamilyPolicy: new(corev1.IPFamilyPolicyPreferDualStack),
 		},
 	}
 	logger.Debugf("reconciling headless service for StatefulSet")
 	return createOrUpdate(ctx, a.Client, a.operatorNamespace, hsvc, func(svc *corev1.Service) { svc.Spec = hsvc.Spec })
 }
 
-func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscaleClient tsClient, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, hsvc *corev1.Service) ([]string, error) {
+func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscaleClient tsClient, loginUrl string, stsC *tailscaleSTSConfig, hsvc *corev1.Service, logger *zap.SugaredLogger) ([]string, error) {
 	secretNames := make([]string, stsC.Replicas)
 
 	// Start by ensuring we have Secrets for the desired number of replicas. This will handle both creating and scaling
@@ -434,7 +451,7 @@ func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscale
 			}
 		}
 
-		configs, err := tailscaledConfig(stsC, authKey, orig, hostname)
+		configs, err := tailscaledConfig(stsC, loginUrl, authKey, orig, hostname)
 		if err != nil {
 			return nil, fmt.Errorf("error creating tailscaled config: %w", err)
 		}
@@ -500,14 +517,11 @@ func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscale
 		}
 
 		if dev != nil && dev.id != "" {
-			var errResp *tailscale.ErrResponse
-
 			err = tailscaleClient.DeleteDevice(ctx, string(dev.id))
-			switch {
-			case errors.As(err, &errResp) && errResp.Status == http.StatusNotFound:
+			if errResp, ok := errors.AsType[*tailscale.ErrResponse](err); ok && errResp.Status == http.StatusNotFound {
 				// This device has possibly already been deleted in the admin console. So we can ignore this
 				// and move on to removing the secret.
-			case err != nil:
+			} else if err != nil {
 				return nil, err
 			}
 		}
@@ -526,7 +540,7 @@ func sanitizeConfig(c ipn.ConfigVAlpha) ipn.ConfigVAlpha {
 	// Explicitly redact AuthKey because we never want it appearing in logs. Never populate this with the
 	// actual auth key.
 	if c.AuthKey != nil {
-		c.AuthKey = ptr.To("**redacted**")
+		c.AuthKey = new("**redacted**")
 	}
 
 	return c
@@ -678,12 +692,11 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		},
 	}
 	mak.Set(&pod.Labels, "app", sts.ParentResourceUID)
-	for key, val := range sts.ChildResourceLabels {
-		pod.Labels[key] = val // sync StatefulSet labels to Pod to make it easier for users to select the Pod
-	}
+	// sync StatefulSet labels to Pod to make it easier for users to select the Pod
+	maps.Copy(pod.Labels, sts.ChildResourceLabels)
 
 	if sts.Replicas > 0 {
-		ss.Spec.Replicas = ptr.To(sts.Replicas)
+		ss.Spec.Replicas = new(sts.Replicas)
 	}
 
 	// Generic containerboot configuration options.
@@ -1067,7 +1080,7 @@ func isMainContainer(c *corev1.Container) bool {
 
 // tailscaledConfig takes a proxy config, a newly generated auth key if generated and a Secret with the previous proxy
 // state and auth key and returns tailscaled config files for currently supported proxy versions.
-func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *corev1.Secret, hostname string) (tailscaledConfigs, error) {
+func tailscaledConfig(stsC *tailscaleSTSConfig, loginUrl string, newAuthkey string, oldSecret *corev1.Secret, hostname string) (tailscaledConfigs, error) {
 	conf := &ipn.ConfigVAlpha{
 		Version:             "alpha0",
 		AcceptDNS:           "false",
@@ -1098,12 +1111,16 @@ func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *co
 
 	if newAuthkey != "" {
 		conf.AuthKey = &newAuthkey
-	} else if shouldRetainAuthKey(oldSecret) {
+	} else if !deviceAuthed(oldSecret) {
 		key, err := authKeyFromSecret(oldSecret)
 		if err != nil {
 			return nil, fmt.Errorf("error retrieving auth key from Secret: %w", err)
 		}
 		conf.AuthKey = key
+	}
+
+	if loginUrl != "" {
+		conf.ServerURL = new(loginUrl)
 	}
 
 	capVerConfigs := make(map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha)
@@ -1147,6 +1164,8 @@ func latestConfigFromSecret(s *corev1.Secret) (*ipn.ConfigVAlpha, error) {
 	return conf, nil
 }
 
+// authKeyFromSecret returns the auth key from the latest config version if
+// found, or else nil.
 func authKeyFromSecret(s *corev1.Secret) (key *string, err error) {
 	conf, err := latestConfigFromSecret(s)
 	if err != nil {
@@ -1163,13 +1182,13 @@ func authKeyFromSecret(s *corev1.Secret) (key *string, err error) {
 	return key, nil
 }
 
-// shouldRetainAuthKey returns true if the state stored in a proxy's state Secret suggests that auth key should be
-// retained (because the proxy has not yet successfully authenticated).
-func shouldRetainAuthKey(s *corev1.Secret) bool {
+// deviceAuthed returns true if the state stored in a proxy's state Secret
+// suggests that the proxy has successfully authenticated.
+func deviceAuthed(s *corev1.Secret) bool {
 	if s == nil {
-		return false // nothing to retain here
+		return false // No state Secret means no device state.
 	}
-	return len(s.Data["device_id"]) == 0 // proxy has not authed yet
+	return len(s.Data["device_id"]) > 0
 }
 
 func shouldAcceptRoutes(pc *tsapi.ProxyClass) bool {

@@ -55,7 +55,7 @@
           system = system;
           overlays = [
             (final: prev: {
-              go_1_25 = prev.go_1_25.overrideAttrs {
+              go_1_26 = prev.go_1_26.overrideAttrs {
                 version = goVersion;
                 src = prev.fetchFromGitHub {
                   owner = "tailscale";
@@ -87,7 +87,7 @@
     # you're an end user you should be prepared for this flake to not
     # build periodically.
     packages = eachSystem (pkgs: rec {
-      default = pkgs.buildGo125Module {
+      default = pkgs.buildGo126Module {
         name = "tailscale";
         pname = "tailscale";
         src = ./.;
@@ -140,7 +140,7 @@
           gotools
           graphviz
           perl
-          go_1_25
+          go_1_26
           yarn
 
           # qemu and e2fsprogs are needed for natlab
@@ -151,4 +151,4 @@
     });
   };
 }
-# nix-direnv cache busting line: sha256-Lr+5B0LEFk66WahPczRcfzH8rSL5Cc2qvNJuW6B0Llc=
+# nix-direnv cache busting line: sha256-39axT5Q0+fNTcMgZCMLMNfJEJN46wMaaKDgfI+Uj+Ps=

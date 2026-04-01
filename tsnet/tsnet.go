@@ -59,6 +59,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
@@ -151,6 +152,8 @@ type Server struct {
 
 	// ControlURL optionally specifies the coordination server URL.
 	// If empty, the Tailscale default is used.
+	// If empty, it defaults to the TS_CONTROL_URL environment variable.
+	// If that is also empty, the Tailscale default is used.
 	ControlURL string
 
 	// RunWebClient, if true, runs a client for managing this node over
@@ -173,32 +176,33 @@ type Server struct {
 	// This field must be set before calling Start.
 	Tun tun.Device
 
-	initOnce             sync.Once
-	initErr              error
-	lb                   *ipnlocal.LocalBackend
-	sys                  *tsd.System
-	netstack             *netstack.Impl
-	netMon               *netmon.Monitor
-	rootPath             string // the state directory
-	hostname             string
-	shutdownCtx          context.Context
-	shutdownCancel       context.CancelFunc
-	proxyCred            string        // SOCKS5 proxy auth for loopbackListener
-	localAPICred         string        // basic auth password for loopbackListener
-	loopbackListener     net.Listener  // optional loopback for localapi and proxies
-	localAPIListener     net.Listener  // in-memory, used by localClient
-	localClient          *local.Client // in-memory
-	localAPIServer       *http.Server
-	resetServeConfigOnce sync.Once
-	logbuffer            *filch.Filch
-	logtail              *logtail.Logger
-	logid                logid.PublicID
+	initOnce            sync.Once
+	initErr             error
+	lb                  *ipnlocal.LocalBackend
+	sys                 *tsd.System
+	netstack            *netstack.Impl
+	netMon              *netmon.Monitor
+	rootPath            string // the state directory
+	hostname            string
+	shutdownCtx         context.Context
+	shutdownCancel      context.CancelFunc
+	proxyCred           string        // SOCKS5 proxy auth for loopbackListener
+	localAPICred        string        // basic auth password for loopbackListener
+	loopbackListener    net.Listener  // optional loopback for localapi and proxies
+	localAPIListener    net.Listener  // in-memory, used by localClient
+	localClient         *local.Client // in-memory
+	localAPIServer      *http.Server
+	resetServeStateOnce sync.Once
+	logbuffer           *filch.Filch
+	logtail             *logtail.Logger
+	logid               logid.PublicID
 
 	mu                  sync.Mutex
 	listeners           map[listenKey]*listener
 	nextEphemeralPort   uint16 // next port to try in ephemeral range; 0 means use ephemeralPortFirst
 	fallbackTCPHandlers set.HandleSet[FallbackTCPHandler]
 	dialer              *tsdial.Dialer
+	advertisedServices  map[tailcfg.ServiceName]int
 	closeOnce           sync.Once
 }
 
@@ -413,15 +417,27 @@ func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
 					return nil, errors.New("tsnet.Up: running, but no ip")
 				}
 
-				// The first time Up is run, clear the persisted serve config.
-				// We do this to prevent messy interactions with stale config in
-				// the face of code changes.
-				var srvResetErr error
-				s.resetServeConfigOnce.Do(func() {
-					srvResetErr = lc.SetServeConfig(ctx, new(ipn.ServeConfig))
+				// The first time Up is run, clear the persisted serve config
+				// and Service advertisements. We do this to prevent messy
+				// interactions with stale config in the face of code changes.
+				var srvCfgErr error
+				var svcAdErr error
+				s.resetServeStateOnce.Do(func() {
+					if err := lc.SetServeConfig(ctx, new(ipn.ServeConfig)); err != nil {
+						srvCfgErr = fmt.Errorf("clearing serve config: %w", err)
+					}
+					_, err := s.lb.EditPrefs(&ipn.MaskedPrefs{
+						AdvertiseServicesSet: true,
+						Prefs: ipn.Prefs{
+							AdvertiseServices: []string{},
+						},
+					})
+					if err != nil {
+						svcAdErr = fmt.Errorf("clearing Service advertisements: %w", err)
+					}
 				})
-				if srvResetErr != nil {
-					return nil, fmt.Errorf("tsnet.Up: clearing serve config: %w", err)
+				if err := errors.Join(srvCfgErr, svcAdErr); err != nil {
+					return nil, fmt.Errorf("tsnet.Up: %w", err)
 				}
 
 				return status, nil
@@ -466,9 +482,7 @@ func (s *Server) close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		// Perform a best-effort final flush.
 		if s.logtail != nil {
 			s.logtail.Shutdown(ctx)
@@ -476,14 +490,12 @@ func (s *Server) close() {
 		if s.logbuffer != nil {
 			s.logbuffer.Close()
 		}
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		if s.localAPIServer != nil {
 			s.localAPIServer.Shutdown(ctx)
 		}
-	}()
+	})
 
 	if s.shutdownCancel != nil {
 		s.shutdownCancel()
@@ -572,6 +584,13 @@ func (s *Server) getAuthKey() string {
 	return os.Getenv("TS_AUTH_KEY")
 }
 
+func (s *Server) getControlURL() string {
+	if v := s.ControlURL; v != "" {
+		return v
+	}
+	return os.Getenv("TS_CONTROL_URL")
+}
+
 func (s *Server) getClientSecret() string {
 	if v := s.ClientSecret; v != "" {
 		return v
@@ -613,10 +632,15 @@ func (s *Server) start() (reterr error) {
 			// directory and hostname when they're not supplied. But we can fall
 			// back to "tsnet" as well.
 			exe = "tsnet"
-		case "ios":
+		case "ios", "darwin":
 			// When compiled as a framework (via TailscaleKit in libtailscale),
-			// os.Executable() returns an error, so fall back to "tsnet" there
-			// too.
+			// os.Executable() returns an error on iOS. The same failure occurs
+			// on macOS (darwin) when the framework is loaded in a process
+			// launched by a debugger or certain host environments (e.g. Xcode),
+			// where the OS does not expose a resolvable executable path to the
+			// embedded Go runtime. Fall back to "tsnet" in both cases — the
+			// value is only used as a default hostname/directory when neither
+			// Server.Hostname nor Server.Dir is set.
 			exe = "tsnet"
 		default:
 			return err
@@ -773,7 +797,7 @@ func (s *Server) start() (reterr error) {
 	prefs := ipn.NewPrefs()
 	prefs.Hostname = s.hostname
 	prefs.WantRunning = true
-	prefs.ControlURL = s.ControlURL
+	prefs.ControlURL = s.getControlURL()
 	prefs.RunWebClient = s.RunWebClient
 	prefs.AdvertiseTags = s.AdvertiseTags
 	authKey, err := s.resolveAuthKey()
@@ -862,7 +886,7 @@ func (s *Server) resolveAuthKey() (string, error) {
 				return "", fmt.Errorf("audience for workload identity federation found, but client ID is empty")
 			}
 		}
-		authKey, err = resolveViaWIF(s.shutdownCtx, s.ControlURL, clientID, idToken, audience, s.AdvertiseTags)
+		authKey, err = resolveViaWIF(s.shutdownCtx, s.getControlURL(), clientID, idToken, audience, s.AdvertiseTags)
 		if err != nil {
 			return "", err
 		}
@@ -936,6 +960,22 @@ func (s *Server) logf(format string, a ...any) {
 // printAuthURLLoop loops once every few seconds while the server is still running and
 // is in NeedsLogin state, printing out the auth URL.
 func (s *Server) printAuthURLLoop() {
+	ctx, cancel := context.WithCancel(s.shutdownCtx)
+	defer cancel()
+	stateCh := make(chan struct{}, 1)
+	go s.lb.WatchNotifications(ctx, ipn.NotifyInitialState, nil, func(n *ipn.Notify) (keepGoing bool) {
+		if n.State == nil {
+			return true
+		}
+
+		// No need to block, we only want to make sure the loop below is not
+		// blocking on time.After if there's a new state available.
+		select {
+		case stateCh <- struct{}{}:
+		default:
+		}
+		return true
+	})
 	for {
 		if s.shutdownCtx.Err() != nil {
 			return
@@ -950,6 +990,7 @@ func (s *Server) printAuthURLLoop() {
 		}
 		select {
 		case <-time.After(5 * time.Second):
+		case <-stateCh:
 		case <-s.shutdownCtx.Done():
 			return
 		}
@@ -1447,6 +1488,13 @@ type ServiceListener struct {
 
 	// FQDN is the fully-qualifed domain name of this Service.
 	FQDN string
+
+	// Used by Close.
+	closeOnce sync.Once
+	closeErr  error               // written to during execution of closeOnce, read by Close()
+	s         *Server             // read and written to during execution of closeOnce
+	svcName   tailcfg.ServiceName // read during execution of closeOnce
+	mode      ServiceMode         // read during execution of closeOnce
 }
 
 // Addr returns the listener's network address. This will be the Service's
@@ -1454,8 +1502,62 @@ type ServiceListener struct {
 //
 // A hostname is not truly a network address, but Services listen on multiple
 // addresses (the IPv4 and IPv6 virtual IPs).
-func (sl ServiceListener) Addr() net.Addr {
+func (sl *ServiceListener) Addr() net.Addr {
 	return sl.addr
+}
+
+// cleanServeConfig cleans serve config changes made to support this listener.
+// This should only be called by Close.
+func (sl *ServiceListener) cleanServeConfig() error {
+	sc, etag, err := sl.s.lb.ServeConfigETag()
+	if err != nil {
+		return fmt.Errorf("fetching current config: %w", err)
+	}
+	if !sc.Valid() || !sc.Services().Contains(sl.svcName) {
+		return nil
+	}
+	srvConfig := sc.AsStruct()
+	svcConfig := srvConfig.Services[sl.svcName]
+	switch m := sl.mode.(type) {
+	case ServiceModeTCP:
+		delete(svcConfig.TCP, m.Port)
+	case ServiceModeHTTP:
+		hp := net.JoinHostPort(sl.FQDN, strconv.Itoa(int(m.Port)))
+		delete(svcConfig.Web, ipn.HostPort(hp))
+		delete(svcConfig.TCP, m.Port)
+	default:
+		return fmt.Errorf("unexpected ServiceMode %T", sl.mode)
+	}
+	if err := sl.s.lb.SetServeConfig(srvConfig, etag); err != nil {
+		return fmt.Errorf("setting config: %w", err)
+	}
+	return nil
+}
+
+// Close closes the listener and clears state related to hosting the Service.
+// Behavior is undefined after the [Server] has been closed.
+func (sl *ServiceListener) Close() error {
+	// We should only clean up state once. Otherwise we can stomp on state
+	// created by new listeners.
+	sl.closeOnce.Do(func() {
+		// Two pieces of state we need to clear:
+		//  1. The Service advertisement pref
+		//  2. Artifacts in the serve config
+		// Then we can close the listener.
+
+		var adErr error
+		if err := sl.s.decrementServiceAdvertisement(sl.svcName); err != nil {
+			adErr = fmt.Errorf("managing Service advertisements: %w", err)
+		}
+
+		var srvCfgErr error
+		if err := sl.cleanServeConfig(); err != nil {
+			srvCfgErr = fmt.Errorf("cleaning config changes: %w", err)
+		}
+
+		sl.closeErr = errors.Join(sl.Listener.Close(), adErr, srvCfgErr)
+	})
+	return sl.closeErr
 }
 
 // ErrUntaggedServiceHost is returned by ListenService when run on a node
@@ -1463,6 +1565,78 @@ func (sl ServiceListener) Addr() net.Addr {
 // Service host. For more information, see:
 // https://tailscale.com/kb/1552/tailscale-services#prerequisites
 var ErrUntaggedServiceHost = errors.New("service hosts must be tagged nodes")
+
+// advertiseService ensures the Service is advertised by this node.
+func (s *Server) advertiseService(name tailcfg.ServiceName) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	advertised := s.lb.Prefs().AdvertiseServices()
+	if !views.SliceContains(advertised, name.String()) {
+		newAdvertised := make([]string, 0, advertised.Len()+1)
+		newAdvertised = advertised.AppendTo(newAdvertised)
+		newAdvertised = append(newAdvertised, name.String())
+		_, err := s.lb.EditPrefs(&ipn.MaskedPrefs{
+			AdvertiseServicesSet: true,
+			Prefs: ipn.Prefs{
+				AdvertiseServices: newAdvertised,
+			},
+		})
+		if err != nil {
+			return err
+		}
+	}
+	mak.Set(&s.advertisedServices, name, s.advertisedServices[name]+1)
+	return nil
+}
+
+// decrementServiceAdvertisement decrements the count of listeners this node has
+// advertising the Service. Advertisement of the Service will be withdrawn if
+// the count hits zero. It is an error to call this function when the Service is
+// not being advertised by this node.
+func (s *Server) decrementServiceAdvertisement(name tailcfg.ServiceName) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cleanAdvertisement := func() error {
+		delete(s.advertisedServices, name)
+		advertised := s.lb.Prefs().AdvertiseServices()
+		if !views.SliceContains(advertised, name.String()) {
+			return nil
+		}
+		newAdvertised := make([]string, 0, advertised.Len()-1)
+		for _, svc := range advertised.All() {
+			if svc == name.String() {
+				continue
+			}
+			newAdvertised = append(newAdvertised, svc)
+		}
+		_, err := s.lb.EditPrefs(&ipn.MaskedPrefs{
+			AdvertiseServicesSet: true,
+			Prefs: ipn.Prefs{
+				AdvertiseServices: newAdvertised,
+			},
+		})
+		return err
+	}
+
+	if s.advertisedServices[name] <= 0 {
+		advertisements := s.advertisedServices[name]
+		// We somehow mismatched increments and decrements. Clear current
+		// advertisements and surface the mismatch as an error.
+		return errors.Join(
+			cleanAdvertisement(),
+			fmt.Errorf("service decrement requested with %d advertisements", advertisements),
+		)
+	}
+	s.advertisedServices[name]--
+	if s.advertisedServices[name] > 0 {
+		// If there are still listeners advertising the Service, then there's
+		// nothing more for us to do.
+		return nil
+	}
+	return cleanAdvertisement()
+}
 
 // ListenService creates a network listener for a Tailscale Service. This will
 // advertise this node as hosting the Service. Note that:
@@ -1476,13 +1650,22 @@ var ErrUntaggedServiceHost = errors.New("service hosts must be tagged nodes")
 //
 // This function will start the server if it is not already started.
 func (s *Server) ListenService(name string, mode ServiceMode) (*ServiceListener, error) {
-	if err := tailcfg.ServiceName(name).Validate(); err != nil {
+	svcName := tailcfg.ServiceName(name)
+	if err := svcName.Validate(); err != nil {
 		return nil, err
 	}
 	if mode == nil {
 		return nil, errors.New("mode may not be nil")
 	}
-	svcName := name
+
+	// We collect cleanup tasks as we go and execute these on error. If we make
+	// it to the end we abandon these cleanup tasks by setting onError to nil.
+	var onError []func()
+	defer func() {
+		for _, f := range onError {
+			f()
+		}
+	}()
 
 	// TODO(hwh33,tailscale/corp#35859): support TUN mode
 
@@ -1497,31 +1680,21 @@ func (s *Server) ListenService(name string, mode ServiceMode) (*ServiceListener,
 		return nil, ErrUntaggedServiceHost
 	}
 
-	advertisedServices := s.lb.Prefs().AdvertiseServices().AsSlice()
-	if !slices.Contains(advertisedServices, svcName) {
-		// TODO(hwh33,tailscale/corp#35860): clean these prefs up when (a) we
-		// exit early due to error or (b) when the returned listener is closed.
-		_, err = s.lb.EditPrefs(&ipn.MaskedPrefs{
-			AdvertiseServicesSet: true,
-			Prefs: ipn.Prefs{
-				AdvertiseServices: append(advertisedServices, svcName),
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("updating advertised Services: %w", err)
-		}
+	if err := s.advertiseService(svcName); err != nil {
+		return nil, fmt.Errorf("advertising Service: %w", err)
 	}
+	onError = append(onError, func() { s.decrementServiceAdvertisement(svcName) })
 
-	srvConfig := new(ipn.ServeConfig)
-	sc, srvConfigETag, err := s.lb.ServeConfigETag()
+	srvCfg := new(ipn.ServeConfig)
+	sc, srvCfgETag, err := s.lb.ServeConfigETag()
 	if err != nil {
 		return nil, fmt.Errorf("fetching current serve config: %w", err)
 	}
 	if sc.Valid() {
-		srvConfig = sc.AsStruct()
+		srvCfg = sc.AsStruct()
 	}
 
-	fqdn := tailcfg.ServiceName(svcName).WithoutPrefix() + "." + st.CurrentTailnet.MagicDNSSuffix
+	fqdn := svcName.WithoutPrefix() + "." + st.CurrentTailnet.MagicDNSSuffix
 
 	// svcAddr is used to implement Addr() on the returned listener.
 	svcAddr := addr{
@@ -1537,6 +1710,13 @@ func (s *Server) ListenService(name string, mode ServiceMode) (*ServiceListener,
 		if m.port() == 0 {
 			return nil, errors.New("must specify a port to advertise")
 		}
+		if svcCfg, ok := srvCfg.Services[svcName]; ok {
+			if _, handlerExists := svcCfg.TCP[m.port()]; handlerExists {
+				// We know that a handler must have been started in this runtime
+				// because serve config is reset on the first [Server.Up].
+				return nil, errors.New("a Service handler already exists for this port")
+			}
+		}
 		svcAddr.addr += ":" + strconv.Itoa(int(m.port()))
 	}
 
@@ -1545,11 +1725,12 @@ func (s *Server) ListenService(name string, mode ServiceMode) (*ServiceListener,
 	if err != nil {
 		return nil, fmt.Errorf("starting local listener: %w", err)
 	}
+	onError = append(onError, func() { ln.Close() })
 
 	switch m := mode.(type) {
 	case ServiceModeTCP:
 		// Forward all connections from service-hostname:port to our socket.
-		srvConfig.SetTCPForwardingForService(
+		srvCfg.SetTCPForwardingForService(
 			m.Port, ln.Addr().String(), m.TerminateTLS,
 			tailcfg.ServiceName(svcName), m.PROXYProtocolVersion, st.CurrentTailnet.MagicDNSSuffix)
 	case ServiceModeHTTP:
@@ -1570,30 +1751,29 @@ func (s *Server) ListenService(name string, mode ServiceMode) (*ServiceListener,
 			} else {
 				h.Proxy += path
 			}
-			srvConfig.SetWebHandler(&h, svcName, m.Port, path, m.HTTPS, mds)
+			srvCfg.SetWebHandler(&h, svcName.String(), m.Port, path, m.HTTPS, mds)
 		}
 		// We always need a root handler.
 		if !haveRootHandler {
 			h := ipn.HTTPHandler{Proxy: ln.Addr().String()}
-			srvConfig.SetWebHandler(&h, svcName, m.Port, "/", m.HTTPS, mds)
+			srvCfg.SetWebHandler(&h, svcName.String(), m.Port, "/", m.HTTPS, mds)
 		}
 	default:
-		ln.Close()
 		return nil, fmt.Errorf("unknown ServiceMode type %T", m)
 	}
 
-	if err := s.lb.SetServeConfig(srvConfig, srvConfigETag); err != nil {
-		ln.Close()
+	if err := s.lb.SetServeConfig(srvCfg, srvCfgETag); err != nil {
 		return nil, err
 	}
 
-	// TODO(hwh33,tailscale/corp#35860): clean up state (advertising prefs,
-	// serve config changes) when the returned listener is closed.
-
+	onError = nil
 	return &ServiceListener{
 		Listener: ln,
 		FQDN:     fqdn,
 		addr:     svcAddr,
+		s:        s,
+		svcName:  svcName,
+		mode:     mode,
 	}, nil
 }
 
@@ -1850,9 +2030,9 @@ func (s *Server) GetRootPath() string {
 // debugging, probably not useful for production.
 //
 // Packets will be written to the pcap until the process exits. The pcap needs a Lua dissector
-// to be installed in WireShark in order to decode properly: wgengine/capture/ts-dissector.lua
+// to be installed in Wireshark in order to decode properly: wgengine/capture/ts-dissector.lua
 // in this repository.
-// https://tailscale.com/kb/1023/troubleshooting/#can-i-examine-network-traffic-inside-the-encrypted-tunnel
+// https://tailscale.com/docs/reference/troubleshooting/network-configuration/inspect-unencrypted-packets
 func (s *Server) CapturePcap(ctx context.Context, pcapFile string) error {
 	stream, err := s.localClient.StreamDebugCapture(ctx)
 	if err != nil {

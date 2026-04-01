@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ import (
 	"tailscale.com/tstime/rate"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/bufiox"
 	"tailscale.com/util/ctxkey"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
@@ -71,7 +73,7 @@ func init() {
 	if keys == "" {
 		return
 	}
-	for _, keyStr := range strings.Split(keys, ",") {
+	for keyStr := range strings.SplitSeq(keys, ",") {
 		k, err := key.ParseNodePublicUntyped(mem.S(keyStr))
 		if err != nil {
 			log.Printf("ignoring invalid debug key %q: %v", keyStr, err)
@@ -1004,7 +1006,12 @@ func (c *sclient) run(ctx context.Context) error {
 		}
 	}()
 
-	c.startStatsLoop(sendCtx)
+	// Allow disabling RTT stats collection to reduce
+	// CPU and syscalls on servers with high connection
+	// counts
+	if !envknob.Bool("TS_DERP_DISABLE_RTT_STATS") {
+		c.startStatsLoop(sendCtx)
+	}
 
 	for {
 		ft, fl, err := derp.ReadFrameHeader(c.br)
@@ -1082,10 +1089,10 @@ func (c *sclient) handleFramePing(ft derp.FrameType, fl uint32) error {
 		// space for future extensibility, but not too much.
 		return fmt.Errorf("ping body too large: %v", fl)
 	}
-	_, err := io.ReadFull(c.br, m[:])
-	if err != nil {
+	if _, err := bufiox.ReadFull(c.br, m[:]); err != nil {
 		return err
 	}
+	var err error
 	if extra := int64(fl) - int64(len(m)); extra > 0 {
 		_, err = io.CopyN(io.Discard, c.br, extra)
 	}
@@ -1287,7 +1294,7 @@ func (c *sclient) sendPkt(dst *sclient, p pkt) error {
 	if disco.LooksLikeDiscoWrapper(p.bs) {
 		sendQueue = dst.discoSendQueue
 	}
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := range 3 {
 		select {
 		case <-dst.done:
 			s.recordDrop(p.bs, c.key, dstKey, dropReasonGoneDisconnected)
@@ -1484,16 +1491,13 @@ func (s *Server) noteClientActivity(c *sclient) {
 	// If we saw this connection send previously, then consider
 	// the group fighting and disable them all.
 	if s.dupPolicy == disableFighters {
-		for _, prior := range dup.sendHistory {
-			if prior == c {
-				cs.ForeachClient(func(c *sclient) {
-					c.isDisabled.Store(true)
-					if cs.activeClient.Load() == c {
-						cs.activeClient.Store(nil)
-					}
-				})
-				break
-			}
+		if slices.Contains(dup.sendHistory, c) {
+			cs.ForeachClient(func(c *sclient) {
+				c.isDisabled.Store(true)
+				if cs.activeClient.Load() == c {
+					cs.activeClient.Store(nil)
+				}
+			})
 		}
 	}
 
@@ -2210,9 +2214,9 @@ func (s *Server) ExpVar() expvar.Var {
 	m.Set("gauge_current_connections", &s.curClients)
 	m.Set("gauge_current_home_connections", &s.curHomeClients)
 	m.Set("gauge_current_notideal_connections", &s.curClientsNotIdeal)
-	m.Set("gauge_clients_total", expvar.Func(func() any { return len(s.clientsMesh) }))
-	m.Set("gauge_clients_local", expvar.Func(func() any { return len(s.clients) }))
-	m.Set("gauge_clients_remote", expvar.Func(func() any { return len(s.clientsMesh) - len(s.clients) }))
+	m.Set("gauge_clients_total", s.expVarFunc(func() any { return len(s.clientsMesh) }))
+	m.Set("gauge_clients_local", s.expVarFunc(func() any { return len(s.clients) }))
+	m.Set("gauge_clients_remote", s.expVarFunc(func() any { return len(s.clientsMesh) - len(s.clients) }))
 	m.Set("gauge_current_dup_client_keys", &s.dupClientKeys)
 	m.Set("gauge_current_dup_client_conns", &s.dupClientConns)
 	m.Set("counter_total_dup_client_conns", &s.dupClientConnTotal)

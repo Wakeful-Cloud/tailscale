@@ -8,6 +8,7 @@ package main
 import (
 	_ "embed"
 	"fmt"
+	"maps"
 	"reflect"
 	"regexp"
 	"strings"
@@ -22,7 +23,6 @@ import (
 	"sigs.k8s.io/yaml"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
-	"tailscale.com/types/ptr"
 )
 
 // Test_statefulSetNameBase tests that parent name portion in a StatefulSet name
@@ -69,7 +69,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 					Labels:      tsapi.Labels{"bar": "foo"},
 					Annotations: map[string]string{"bar.io/foo": "foo"},
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsUser: ptr.To(int64(0)),
+						RunAsUser: new(int64(0)),
 					},
 					ImagePullSecrets:  []corev1.LocalObjectReference{{Name: "docker-creds"}},
 					NodeName:          "some-node",
@@ -87,18 +87,18 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 							},
 						},
 					},
-					DNSPolicy: ptr.To(corev1.DNSClusterFirstWithHostNet),
+					DNSPolicy: new(corev1.DNSClusterFirstWithHostNet),
 					DNSConfig: &corev1.PodDNSConfig{
 						Nameservers: []string{"1.1.1.1", "8.8.8.8"},
 						Searches:    []string{"example.com", "test.local"},
 						Options: []corev1.PodDNSConfigOption{
-							{Name: "ndots", Value: ptr.To("2")},
+							{Name: "ndots", Value: new("2")},
 							{Name: "edns0"},
 						},
 					},
 					TailscaleContainer: &tsapi.Container{
 						SecurityContext: &corev1.SecurityContext{
-							Privileged: ptr.To(true),
+							Privileged: new(true),
 						},
 						Resources: corev1.ResourceRequirements{
 							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1000m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
@@ -110,8 +110,8 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 					},
 					TailscaleInitContainer: &tsapi.Container{
 						SecurityContext: &corev1.SecurityContext{
-							Privileged: ptr.To(true),
-							RunAsUser:  ptr.To(int64(0)),
+							Privileged: new(true),
+							RunAsUser:  new(int64(0)),
 						},
 						Resources: corev1.ResourceRequirements{
 							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1000m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
@@ -293,7 +293,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 		corev1.EnvVar{Name: "TS_ENABLE_METRICS", Value: "true"},
 	)
 	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "metrics", Protocol: "TCP", ContainerPort: 9002}}
-	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(true, ptr.To(false)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(true, new(false)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
 		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
 	}
@@ -305,7 +305,7 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 		corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(TS_DEBUG_ADDR_PORT)"},
 	)
 	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "debug", Protocol: "TCP", ContainerPort: 9001}}
-	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(false, ptr.To(true)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(false, new(true)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
 		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
 	}
@@ -409,7 +409,5 @@ func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
 
 // updateMap updates map a with the values from map b.
 func updateMap(a, b map[string]string) {
-	for key, val := range b {
-		a[key] = val
-	}
+	maps.Copy(a, b)
 }

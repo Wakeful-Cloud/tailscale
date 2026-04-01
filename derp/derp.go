@@ -168,6 +168,8 @@ const FastStartHeader = "Derp-Fast-Start"
 
 var bin = binary.BigEndian
 
+// writeUint32 writes v to bw one byte at a time
+// as a big-endian uint32.
 func writeUint32(bw *bufio.Writer, v uint32) error {
 	var b [4]byte
 	bin.PutUint32(b[:], v)
@@ -181,21 +183,6 @@ func writeUint32(bw *bufio.Writer, v uint32) error {
 		}
 	}
 	return nil
-}
-
-func readUint32(br *bufio.Reader) (uint32, error) {
-	var b [4]byte
-	// Reading a byte at a time is a bit silly,
-	// but it causes b not to escape,
-	// which more than pays for the silliness.
-	for i := range &b {
-		c, err := br.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		b[i] = c
-	}
-	return bin.Uint32(b[:]), nil
 }
 
 // ReadFrameTypeHeader reads a frame header from br and
@@ -213,18 +200,16 @@ func ReadFrameTypeHeader(br *bufio.Reader, wantType FrameType) (frameLen uint32,
 	return frameLen, err
 }
 
-// ReadFrameHeader reads the header of a DERP frame,
-// reading 5 bytes from br.
+// ReadFrameHeader reads a DERP frame header ([FrameHeaderLen] bytes) from br.
+// It uses Peek+Discard to read directly from bufio's internal buffer
+// without copying or allocating.
 func ReadFrameHeader(br *bufio.Reader) (t FrameType, frameLen uint32, err error) {
-	tb, err := br.ReadByte()
+	hdr, err := br.Peek(FrameHeaderLen)
 	if err != nil {
 		return 0, 0, err
 	}
-	frameLen, err = readUint32(br)
-	if err != nil {
-		return 0, 0, err
-	}
-	return FrameType(tb), frameLen, nil
+	defer br.Discard(FrameHeaderLen)
+	return FrameType(hdr[0]), bin.Uint32(hdr[1:FrameHeaderLen]), nil
 }
 
 // readFrame reads a frame header and then reads its payload into
@@ -260,14 +245,26 @@ func readFrame(br *bufio.Reader, maxSize uint32, b []byte) (t FrameType, frameLe
 	return t, frameLen, err
 }
 
-// WriteFrameHeader writes a frame header to bw.
+// WriteFrameHeader writes a DERP frame header to bw: a one-byte frame
+// type followed by a big-endian uint32 frame length.
 //
-// The frame header is 5 bytes: a one byte frame type
-// followed by a big-endian uint32 length of the
-// remaining frame (not including the 5 byte header).
-//
+// It uses AvailableBuffer to append the header directly into bufio's
+// internal buffer without allocation, falling back to WriteByte when
+// the buffer has insufficient space.
 // It does not flush bw.
 func WriteFrameHeader(bw *bufio.Writer, t FrameType, frameLen uint32) error {
+	// Fast path: enough space in the buffer to append the header
+	// directly without allocation via AvailableBuffer.
+	if bw.Available() >= FrameHeaderLen {
+		buf := bw.AvailableBuffer()
+		buf = append(buf, byte(t))
+		buf = bin.AppendUint32(buf, frameLen)
+		_, err := bw.Write(buf)
+		return err
+	}
+	// Slow path: buffer nearly full. Write byte-at-a-time to let
+	// bufio flush as needed, avoiding a heap allocation from append
+	// growing past AvailableBuffer's capacity.
 	if err := bw.WriteByte(byte(t)); err != nil {
 		return err
 	}
