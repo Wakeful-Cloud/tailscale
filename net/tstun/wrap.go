@@ -111,8 +111,7 @@ type Wrapper struct {
 	// you might need to add an align64 field here.
 	lastActivityAtomic mono.Time // time of last send or receive
 
-	destIPActivity syncs.AtomicValue[map[netip.Addr]func()]
-	discoKey       syncs.AtomicValue[key.DiscoPublic]
+	discoKey syncs.AtomicValue[key.DiscoPublic]
 
 	// timeNow, if non-nil, will be used to obtain the current time.
 	timeNow func() time.Time
@@ -338,16 +337,6 @@ func (t *Wrapper) now() time.Time {
 		return t.timeNow()
 	}
 	return time.Now()
-}
-
-// SetDestIPActivityFuncs sets a map of funcs to run per packet
-// destination (the map keys).
-//
-// The map ownership passes to the Wrapper. It must be non-nil.
-func (t *Wrapper) SetDestIPActivityFuncs(m map[netip.Addr]func()) {
-	if buildfeatures.HasLazyWG {
-		t.destIPActivity.Store(m)
-	}
 }
 
 // SetDiscoKey sets the current discovery key.
@@ -997,13 +986,6 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	for _, data := range res.data {
 		p.Decode(data[res.dataOffset:])
 
-		if buildfeatures.HasLazyWG {
-			if m := t.destIPActivity.Load(); m != nil {
-				if fn := m[p.Dst.Addr()]; fn != nil {
-					fn()
-				}
-			}
-		}
 		if buildfeatures.HasCapture && captHook != nil {
 			captHook(packet.FromLocal, t.now(), p.Buffer(), p.CaptureMeta)
 		}
@@ -1136,14 +1118,6 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, outBuffs [][]byte, sizes []i
 	pc.snat(p)
 	invertGSOChecksum(pkt, gso)
 
-	if buildfeatures.HasLazyWG {
-		if m := t.destIPActivity.Load(); m != nil {
-			if fn := m[p.Dst.Addr()]; fn != nil {
-				fn()
-			}
-		}
-	}
-
 	if res.packet != nil {
 		var gsoOptions tun.GSOOptions
 		gsoOptions, err = stackGSOToTunGSO(pkt, gso)
@@ -1177,7 +1151,7 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 			t.injectOutboundPong(p, pingReq)
 			return filter.DropSilently, gro
 		} else if discoKeyAdvert, ok := p.AsTSMPDiscoAdvertisement(); ok {
-			if buildfeatures.HasCacheNetMap && envknob.Bool("TS_USE_CACHED_NETMAP") {
+			if buildfeatures.HasCacheNetMap && envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") {
 				t.discoKeyAdvertisementPub.Publish(events.DiscoKeyAdvertisement{
 					Src: discoKeyAdvert.Src,
 					Key: discoKeyAdvert.Key,

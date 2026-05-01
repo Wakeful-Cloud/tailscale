@@ -9,12 +9,15 @@ import (
 	"context"
 	"crypto"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -22,6 +25,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -74,6 +78,7 @@ type Direct struct {
 	logf              logger.Logf
 	netMon            *netmon.Monitor // non-nil
 	health            *health.Tracker
+	extraRootCAs      *x509.CertPool // additional trusted root CAs; or nil
 	busClient         *eventbus.Client
 	clientVersionPub  *eventbus.Publisher[tailcfg.ClientVersion]
 	autoUpdatePub     *eventbus.Publisher[AutoUpdate]
@@ -141,6 +146,7 @@ type Options struct {
 	NoiseTestClient      *http.Client // optional HTTP client to use for noise RPCs (tests only)
 	DebugFlags           []string     // debug settings to send to control
 	HealthTracker        *health.Tracker
+	ExtraRootCAs         *x509.CertPool      // additional trusted root CAs; or nil
 	PopBrowserURL        func(url string)    // optional func to open browser
 	Dialer               *tsdial.Dialer      // non-nil
 	C2NHandler           http.Handler        // or nil
@@ -297,6 +303,12 @@ func NewDirect(opts Options) (*Direct, error) {
 				f(tr)
 			}
 		}
+		if opts.ExtraRootCAs != nil {
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{}
+			}
+			tr.TLSClientConfig.RootCAs = opts.ExtraRootCAs
+		}
 		tr.TLSClientConfig = tlsdial.Config(opts.HealthTracker, tr.TLSClientConfig)
 		var dialFunc netx.DialFunc
 		dialFunc, interceptedDial = makeScreenTimeDetectingDialFunc(opts.Dialer.SystemDial)
@@ -324,6 +336,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		debugFlags:        opts.DebugFlags,
 		netMon:            netMon,
 		health:            opts.HealthTracker,
+		extraRootCAs:      opts.ExtraRootCAs,
 		pinger:            opts.Pinger,
 		polc:              cmp.Or(opts.PolicyClient, policyclient.Client(policyclient.NoPolicyClient{})),
 		popBrowser:        opts.PopBrowserURL,
@@ -362,26 +375,24 @@ func NewDirect(opts Options) (*Direct, error) {
 	discoKeyPub := eventbus.Publish[events.PeerDiscoKeyUpdate](c.busClient)
 	eventbus.SubscribeFunc(c.busClient, func(update events.DiscoKeyAdvertisement) {
 		c.logf("controlclient direct: got TSMP disco key advertisement from %v via eventbus", update.Src)
-		var nm *netmap.NetworkMap
+		var peerID tailcfg.NodeID
+		var peerKey key.NodePublic
+		var ok bool
 		c.mu.Lock()
 		sess := c.streamingMapSession
-		if sess != nil {
-			nm = c.streamingMapSession.netmap()
-		}
 		c.mu.Unlock()
-
 		if sess != nil {
-			peer, ok := nm.PeerByTailscaleIP(update.Src)
-			if !ok {
-				return
-			}
+			peerID, peerKey, ok = sess.PeerIDAndKeyByTailscaleIP(update.Src)
+		}
+
+		if sess != nil && ok {
 			c.logf("controlclient direct: updating discoKey for %v via mapSession", update.Src)
 
 			// If we update without error, return. If the err indicates that the
 			// mapSession has gone away, we want to fall back to pushing the key
 			// further down the chain.
 			if err := sess.updateDiscoForNode(
-				peer.ID(), peer.Key(), update.Key, time.Now(), false); err == nil ||
+				peerID, peerKey, update.Key, time.Now(), false); err == nil ||
 				!errors.Is(err, ErrChangeQueueClosed) {
 				return
 			}
@@ -565,6 +576,37 @@ var macOSScreenTime = health.Register(&health.Warnable{
 	},
 	ImpactsConnectivity: true,
 })
+
+type rateLimitError struct {
+	msg        string
+	retryAfter time.Duration
+}
+
+func (e *rateLimitError) Error() string {
+	return fmt.Sprintf("rate limited: %s (retry after %v)", e.msg, e.retryAfter)
+}
+
+func parseRateLimitError(res *http.Response) *rateLimitError {
+	msg, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+
+	ret := &rateLimitError{
+		msg: strings.TrimSpace(string(msg)),
+	}
+
+	v := res.Header.Get("Retry-After")
+	if i, err := strconv.Atoi(v); err == nil {
+		ret.retryAfter = time.Duration(i) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		ret.retryAfter = time.Until(t)
+	}
+
+	// If the server didn't give us a valid Retry-After, default to 10s.
+	if ret.retryAfter <= 0 || ret.retryAfter > time.Hour {
+		ret.retryAfter = 5*time.Second + rand.N(5*time.Second)
+	}
+	return ret
+}
 
 func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, newURL string, nks tkatype.MarshaledSignature, err error) {
 	if c.panicOnUse {
@@ -759,6 +801,12 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	res, err := httpc.Do(req)
 	if err != nil {
 		return regen, opt.URL, nil, fmt.Errorf("register request: %w", err)
+	}
+	// Handle 429 Too Many Requests with a specific error type that includes the retry-after duration.
+	if res.StatusCode == 429 {
+		rle := parseRateLimitError(res)
+		msg := fmt.Sprintf("node registration rate limited; will retry after %v", rle.retryAfter)
+		return false, "", nil, vizerror.WrapWithMessage(rle, msg)
 	}
 	if res.StatusCode != 200 {
 		msg, _ := io.ReadAll(res.Body)
@@ -1633,6 +1681,7 @@ func (c *Direct) getNoiseClient() (*ts2021.Client, error) {
 			Logf:          c.logf,
 			NetMon:        c.netMon,
 			HealthTracker: c.health,
+			ExtraRootCAs:  c.extraRootCAs,
 			DialPlan:      dp,
 		})
 		if err != nil {

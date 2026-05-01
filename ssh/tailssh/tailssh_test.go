@@ -33,6 +33,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	gliderssh "github.com/tailscale/gliderssh"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"tailscale.com/cmd/testwrapper/flakytest"
@@ -42,7 +43,6 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tempfork/gliderlabs/ssh"
 	testssh "tailscale.com/tempfork/sshtest/ssh"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
@@ -387,7 +387,14 @@ type localState struct {
 	serverActions map[string]*tailcfg.SSHAction
 }
 
-var currentUser = os.Getenv("USER") // Use the current user for the test.
+var currentUser = func() string {
+	// Prefer user.Current because the USER env var is not set in
+	// some environments (e.g. the golang:latest container used by CI).
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return os.Getenv("USER")
+}()
 
 func (ts *localState) Dialer() *tsdial.Dialer {
 	return &tsdial.Dialer{}
@@ -414,6 +421,8 @@ func (ts *localState) NetMap() *netmap.NetworkMap {
 		SSHPolicy: policy,
 	}
 }
+
+func (ts *localState) NetMapNoPeers() *netmap.NetworkMap { return ts.NetMap() }
 
 func (ts *localState) WhoIs(proto string, ipp netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool) {
 	if proto != "tcp" {
@@ -470,8 +479,9 @@ func newSSHRule(action *tailcfg.SSHAction) *tailcfg.SSHRule {
 }
 
 func TestSSHRecordingCancelsSessionsOnUploadFailure(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/7707")
-
+	if runtime.GOOS == "darwin" {
+		flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/7707")
+	}
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
 	}
@@ -688,9 +698,9 @@ func TestSSHRecordingNonInteractive(t *testing.T) {
 		t.Skipf("skipping on %q; only runs on linux and darwin", runtime.GOOS)
 	}
 	var recording []byte
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	done := make(chan struct{})
 	recordingServer := mockRecordingServer(t, func(w http.ResponseWriter, r *http.Request) {
-		defer cancel()
+		defer close(done)
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 
@@ -758,7 +768,11 @@ func TestSSHRecordingNonInteractive(t *testing.T) {
 	}
 	wg.Wait()
 
-	<-ctx.Done() // wait for recording to finish
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for recording")
+	}
 	var ch sessionrecording.CastHeader
 	if err := json.NewDecoder(bytes.NewReader(recording)).Decode(&ch); err != nil {
 		t.Fatal(err)
@@ -1094,7 +1108,7 @@ func TestSSH(t *testing.T) {
 	sc.finalAction = sc.action0
 	sc.authCompleted.Store(true)
 
-	sc.Handler = func(s ssh.Session) {
+	sc.Handler = func(s gliderssh.Session) {
 		sc.newSSHSession(s).run()
 	}
 

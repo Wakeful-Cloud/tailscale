@@ -40,6 +40,7 @@ import (
 	"github.com/axiomhq/hyperloglog"
 	"go4.org/mem"
 	"golang.org/x/sync/errgroup"
+	xrate "golang.org/x/time/rate"
 	"tailscale.com/client/local"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derpconst"
@@ -171,6 +172,9 @@ type Server struct {
 	meshUpdateBatchSize        *metrics.Histogram
 	meshUpdateLoopCount        *metrics.Histogram
 	bufferedWriteFrames        *metrics.Histogram // how many sendLoop frames (or groups of related frames) get written per flush
+	rateLimitGlobalWaited      expvar.Int         // number of times global rate limit caused a wait
+	rateLimitPerClientWaited   expvar.Int         // number of times per-client rate limit caused a wait
+	// TODO(illotum): add metrics for rate limited wait time, consider total seconds vs a histogram.
 
 	// verifyClientsLocalTailscaled only accepts client connections to the DERP
 	// server if the clientKey is a known peer in the network, as specified by a
@@ -180,7 +184,11 @@ type Server struct {
 	verifyClientsURL         string
 	verifyClientsURLFailOpen bool
 
-	mu       syncs.Mutex
+	perClientSendQueueDepth int // Sets the client send queue depth for the server.
+	tcpWriteTimeout         time.Duration
+	clock                   tstime.Clock
+
+	mu       syncs.Mutex // guards the following fields
 	closed   bool
 	netConns map[derp.Conn]chan struct{} // chan is closed when conn closes
 	clients  map[key.NodePublic]*clientSet
@@ -196,16 +204,10 @@ type Server struct {
 	// is gone from the region, we notify all of these watchers,
 	// calling their funcs in a new goroutine.
 	peerGoneWatchers map[key.NodePublic]set.HandleSet[func(key.NodePublic)]
-
 	// maps from netip.AddrPort to a client's public key
-	keyOfAddr map[netip.AddrPort]key.NodePublic
-
-	// Sets the client send queue depth for the server.
-	perClientSendQueueDepth int
-
-	tcpWriteTimeout time.Duration
-
-	clock tstime.Clock
+	keyOfAddr  map[netip.AddrPort]key.NodePublic
+	rateConfig RateConfig     // server-global and per-client DERP frame rate limiting config
+	recvLim    *xrate.Limiter // server-global DERP frame receive limiter
 }
 
 // clientSet represents 1 or more *sclients.
@@ -229,10 +231,6 @@ type clientSet struct {
 	// activeClient holds the currently active connection for the set. It's nil
 	// if there are no connections or the connection is disabled.
 	//
-	// A pointer to a clientSet can be held by peers for long periods of time
-	// without holding Server.mu to avoid mutex contention on Server.mu, only
-	// re-acquiring the mutex and checking the clients map if activeClient is
-	// nil.
 	activeClient atomic.Pointer[sclient]
 
 	// dup is non-nil if there are multiple connections for the
@@ -508,6 +506,99 @@ func (s *Server) SetTCPWriteTimeout(d time.Duration) {
 	s.tcpWriteTimeout = d
 }
 
+// minRateLimitTokenBucketSize represents the minimum size of a token bucket
+// applied for the purposes of rate limiting a DERP connection per received DERP
+// frame.
+//
+// Note: The DERP protocol supports frames larger than this ([math.MaxUint32] length),
+// but a [derp.FrameSendPacket] cannot exceed this value, which is what we optimize
+// our token bucket calls for.
+const minRateLimitTokenBucketSize = derp.MaxPacketSize + derp.KeyLen
+
+// RateConfig is a JSON-serializable configuration for rate limits. Values are
+// in bytes.
+type RateConfig struct {
+	// PerClientRateLimitBytesPerSec represents the per-client
+	// rate limit in bytes per second. A zero value disables per-client rate limiting,
+	// but global (GlobalRate...) configuration may still apply.
+	PerClientRateLimitBytesPerSec uint64 `json:",omitzero"`
+	// PerClientRateBurstBytes represents the per-client token bucket depth,
+	// or burst, in bytes. Any value lower than [minRateLimitTokenBucketSize]
+	// will be increased to [minRateLimitTokenBucketSize] before application. Only
+	// relevant if PerClientRateLimitBytesPerSec is nonzero.
+	PerClientRateBurstBytes uint64 `json:",omitzero"`
+	// GlobalRateLimitBytesPerSec represents the global rate limit in bytes per
+	// second. A zero value disables global rate limiting, but per-client (PerClient...)
+	// configuration may still apply. If GlobalRateLimitBytesPerSec is nonzero and less than
+	// PerClientRateLimitBytesPerSec, then GlobalRateLimitBytesPerSec will be set
+	// equal to PerClientRateLimitBytesPerSec before application.
+	GlobalRateLimitBytesPerSec uint64 `json:",omitzero"`
+	// GlobalRateBurstBytes represents the global token bucket depth, or burst,
+	// in bytes. Any value lower than [minRateLimitTokenBucketSize] will be increased to
+	// [minRateLimitTokenBucketSize] before application. Only relevant if
+	// GlobalRateLimitBytesPerSec is nonzero.
+	GlobalRateBurstBytes uint64 `json:",omitzero"`
+}
+
+// LoadRateConfig reads and JSON-unmarshals a [RateConfig] from the file at path.
+func LoadRateConfig(path string) (RateConfig, error) {
+	if path == "" {
+		return RateConfig{}, errors.New("rate config path is empty")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return RateConfig{}, fmt.Errorf("error reading rate config: %w", err)
+	}
+	var rc RateConfig
+	if err := json.Unmarshal(b, &rc); err != nil {
+		return RateConfig{}, fmt.Errorf("error parsing rate config: %w", err)
+	}
+	return rc, nil
+}
+
+// LoadAndApplyRateConfig reads a [RateConfig] from the file at path and
+// applies it to the server via [Server.UpdateRateLimits].
+func (s *Server) LoadAndApplyRateConfig(path string) error {
+	rc, err := LoadRateConfig(path)
+	if err != nil {
+		return err
+	}
+	applied := s.UpdateRateLimits(rc)
+	s.logf("rate config applied: global-rate=%d bytes/sec global-burst=%d bytes client-rate=%d bytes/sec, client-burst=%d bytes",
+		applied.GlobalRateLimitBytesPerSec, applied.GlobalRateBurstBytes, applied.PerClientRateLimitBytesPerSec, applied.PerClientRateBurstBytes)
+	return nil
+}
+
+// UpdateRateLimits sets the receive rate limits, updating all existing client
+// connections. It returns the applied config, which may differ from rc. If both
+// the per-client and global rate limits are 0, rate limiting is disabled. Mesh
+// peers are always exempt from rate limiting.
+func (s *Server) UpdateRateLimits(rc RateConfig) (applied RateConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rc.PerClientRateLimitBytesPerSec == 0 && rc.GlobalRateLimitBytesPerSec == 0 {
+		// if per-client and global are disabled, all rate limiting is disabled
+		rc = RateConfig{}
+	}
+	if rc.PerClientRateLimitBytesPerSec != 0 {
+		rc.PerClientRateBurstBytes = max(rc.PerClientRateBurstBytes, minRateLimitTokenBucketSize)
+	}
+	if rc.GlobalRateLimitBytesPerSec != 0 {
+		rc.GlobalRateLimitBytesPerSec = max(rc.GlobalRateLimitBytesPerSec, rc.PerClientRateLimitBytesPerSec)
+		rc.GlobalRateBurstBytes = max(rc.GlobalRateBurstBytes, minRateLimitTokenBucketSize)
+		s.recvLim = xrate.NewLimiter(xrate.Limit(rc.GlobalRateLimitBytesPerSec), int(rc.GlobalRateBurstBytes))
+	} else {
+		s.recvLim = nil
+	}
+	s.rateConfig = rc
+	for _, cs := range s.clients {
+		cs.ForeachClient(func(c *sclient) {
+			c.setRateLimit(rc.PerClientRateLimitBytesPerSec, rc.PerClientRateBurstBytes, s.recvLim)
+		})
+	}
+	return rc
+}
+
 // HasMeshKey reports whether the server is configured with a mesh key.
 func (s *Server) HasMeshKey() bool { return !s.meshKey.IsZero() }
 
@@ -669,6 +760,8 @@ func (s *Server) ModifyTLSConfigToAddMetaCert(c *tls.Config) {
 func (s *Server) registerClient(c *sclient) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	c.setRateLimit(s.rateConfig.PerClientRateLimitBytesPerSec, s.rateConfig.PerClientRateBurstBytes, s.recvLim)
 
 	cs, ok := s.clients[c.key]
 	if !ok {
@@ -943,7 +1036,7 @@ func (s *Server) accept(ctx context.Context, nc derp.Conn, brw *bufio.ReadWriter
 		br:             br,
 		bw:             bw,
 		logf:           logger.WithPrefix(s.logf, fmt.Sprintf("derp client %v%s: ", remoteAddr, clientKey.ShortString())),
-		done:           ctx.Done(),
+		ctx:            ctx,
 		remoteIPPort:   remoteIPPort,
 		connectedAt:    s.clock.Now(),
 		sendQueue:      make(chan pkt, s.perClientSendQueueDepth),
@@ -1027,6 +1120,13 @@ func (c *sclient) run(ctx context.Context) error {
 			}
 			return fmt.Errorf("client %s: readFrameHeader: %w", c.key.ShortString(), err)
 		}
+		// Rate-limit by DERP frame length (fl), which excludes TLS protocol and
+		// DERP frame length field overheads.
+		// Note: meshed clients are exempt from rate limits.
+		if err := c.rateLimit(int(fl)); err != nil {
+			return err // context canceled, connection closing
+		}
+
 		c.s.noteClientActivity(c)
 		switch ft {
 		case derp.FrameNotePreferred:
@@ -1096,6 +1196,7 @@ func (c *sclient) handleFramePing(ft derp.FrameType, fl uint32) error {
 	if extra := int64(fl) - int64(len(m)); extra > 0 {
 		_, err = io.CopyN(io.Discard, c.br, extra)
 	}
+
 	select {
 	case c.sendPongCh <- [8]byte(m):
 	default:
@@ -1139,7 +1240,7 @@ func (c *sclient) handleFrameClosePeer(ft derp.FrameType, fl uint32) error {
 
 // handleFrameForwardPacket reads a "forward packet" frame from the client
 // (which must be a trusted client, a peer in our mesh).
-func (c *sclient) handleFrameForwardPacket(ft derp.FrameType, fl uint32) error {
+func (c *sclient) handleFrameForwardPacket(_ derp.FrameType, fl uint32) error {
 	if !c.canMesh {
 		return fmt.Errorf("insufficient permissions")
 	}
@@ -1182,7 +1283,7 @@ func (c *sclient) handleFrameForwardPacket(ft derp.FrameType, fl uint32) error {
 }
 
 // handleFrameSendPacket reads a "send packet" frame from the client.
-func (c *sclient) handleFrameSendPacket(ft derp.FrameType, fl uint32) error {
+func (c *sclient) handleFrameSendPacket(_ derp.FrameType, fl uint32) error {
 	s := c.s
 
 	dstKey, contents, err := s.recvPacket(c.br, fl)
@@ -1233,6 +1334,104 @@ func (c *sclient) handleFrameSendPacket(ft derp.FrameType, fl uint32) error {
 		src:        c.key,
 	}
 	return c.sendPkt(dst, p)
+}
+
+// setRateLimit updates the receive rate limiter. When bytesPerSec is 0 and parent is nil, or the
+// client is a mesh peer, the limiter is set to nil so that [sclient.rateLimit] is a no-op.
+func (c *sclient) setRateLimit(bytesPerSec, burst uint64, parent *xrate.Limiter) {
+	if c.canMesh || (bytesPerSec == 0 && parent == nil) {
+		c.recvLim.Store(nil)
+		return
+	}
+	var child *xrate.Limiter
+	if bytesPerSec != 0 {
+		child = xrate.NewLimiter(xrate.Limit(bytesPerSec), int(burst))
+	}
+	lim := &parentChildTokenBuckets{
+		parent: parent,
+		child:  child,
+	}
+	c.recvLim.Store(lim)
+}
+
+// rateLimitWait is a reimplementation of [xrate.Limiter.WaitN] via [xrate.Limiter.ReserveN].
+// It returns the duration waited for tokens to become available.
+func rateLimitWait(ctx context.Context, lim *xrate.Limiter, n int, now time.Time, newTimer func(time.Duration) (<-chan time.Time, func() bool)) (time.Duration, error) {
+	r := lim.ReserveN(now, n)
+	if !r.OK() {
+		return 0, fmt.Errorf("rate: Wait(n=%d) exceeds limiter's burst %d", n, lim.Burst())
+	}
+	delay := r.DelayFrom(now)
+	if delay == 0 {
+		return 0, nil
+	}
+	ch, stop := newTimer(delay)
+	defer stop()
+	select {
+	case <-ch:
+		// Note: We return the predicted delay as wall-clock duration. May be not the same.
+		return delay, nil
+	case <-ctx.Done():
+		r.Cancel()
+		return 0, ctx.Err()
+	}
+}
+
+// rateLimit applies the receive rate limit.
+// Per-client rate limiting is applied before global.
+// The former lets us differentiate classes of service,
+// the latter sets the overall pace of reading.
+// By limiting here we prevent reading from the buffered reader
+// [sclient.br] if the limit has been exceeded. Any reads done here provide space
+// within the buffered reader to fill back in with data from
+// the TCP socket. Pacing reads acts as a form of natural
+// backpressure via TCP flow control.
+// When rate limiting is disabled or the client is a mesh peer, recvLim is nil
+// and this is a no-op.
+func (c *sclient) rateLimit(n int) error {
+	if lim := c.recvLim.Load(); lim != nil {
+		newTimer := func(d time.Duration) (<-chan time.Time, func() bool) {
+			tc, ch := c.s.clock.NewTimer(d)
+			return ch, tc.Stop
+		}
+		// If n exceeds the capacity of the bucket, then WaitN will return
+		// an error and consume zero tokens. To prevent this, clamp n to
+		// [minRateLimitTokenBucketSize].
+		//
+		// While we could call WaitN multiple times and/or more precisely for
+		// lim.Burst(), it's better to return early as a larger DERP frame:
+		//   1. is unexpected
+		//   2. is only partially read off the socket (bufio)
+		//   3. would cause the connection to close shortly after rate limiting, anyway.
+		clampedN := min(n, minRateLimitTokenBucketSize)
+		now := c.s.clock.Now()
+		var (
+			durationWaited time.Duration
+			err            error
+		)
+		if lim.child != nil {
+			durationWaited, err = rateLimitWait(c.ctx, lim.child, clampedN, now, newTimer)
+			if err != nil {
+				return err
+			}
+			if durationWaited > 0 {
+				c.s.rateLimitPerClientWaited.Add(1)
+			}
+		}
+		if lim.parent != nil {
+			if durationWaited > 0 {
+				now = c.s.clock.Now() // update 'now' if we already waited
+			}
+			durationWaited, err = rateLimitWait(c.ctx, lim.parent, clampedN, now, newTimer)
+			if err != nil {
+				return err
+			}
+			if durationWaited > 0 {
+				c.s.rateLimitGlobalWaited.Add(1)
+			}
+		}
+	}
+	return nil
 }
 
 func (c *sclient) debugLogf(format string, v ...any) {
@@ -1296,7 +1495,7 @@ func (c *sclient) sendPkt(dst *sclient, p pkt) error {
 	}
 	for attempt := range 3 {
 		select {
-		case <-dst.done:
+		case <-dst.ctx.Done():
 			s.recordDrop(p.bs, c.key, dstKey, dropReasonGoneDisconnected)
 			dst.debugLogf("sendPkt attempt %d dropped, dst gone", attempt)
 			return nil
@@ -1341,7 +1540,7 @@ func (c *sclient) requestPeerGoneWrite(peer key.NodePublic, reason derp.PeerGone
 		peer:   peer,
 		reason: reason,
 	}:
-	case <-c.done:
+	case <-c.ctx.Done():
 	}
 }
 
@@ -1523,7 +1722,7 @@ func (s *Server) sendServerInfo(bw *lazyBufioWriter, clientKey key.NodePublic) e
 	return bw.Flush()
 }
 
-// recvClientKey reads the frameClientInfo frame from the client (its
+// recvClientKey reads the FrameClientInfo frame from the client (its
 // proof of identity) upon its initial connection. It should be
 // considered especially untrusted at this point.
 func (s *Server) recvClientKey(br *bufio.Reader) (clientKey key.NodePublic, info *derp.ClientInfo, err error) {
@@ -1626,7 +1825,7 @@ type sclient struct {
 	key            key.NodePublic
 	info           derp.ClientInfo
 	logf           logger.Logf
-	done           <-chan struct{}  // closed when connection closes
+	ctx            context.Context  // closed when connection closes
 	remoteIPPort   netip.AddrPort   // zero if remoteAddr is not ip:port.
 	sendQueue      chan pkt         // packets queued to this client; never closed
 	discoSendQueue chan pkt         // important packets queued to this client; never closed
@@ -1666,6 +1865,23 @@ type sclient struct {
 	// client that it's trying to establish a direct connection
 	// through us with a peer we have no record of.
 	peerGoneLim *rate.Limiter
+
+	// recvLim is the receive rate limiter. When rate limiting is enabled for a
+	// non-mesh client, it points to a [parentChildTokenBuckets]. When rate limiting
+	// is disabled or the client is a mesh peer, it is nil and [sclient.rateLimit]
+	// is a no-op. Updated atomically by [sclient.setRateLimit] so that
+	// [sclient.rateLimit] can load it without holding [Server.mu].
+	recvLim atomic.Pointer[parentChildTokenBuckets]
+}
+
+// parentChildTokenBuckets contains a parent and child token bucket for the
+// purpose of applying in a hierarchical topology.
+//
+// TODO: consider porting the required APIs from [xrate.Limiter] to [rate.Limiter],
+// which is already optimized to use [mono.Time].
+type parentChildTokenBuckets struct {
+	parent *xrate.Limiter // parent may be nil
+	child  *xrate.Limiter // child may be nil
 }
 
 func (c *sclient) presentFlags() derp.PeerPresentFlags {
@@ -2206,7 +2422,7 @@ func (s *Server) expVarFunc(f func() any) expvar.Func {
 }
 
 // ExpVar returns an expvar variable suitable for registering with expvar.Publish.
-func (s *Server) ExpVar() expvar.Var {
+func (s *Server) ExpVar(rateLimitEnabled bool) expvar.Var {
 	m := new(metrics.Set)
 	m.Set("gauge_memstats_sys0", expvar.Func(func() any { return int64(s.memSys0) }))
 	m.Set("gauge_watchers", s.expVarFunc(func() any { return len(s.watchers) }))
@@ -2249,6 +2465,25 @@ func (s *Server) ExpVar() expvar.Var {
 	var expvarVersion expvar.String
 	expvarVersion.Set(version.Long())
 	m.Set("version", &expvarVersion)
+	if rateLimitEnabled {
+		// Rate limiting is currently experimental, its APIs are unstable, and it must
+		// be opted-in via --rate-config. Therefore, we only publish related metrics
+		// on demand, to avoid polluting uninterested metrics consumers.
+		m.Set("rate_limit_per_client_bytes_per_second", s.expVarFunc(func() any {
+			return s.rateConfig.PerClientRateLimitBytesPerSec
+		}))
+		m.Set("rate_limit_per_client_burst_bytes", s.expVarFunc(func() any {
+			return s.rateConfig.PerClientRateBurstBytes
+		}))
+		m.Set("rate_limit_global_bytes_per_second", s.expVarFunc(func() any {
+			return s.rateConfig.GlobalRateLimitBytesPerSec
+		}))
+		m.Set("rate_limit_global_burst_bytes", s.expVarFunc(func() any {
+			return s.rateConfig.GlobalRateBurstBytes
+		}))
+		m.Set("rate_limit_per_client_waited", &s.rateLimitPerClientWaited)
+		m.Set("rate_limit_global_waited", &s.rateLimitGlobalWaited)
+	}
 	return m
 }
 

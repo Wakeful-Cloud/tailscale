@@ -9,6 +9,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -232,12 +233,36 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			return
 		}
+	case "peer-disco-keys":
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(h.b.DebugPeerDiscoKeys())
+		if err == nil {
+			return
+		}
 	case "rotate-disco-key":
 		err = h.b.DebugRotateDiscoKey()
 	case "statedir":
 		root := h.b.TailscaleVarRoot()
 		w.Header().Set("Content-Type", "application/json")
 		err = json.NewEncoder(w).Encode(root)
+		if err == nil {
+			return
+		}
+	case "clear-netmap-cache":
+		h.b.ClearNetmapCache(r.Context())
+	case "current-netmap":
+		// Return the current netmap (with peers populated) as JSON. This
+		// is a debug-only path: the netmap.NetworkMap shape is an
+		// internal type and may change without notice. Production
+		// callers should fetch the narrower bits they need via their
+		// own LocalAPI methods instead.
+		nm := h.b.NetMapWithPeers()
+		if nm == nil {
+			err = errors.New("no netmap")
+			break
+		}
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(nm)
 		if err == nil {
 			return
 		}
@@ -276,7 +301,7 @@ func (h *Handler) serveDebugPacketFilterRules(w http.ResponseWriter, r *http.Req
 		http.Error(w, "debug access denied", http.StatusForbidden)
 		return
 	}
-	nm := h.b.NetMap()
+	nm := h.b.NetMapNoPeers()
 	if nm == nil {
 		http.Error(w, "no netmap", http.StatusNotFound)
 		return
@@ -293,7 +318,7 @@ func (h *Handler) serveDebugPacketFilterMatches(w http.ResponseWriter, r *http.R
 		http.Error(w, "debug access denied", http.StatusForbidden)
 		return
 	}
-	nm := h.b.NetMap()
+	nm := h.b.NetMapNoPeers()
 	if nm == nil {
 		http.Error(w, "no netmap", http.StatusNotFound)
 		return

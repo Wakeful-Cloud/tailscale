@@ -769,7 +769,7 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			args: upArgsT{
 				exitNodeIP: "foo",
 			},
-			wantErr: `invalid value "foo" for --exit-node; must be IP or unique node name`,
+			wantErr: `invalid value "foo" for --exit-node; must be IP or hostname`,
 		},
 		{
 			name: "error_exit_node_allow_lan_without_exit_node",
@@ -779,11 +779,43 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			wantErr: `--exit-node-allow-lan-access can only be used with --exit-node`,
 		},
 		{
-			name: "error_tag_prefix",
+			name: "error_tag_bad_prefix",
 			args: upArgsT{
-				advertiseTags: "foo",
+				advertiseTags: "notatag:foo",
 			},
-			wantErr: `tag: "foo": tags must start with 'tag:'`,
+			wantErr: `tag: "notatag:foo": tags must start with 'tag:'`,
+		},
+		{
+			name: "tag_auto_prefix",
+			args: upArgsFromOSArgs("linux", "--advertise-tags=foo,bar"),
+			want: &ipn.Prefs{
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				CorpDNS:             true,
+				AdvertiseTags:       []string{"tag:foo", "tag:bar"},
+				NoSNAT:              false,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
+			},
+		},
+		{
+			name: "tag_mixed_prefix",
+			args: upArgsFromOSArgs("linux", "--advertise-tags=tag:foo,bar"),
+			want: &ipn.Prefs{
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				CorpDNS:             true,
+				AdvertiseTags:       []string{"tag:foo", "tag:bar"},
+				NoSNAT:              false,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
+			},
 		},
 		{
 			name: "error_long_hostname",
@@ -1533,13 +1565,13 @@ func TestParseNLArgs(t *testing.T) {
 			parseDisablements: true,
 		},
 		{
-			name:      "key no votes",
+			name:      "key-no-votes",
 			input:     []string{"nlpub:" + strings.Repeat("00", 32)},
 			parseKeys: true,
 			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 1, Public: bytes.Repeat([]byte{0}, 32)}},
 		},
 		{
-			name:      "key with votes",
+			name:      "key-with-votes",
 			input:     []string{"nlpub:" + strings.Repeat("01", 32) + "?5"},
 			parseKeys: true,
 			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 5, Public: bytes.Repeat([]byte{1}, 32)}},
@@ -1551,13 +1583,13 @@ func TestParseNLArgs(t *testing.T) {
 			wantDisablements:  [][]byte{bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)},
 		},
 		{
-			name:      "disablements not allowed",
+			name:      "disablements-not-allowed",
 			input:     []string{"disablement:" + strings.Repeat("02", 32)},
 			parseKeys: true,
 			wantErr:   fmt.Errorf("parsing key 1: key hex string doesn't have expected type prefix tlpub:"),
 		},
 		{
-			name:              "keys not allowed",
+			name:              "keys-not-allowed",
 			input:             []string{"nlpub:" + strings.Repeat("02", 32)},
 			parseDisablements: true,
 			wantErr:           fmt.Errorf("parsing argument 1: expected value with \"disablement:\" or \"disablement-secret:\" prefix, got %q", "nlpub:0202020202020202020202020202020202020202020202020202020202020202"),
@@ -1618,7 +1650,7 @@ func TestNoDups(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := newRootCmd()
+			cmd := newRootCmd(t)
 			makeQuietContinueOnError(cmd)
 			err := cmd.Parse(tt.args)
 			if got := fmt.Sprint(err); got != tt.want {

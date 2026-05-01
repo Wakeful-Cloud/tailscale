@@ -6,7 +6,6 @@
 package dns
 
 import (
-	"maps"
 	"net/netip"
 
 	"tailscale.com/types/dnstype"
@@ -34,8 +33,18 @@ func (src *Config) Clone() *Config {
 	}
 	if dst.Routes != nil {
 		dst.Routes = map[dnsname.FQDN][]*dnstype.Resolver{}
-		for k := range src.Routes {
-			dst.Routes[k] = append([]*dnstype.Resolver{}, src.Routes[k]...)
+		for k, sv := range src.Routes {
+			if sv == nil {
+				continue
+			}
+			dst.Routes[k] = make([]*dnstype.Resolver, len(sv))
+			for i := range sv {
+				if sv[i] == nil {
+					dst.Routes[k][i] = nil
+				} else {
+					dst.Routes[k][i] = sv[i].Clone()
+				}
+			}
 		}
 	}
 	dst.SearchDomains = append(src.SearchDomains[:0:0], src.SearchDomains...)
@@ -45,7 +54,7 @@ func (src *Config) Clone() *Config {
 			dst.Hosts[k] = append([]netip.Addr{}, src.Hosts[k]...)
 		}
 	}
-	dst.SubdomainHosts = maps.Clone(src.SubdomainHosts)
+	dst.SubdomainHosts = src.SubdomainHosts.Clone()
 	return dst
 }
 

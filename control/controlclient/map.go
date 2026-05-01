@@ -13,6 +13,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"net/netip"
 	"reflect"
 	"runtime"
 	"runtime/debug"
@@ -86,7 +87,6 @@ type mapSession struct {
 	lastPrintMap           time.Time
 	lastNode               tailcfg.NodeView
 	lastCapSet             set.Set[tailcfg.NodeCapability]
-	peers                  map[tailcfg.NodeID]tailcfg.NodeView
 	lastDNSConfig          *tailcfg.DNSConfig
 	lastDERPMap            *tailcfg.DERPMap
 	lastUserProfile        map[tailcfg.UserID]tailcfg.UserProfileView
@@ -106,6 +106,10 @@ type mapSession struct {
 	changeQueue            chan responseWithSource
 	changeQueueClosed      bool
 	processQueue           sync.WaitGroup
+
+	// mu protects the peers map.
+	peersMu sync.RWMutex
+	peers   map[tailcfg.NodeID]tailcfg.NodeView
 }
 
 // newMapSession returns a mostly unconfigured new mapSession.
@@ -294,7 +298,13 @@ func (ms *mapSession) handleNonKeepAliveMapResponse(ctx context.Context, resp *t
 
 	ms.patchifyPeersChanged(resp)
 
-	ms.removeUnwantedDiscoUpdates(resp)
+	ms.removeUnwantedDiscoUpdates(resp, viaTSMP)
+
+	// TSMP learned key was rejected, no need to do any more work in the engine.
+	if viaTSMP && len(resp.PeersChangedPatch) == 0 {
+		return nil
+	}
+	ms.removeUnwantedDiscoUpdatesFromFullNetmapUpdate(resp)
 
 	ms.updateStateFromResponse(resp)
 
@@ -402,8 +412,10 @@ type updateStats struct {
 
 // removeUnwantedDiscoUpdates goes over the patchified updates and reject items
 // where the node is offline and has last been seen before the recorded last seen.
-func (ms *mapSession) removeUnwantedDiscoUpdates(resp *tailcfg.MapResponse) {
-	existingMap := ms.netmap()
+func (ms *mapSession) removeUnwantedDiscoUpdates(resp *tailcfg.MapResponse, viaTSMP bool) {
+	ms.peersMu.RLock()
+	defer ms.peersMu.RUnlock()
+
 	acceptedDiscoUpdates := resp.PeersChangedPatch[:0]
 
 	for _, change := range resp.PeersChangedPatch {
@@ -415,6 +427,30 @@ func (ms *mapSession) removeUnwantedDiscoUpdates(resp *tailcfg.MapResponse) {
 			continue
 		}
 
+		existingNode, ok := ms.peers[change.NodeID]
+		// Accept if:
+		// - Cannot find the peer, don't have enough data.
+		if !ok {
+			acceptedDiscoUpdates = append(acceptedDiscoUpdates, change)
+			continue
+		}
+
+		// Reject if:
+		// - key was learned via tsmp AND,
+		// - existing node is online AND,
+		// - key did not change.
+		// Here to avoid a deeper reconfig in the case where we get a TSMP key
+		// exchange while that node is already in a connected state (from the view
+		// of the control plane). This is meant to keep the node stable, avoiding a
+		// reconfiguration of the node deeper down in the engine.
+		// With this, we are avoiding updating the LastSeen and Online fields from
+		// TSMP updates when that is not relevant, overall making the connection
+		// state change less, and updating the engine less.
+		if viaTSMP && existingNode.Online().Get() &&
+			*change.DiscoKey == existingNode.DiscoKey() {
+			continue
+		}
+
 		// Accept if:
 		// - Node is online.
 		if *change.Online {
@@ -422,24 +458,75 @@ func (ms *mapSession) removeUnwantedDiscoUpdates(resp *tailcfg.MapResponse) {
 			continue
 		}
 
-		peerIdx := existingMap.PeerIndexByNodeID(change.NodeID)
 		// Accept if:
-		// - Cannot find the peer, don't have enough data
-		if peerIdx < 0 {
-			acceptedDiscoUpdates = append(acceptedDiscoUpdates, change)
-			continue
-		}
-		existingNode := existingMap.Peers[peerIdx]
-
-		// Accept if:
-		// - lastSeen moved forward in time.
-		if existingLastSeen, ok := existingNode.LastSeen().GetOk(); ok &&
+		// - if we don't have a last seen to compare against on the existing node.
+		// - OR lastSeen moved forward in time.
+		if existingLastSeen, ok := existingNode.LastSeen().GetOk(); !ok ||
 			change.LastSeen.After(existingLastSeen) {
 			acceptedDiscoUpdates = append(acceptedDiscoUpdates, change)
 		}
 	}
 
 	resp.PeersChangedPatch = acceptedDiscoUpdates
+}
+
+// removeUnwantedDiscoUpdatesFromFullNetmapUpdate makes a pass over the full
+// set of peers in an update, usually only received when getting a full netmap
+// from control at startup. If the pass finds a peer with a disco key where the
+// local netmap has a newer key learned via TSMP, overwrite the update with the
+// key from TSMP.
+func (ms *mapSession) removeUnwantedDiscoUpdatesFromFullNetmapUpdate(resp *tailcfg.MapResponse) {
+	ms.peersMu.RLock()
+	defer ms.peersMu.RUnlock()
+
+	if len(resp.Peers) == 0 {
+		return
+	}
+	for _, peer := range resp.Peers {
+		if peer.DiscoKey.IsZero() {
+			continue
+		}
+
+		// Accept if:
+		// - peer is new
+		existingNode, ok := ms.peers[peer.ID]
+		if !ok {
+			continue
+		}
+
+		// Accept if:
+		// - disco key has not changed
+		if existingNode.DiscoKey() == peer.DiscoKey {
+			continue
+		}
+
+		// Accept if:
+		// - key has changed but peer is online
+		if peer.Online != nil && *peer.Online {
+			continue
+		}
+
+		// Accept if:
+		// - there's no last seen on the existing node
+		existingLastSeen, ok := existingNode.LastSeen().GetOk()
+		if !ok {
+			continue
+		}
+
+		// Accept if:
+		// - last seen on on control is higher
+		if peer.LastSeen != nil && peer.LastSeen.After(existingLastSeen) {
+			continue
+		}
+
+		// Overwrite the key and last seen in the full netmap update.
+		peer.DiscoKey = existingNode.DiscoKey()
+		if t, ok := existingNode.LastSeen().GetOk(); ok {
+			peer.LastSeen = new(t)
+		} else {
+			peer.LastSeen = nil
+		}
+	}
 }
 
 // updateStateFromResponse updates ms from res. It takes ownership of res.
@@ -615,6 +702,9 @@ var (
 // updatePeersStateFromResponseres updates ms.peers from resp.
 // It takes ownership of resp.
 func (ms *mapSession) updatePeersStateFromResponse(resp *tailcfg.MapResponse) (stats updateStats) {
+	ms.peersMu.Lock()
+	defer ms.peersMu.Unlock()
+
 	if ms.peers == nil {
 		ms.peers = make(map[tailcfg.NodeID]tailcfg.NodeView)
 	}
@@ -749,13 +839,22 @@ func (ms *mapSession) addUserProfile(nm *netmap.NetworkMap, userID tailcfg.UserI
 }
 
 var debugPatchifyPeer = envknob.RegisterBool("TS_DEBUG_PATCHIFY_PEER")
+var debugPatchifyPeerMiss = envknob.RegisterBool("TS_DEBUG_PATCHIFY_PEER_MISS")
+
+// patchifyMissOnFalse, if non-nil, is called with the field name when
+// patchifyPeer fails. It is set by an init func in map_debug.go.
+var patchifyMissOnFalse func(string)
 
 // patchifyPeersChanged mutates resp to promote PeersChanged entries to PeersChangedPatch
 // when possible.
 func (ms *mapSession) patchifyPeersChanged(resp *tailcfg.MapResponse) {
+	var onFalse func(string)
+	if debugPatchifyPeerMiss() {
+		onFalse = patchifyMissOnFalse
+	}
 	filtered := resp.PeersChanged[:0]
 	for _, n := range resp.PeersChanged {
-		if p, ok := ms.patchifyPeer(n); ok {
+		if p, ok := ms.patchifyPeer(n, onFalse); ok {
 			patchifiedPeer.Add(1)
 			if debugPatchifyPeer() {
 				patchj, _ := json.Marshal(p)
@@ -793,18 +892,27 @@ func getNodeFields() []string {
 //
 // It returns ok=false if a patch can't be made, (V, ok) on a delta, or (nil,
 // true) if all the fields were identical (a zero change).
-func (ms *mapSession) patchifyPeer(n *tailcfg.Node) (_ *tailcfg.PeerChange, ok bool) {
+func (ms *mapSession) patchifyPeer(n *tailcfg.Node, onFalse func(string)) (_ *tailcfg.PeerChange, ok bool) {
+	ms.peersMu.RLock()
+	defer ms.peersMu.RUnlock()
+
 	was, ok := ms.peers[n.ID]
 	if !ok {
+		if onFalse != nil {
+			onFalse("peer_not_found")
+		}
 		return nil, false
 	}
-	return peerChangeDiff(was, n)
+	return peerChangeDiff(was, n, onFalse)
 }
 
 // peerChangeDiff returns the difference from 'was' to 'n', if possible.
 //
 // It returns (nil, true) if the fields were identical.
-func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChange, ok bool) {
+func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node, onFalse func(string)) (_ *tailcfg.PeerChange, ok bool) {
+	if onFalse == nil {
+		onFalse = func(string) {}
+	}
 	var ret *tailcfg.PeerChange
 	pc := func() *tailcfg.PeerChange {
 		if ret == nil {
@@ -828,22 +936,27 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			// And it was never sent by any known control server.
 		case "ID":
 			if was.ID() != n.ID {
+				onFalse(field)
 				return nil, false
 			}
 		case "StableID":
 			if was.StableID() != n.StableID {
+				onFalse(field)
 				return nil, false
 			}
 		case "Name":
 			if was.Name() != n.Name {
+				onFalse(field)
 				return nil, false
 			}
 		case "User":
 			if was.User() != n.User {
+				onFalse(field)
 				return nil, false
 			}
 		case "Sharer":
 			if was.Sharer() != n.Sharer {
+				onFalse(field)
 				return nil, false
 			}
 		case "Key":
@@ -860,6 +973,7 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			}
 		case "Machine":
 			if was.Machine() != n.Machine {
+				onFalse(field)
 				return nil, false
 			}
 		case "DiscoKey":
@@ -868,10 +982,12 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			}
 		case "Addresses":
 			if !views.SliceEqual(was.Addresses(), views.SliceOf(n.Addresses)) {
+				onFalse(field)
 				return nil, false
 			}
 		case "AllowedIPs":
 			if !views.SliceEqual(was.AllowedIPs(), views.SliceOf(n.AllowedIPs)) {
+				onFalse(field)
 				return nil, false
 			}
 		case "Endpoints":
@@ -891,13 +1007,16 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				continue
 			}
 			if !was.Hostinfo().Valid() || !n.Hostinfo.Valid() {
+				onFalse(field)
 				return nil, false
 			}
 			if !was.Hostinfo().Equal(n.Hostinfo) {
+				onFalse(field)
 				return nil, false
 			}
 		case "Created":
 			if !was.Created().Equal(n.Created) {
+				onFalse(field)
 				return nil, false
 			}
 		case "Cap":
@@ -925,10 +1044,12 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			}
 		case "Tags":
 			if !views.SliceEqual(was.Tags(), views.SliceOf(n.Tags)) {
+				onFalse(field)
 				return nil, false
 			}
 		case "PrimaryRoutes":
 			if !views.SliceEqual(was.PrimaryRoutes(), views.SliceOf(n.PrimaryRoutes)) {
+				onFalse(field)
 				return nil, false
 			}
 		case "Online":
@@ -941,22 +1062,27 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 			}
 		case "MachineAuthorized":
 			if was.MachineAuthorized() != n.MachineAuthorized {
+				onFalse(field)
 				return nil, false
 			}
 		case "UnsignedPeerAPIOnly":
 			if was.UnsignedPeerAPIOnly() != n.UnsignedPeerAPIOnly {
+				onFalse(field)
 				return nil, false
 			}
 		case "IsWireGuardOnly":
 			if was.IsWireGuardOnly() != n.IsWireGuardOnly {
+				onFalse(field)
 				return nil, false
 			}
 		case "IsJailed":
 			if was.IsJailed() != n.IsJailed {
+				onFalse(field)
 				return nil, false
 			}
 		case "Expired":
 			if was.Expired() != n.Expired {
+				onFalse(field)
 				return nil, false
 			}
 		case "SelfNodeV4MasqAddrForThisPeer":
@@ -965,6 +1091,7 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				continue
 			}
 			if va, ok := va.GetOk(); !ok || vb == nil || va != *vb {
+				onFalse(field)
 				return nil, false
 			}
 		case "SelfNodeV6MasqAddrForThisPeer":
@@ -973,17 +1100,20 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 				continue
 			}
 			if va, ok := va.GetOk(); !ok || vb == nil || va != *vb {
+				onFalse(field)
 				return nil, false
 			}
 		case "ExitNodeDNSResolvers":
 			va, vb := was.ExitNodeDNSResolvers(), views.SliceOfViews(n.ExitNodeDNSResolvers)
 
 			if va.Len() != vb.Len() {
+				onFalse(field)
 				return nil, false
 			}
 
 			for i := range va.Len() {
 				if !va.At(i).Equal(vb.At(i)) {
+					onFalse(field)
 					return nil, false
 				}
 			}
@@ -996,7 +1126,28 @@ func peerChangeDiff(was tailcfg.NodeView, n *tailcfg.Node) (_ *tailcfg.PeerChang
 	return ret, true
 }
 
+// PeerIDAndKeyByTailscaleIP returns the node ID and node Key from the peers
+// map without touching the netmap itself. The implementation mirrors the
+// implementation of [netmap.PeerByTailscaleIP].
+func (ms *mapSession) PeerIDAndKeyByTailscaleIP(ip netip.Addr) (tailcfg.NodeID, key.NodePublic, bool) {
+	ms.peersMu.RLock()
+	defer ms.peersMu.RUnlock()
+	for _, n := range ms.peers {
+		ad := n.Addresses()
+		for i := range ad.Len() {
+			a := ad.At(i)
+			if a.Addr() == ip {
+				return n.ID(), n.Key(), true
+			}
+		}
+	}
+	return 0, key.NodePublic{}, false
+}
+
 func (ms *mapSession) sortedPeers() []tailcfg.NodeView {
+	ms.peersMu.RLock()
+	defer ms.peersMu.RUnlock()
+
 	ret := slicesx.MapValues(ms.peers)
 	slices.SortFunc(ret, func(a, b tailcfg.NodeView) int {
 		return cmp.Compare(a.ID(), b.ID())

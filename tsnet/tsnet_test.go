@@ -30,6 +30,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 )
@@ -940,6 +942,93 @@ func TestFunnelClose(t *testing.T) {
 	})
 }
 
+// setUpServiceState performs all necessary state setup for testing with a
+// Tailscale Service. When this function returns, the host will be able to
+// advertise a Service (via [Server.ListenService]) and the client will be able
+// to dial the Service via the Service name.
+//
+// extraSetup, when non-nil, can be used to perform additional state setup and
+// this state will be observable by client and host when this function returns.
+func setUpServiceState(t *testing.T, name, ip string, host, client *Server,
+	control *testcontrol.Server, extraSetup func(*testing.T, *testcontrol.Server)) {
+
+	t.Helper()
+	serviceName := tailcfg.ServiceName(name)
+	must.Do(serviceName.Validate())
+
+	// The Service host must have the 'service-host' capability, which
+	// is a mapping from the Service name to the Service VIP.
+	cm := host.lb.NetMap().SelfNode.CapMap()
+	svcIPMap := make(tailcfg.ServiceIPMappings)
+	if cm.Contains(tailcfg.NodeAttrServiceHost) {
+		parsed := must.Get(tailcfg.UnmarshalNodeCapViewJSON[tailcfg.ServiceIPMappings](cm, tailcfg.NodeAttrServiceHost))
+		if len(parsed) != 1 {
+			t.Fatalf("expected only one capability for %v, got %d", tailcfg.NodeAttrServiceHost, len(parsed))
+		}
+		svcIPMap = parsed[0]
+	}
+	svcIPMap[serviceName] = []netip.Addr{netip.MustParseAddr(ip)}
+	svcIPMapJSON := must.Get(json.Marshal(svcIPMap))
+	newCM := cm.AsMap()
+	mak.Set(&newCM, tailcfg.NodeAttrServiceHost, []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)})
+	control.SetNodeCapMap(host.lb.NodeKey(), newCM)
+
+	// The Service host must be allowed to advertise the Service VIP.
+	subnetRoutes := []netip.Prefix{netip.MustParsePrefix(ip + `/32`)}
+	selfAddresses := host.lb.NetMap().SelfNode.Addresses()
+	for _, existingRoute := range host.lb.NetMap().SelfNode.AllowedIPs().All() {
+		if views.SliceContains(selfAddresses, existingRoute) {
+			continue
+		}
+		subnetRoutes = append(subnetRoutes, existingRoute)
+	}
+	control.SetSubnetRoutes(host.lb.NodeKey(), subnetRoutes)
+
+	// The Service host must be a tagged node (any tag will do).
+	serviceHostNode := control.Node(host.lb.NodeKey())
+	serviceHostNode.Tags = append(serviceHostNode.Tags, "some-tag")
+	control.UpdateNode(serviceHostNode)
+
+	// The service client must accept routes advertised by other nodes
+	// (RouteAll is equivalent to --accept-routes).
+	must.Get(client.localClient.EditPrefs(t.Context(), &ipn.MaskedPrefs{
+		RouteAllSet: true,
+		Prefs: ipn.Prefs{
+			RouteAll: true,
+		},
+	}))
+
+	// Do the test's extra setup before configuring DNS. This allows
+	// us to use the configured DNS records as sentinel values when
+	// waiting for all of this setup to be visible to test nodes.
+	if extraSetup != nil {
+		extraSetup(t, control)
+	}
+
+	// Set up DNS for our Service.
+	control.AddDNSRecords(tailcfg.DNSRecord{
+		Name:  serviceName.WithoutPrefix() + "." + control.MagicDNSDomain,
+		Value: ip,
+	})
+
+	// Wait until both nodes have up-to-date netmaps before
+	// proceeding with the test.
+	netmapUpToDate := func(nm *netmap.NetworkMap) bool {
+		return nm != nil && slices.ContainsFunc(nm.DNS.ExtraRecords, func(r tailcfg.DNSRecord) bool {
+			return r.Value == ip
+		})
+	}
+	waitForLatestNetmap := func(t *testing.T, s *Server) {
+		t.Helper()
+		w := must.Get(s.localClient.WatchIPNBus(t.Context(), ipn.NotifyInitialNetMap))
+		defer w.Close()
+		for n := must.Get(w.Next()); !netmapUpToDate(n.NetMap); n = must.Get(w.Next()) {
+		}
+	}
+	waitForLatestNetmap(t, client)
+	waitForLatestNetmap(t, host)
+}
+
 func TestListenService(t *testing.T) {
 	tstest.Shard(t)
 
@@ -1207,81 +1296,19 @@ func TestListenService(t *testing.T) {
 			// We run each test with and without a TUN device ([Server.Tun]).
 			// Note that this TUN device is distinct from TUN mode for Services.
 			doTest := func(t *testing.T, withTUNDevice bool) {
-				ctx := t.Context()
-
 				lt := setupTwoClientTest(t, withTUNDevice)
 				serviceHost := lt.s2
 				serviceClient := lt.s1
-				control := lt.control
 
-				const serviceName = tailcfg.ServiceName("svc:foo")
+				const serviceName = "svc:foo"
 				const serviceVIP = "100.11.22.33"
 
-				// == Set up necessary state in our mock ==
+				setUpServiceState(t, serviceName, serviceVIP,
+					serviceHost, serviceClient, lt.control, tt.extraSetup)
 
-				// The Service host must have the 'service-host' capability, which
-				// is a mapping from the Service name to the Service VIP.
-				cm := serviceHost.lb.NetMap().SelfNode.CapMap().AsMap()
-				mak.Set(&cm, tailcfg.NodeAttrServiceHost, []tailcfg.RawMessage{
-					tailcfg.RawMessage(fmt.Sprintf(`{"%s": ["%s"]}`, serviceName, serviceVIP)),
-				})
-				control.SetNodeCapMap(serviceHost.lb.NodeKey(), cm)
-
-				// The Service host must be allowed to advertise the Service VIP.
-				control.SetSubnetRoutes(serviceHost.lb.NodeKey(), []netip.Prefix{
-					netip.MustParsePrefix(serviceVIP + `/32`),
-				})
-
-				// The Service host must be a tagged node (any tag will do).
-				serviceHostNode := control.Node(serviceHost.lb.NodeKey())
-				serviceHostNode.Tags = append(serviceHostNode.Tags, "some-tag")
-				control.UpdateNode(serviceHostNode)
-
-				// The service client must accept routes advertised by other nodes
-				// (RouteAll is equivalent to --accept-routes).
-				must.Get(serviceClient.localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
-					RouteAllSet: true,
-					Prefs: ipn.Prefs{
-						RouteAll: true,
-					},
-				}))
-
-				// Do the test's extra setup before configuring DNS. This allows
-				// us to use the configured DNS records as sentinel values when
-				// waiting for all of this setup to be visible to test nodes.
-				if tt.extraSetup != nil {
-					tt.extraSetup(t, control)
-				}
-
-				// Set up DNS for our Service.
-				control.AddDNSRecords(tailcfg.DNSRecord{
-					Name:  serviceName.WithoutPrefix() + "." + control.MagicDNSDomain,
-					Value: serviceVIP,
-				})
-
-				// Wait until both nodes have up-to-date netmaps before
-				// proceeding with the test.
-				netmapUpToDate := func(nm *netmap.NetworkMap) bool {
-					return nm != nil && slices.ContainsFunc(nm.DNS.ExtraRecords, func(r tailcfg.DNSRecord) bool {
-						return r.Value == serviceVIP
-					})
-				}
-				waitForLatestNetmap := func(t *testing.T, s *Server) {
-					t.Helper()
-					w := must.Get(s.localClient.WatchIPNBus(t.Context(), ipn.NotifyInitialNetMap))
-					defer w.Close()
-					for n := must.Get(w.Next()); !netmapUpToDate(n.NetMap); n = must.Get(w.Next()) {
-					}
-				}
-				waitForLatestNetmap(t, serviceClient)
-				waitForLatestNetmap(t, serviceHost)
-
-				// == Done setting up mock state ==
-
-				// Start the Service listeners.
 				listeners := make([]*ServiceListener, 0, len(tt.modes))
 				for _, input := range tt.modes {
-					ln := must.Get(serviceHost.ListenService(serviceName.String(), input))
+					ln := must.Get(serviceHost.ListenService(serviceName, input))
 					defer ln.Close()
 					listeners = append(listeners, ln)
 				}
@@ -1312,31 +1339,18 @@ func TestListenService(t *testing.T) {
 	t.Run("duplicate_listeners", func(t *testing.T) {
 		ctx := t.Context()
 
+		const serviceName = "svc:foo"
+
 		controlURL, control := startControl(t)
 		serviceHost, _, _ := startServer(t, ctx, controlURL, "service-host")
+		serviceClient, _, _ := startServer(t, ctx, controlURL, "service-client")
 
-		// Service hosts must be a tagged node (any tag will do).
-		serviceHostNode := control.Node(serviceHost.lb.NodeKey())
-		serviceHostNode.Tags = append(serviceHostNode.Tags, "some-tag")
-		control.UpdateNode(serviceHostNode)
+		setUpServiceState(t, serviceName, "1.2.3.4", serviceHost, serviceClient, control, nil)
 
-		// Wait for an up-to-date netmap before proceeding with the test.
-		netmapUpToDate := func(nm *netmap.NetworkMap) bool {
-			return nm != nil && nm.SelfNode.IsTagged()
-		}
-		waitForLatestNetmap := func(t *testing.T, s *Server) {
-			t.Helper()
-			w := must.Get(s.localClient.WatchIPNBus(t.Context(), ipn.NotifyInitialNetMap))
-			defer w.Close()
-			for n := must.Get(w.Next()); !netmapUpToDate(n.NetMap); n = must.Get(w.Next()) {
-			}
-		}
-		waitForLatestNetmap(t, serviceHost)
-
-		ln := must.Get(serviceHost.ListenService("svc:foo", ServiceModeTCP{Port: 8080}))
+		ln := must.Get(serviceHost.ListenService(serviceName, ServiceModeTCP{Port: 8080}))
 		defer ln.Close()
 
-		ln, err := serviceHost.ListenService("svc:foo", ServiceModeTCP{Port: 8080})
+		ln, err := serviceHost.ListenService(serviceName, ServiceModeTCP{Port: 8080})
 		if ln != nil {
 			ln.Close()
 		}
@@ -1345,7 +1359,7 @@ func TestListenService(t *testing.T) {
 		}
 
 		// An HTTP listener on the same port should also collide
-		ln, err = serviceHost.ListenService("svc:foo", ServiceModeHTTP{Port: 8080})
+		ln, err = serviceHost.ListenService(serviceName, ServiceModeHTTP{Port: 8080})
 		if ln != nil {
 			ln.Close()
 		}
@@ -1353,10 +1367,67 @@ func TestListenService(t *testing.T) {
 			t.Fatal("expected error for redundant listener")
 		}
 	})
+
+	t.Run("multiple_services", func(t *testing.T) {
+		const numberServices = 10
+		const port = 80
+
+		lt := setupTwoClientTest(t, false)
+		serviceHost := lt.s2
+		serviceClient := lt.s1
+
+		names := make([]string, numberServices)
+		fqdns := make([]string, numberServices)
+		for i := range numberServices {
+			serviceName := "svc:foo" + strconv.Itoa(i+1)
+			serviceIP := `11.22.33.` + strconv.Itoa(i+1)
+
+			setUpServiceState(t, serviceName, serviceIP, serviceHost, serviceClient, lt.control, nil)
+			ln := must.Get(serviceHost.ListenService(serviceName, ServiceModeTCP{Port: port}))
+			defer ln.Close()
+			names[i] = serviceName
+			fqdns[i] = ln.FQDN
+
+			go func() {
+				// Accept a single connection, echo, then return.
+				conn, err := ln.Accept()
+				if err != nil {
+					t.Errorf("accept error from %v: %v", serviceName, err)
+					return
+				}
+				defer conn.Close()
+				if _, err := io.Copy(conn, conn); err != nil {
+					t.Errorf("copy error from %v: %v", serviceName, err)
+				}
+			}()
+		}
+		for i := range numberServices {
+			msg := []byte("hello, " + fqdns[i])
+
+			conn := must.Get(serviceClient.Dial(t.Context(), "tcp", fqdns[i]+":"+strconv.Itoa(port)))
+			defer conn.Close()
+			must.Get(conn.Write(msg))
+			buf := make([]byte, len(msg))
+			n := must.Get(conn.Read(buf))
+			if !bytes.Equal(buf[:n], msg) {
+				t.Fatalf("did not receive expected message:\n\tgot: %s\n\twant: %s\n", buf[:n], msg)
+			}
+		}
+
+		// Each of the Services should be advertised by our Service host.
+		advertised := serviceHost.lb.Prefs().AdvertiseServices()
+		for _, name := range names {
+			if !views.SliceContains(advertised, name) {
+				t.Log("advertised Services:", advertised)
+				t.Fatalf("did not find %q in advertised Services", name)
+			}
+		}
+	})
 }
 
 func TestListenServiceClose(t *testing.T) {
 	tstest.Shard(t)
+	const serviceName = "svc:foo"
 
 	diffServeConfig := func(a, b ipn.ServeConfigView) string {
 		// We treat a mapping from svc:foo to nil or the zero value as if it
@@ -1387,7 +1458,7 @@ func TestListenServiceClose(t *testing.T) {
 			name: "TCP",
 			run: func(t *testing.T, s *Server) {
 				before := s.lb.ServeConfig()
-				ln := must.Get(s.ListenService("svc:foo", ServiceModeTCP{Port: 8080}))
+				ln := must.Get(s.ListenService(serviceName, ServiceModeTCP{Port: 8080}))
 				ln.Close()
 				after := s.lb.ServeConfig()
 				if diff := diffServeConfig(after, before); diff != "" {
@@ -1399,7 +1470,7 @@ func TestListenServiceClose(t *testing.T) {
 			name: "HTTP",
 			run: func(t *testing.T, s *Server) {
 				before := s.lb.ServeConfig()
-				ln := must.Get(s.ListenService("svc:foo", ServiceModeHTTP{Port: 8080}))
+				ln := must.Get(s.ListenService(serviceName, ServiceModeHTTP{Port: 8080}))
 				ln.Close()
 				after := s.lb.ServeConfig()
 				if diff := diffServeConfig(after, before); diff != "" {
@@ -1412,14 +1483,14 @@ func TestListenServiceClose(t *testing.T) {
 			name: "two_listeners",
 			run: func(t *testing.T, s *Server) {
 				// Start a listener on 443.
-				ln1 := must.Get(s.ListenService("svc:foo", ServiceModeTCP{Port: 443}))
+				ln1 := must.Get(s.ListenService(serviceName, ServiceModeTCP{Port: 443}))
 				defer ln1.Close()
 
 				// Save the serve config for this original listener.
 				before := s.lb.ServeConfig()
 
 				// Now start and close a new listener on a different port.
-				ln2 := must.Get(s.ListenService("svc:foo", ServiceModeTCP{Port: 8080}))
+				ln2 := must.Get(s.ListenService(serviceName, ServiceModeTCP{Port: 8080}))
 				ln2.Close()
 
 				// The serve config for the original listener should be intact.
@@ -1435,7 +1506,7 @@ func TestListenServiceClose(t *testing.T) {
 			// should be automatically closed).
 			name: "after_server_close",
 			run: func(t *testing.T, s *Server) {
-				ln := must.Get(s.ListenService("svc:foo", ServiceModeTCP{Port: 8080}))
+				ln := must.Get(s.ListenService(serviceName, ServiceModeTCP{Port: 8080}))
 
 				// Close the server, then close the listener.
 				must.Do(s.Close())
@@ -1449,35 +1520,64 @@ func TestListenServiceClose(t *testing.T) {
 				}
 			},
 		},
+		{
+			// Regression test for https://github.com/tailscale/tailscale/issues/19169,
+			// in which concurrent ServiceListener.Close calls (by different
+			// listeners) would fail.
+			name: "concurrent_close",
+			run: func(t *testing.T, s *Server) {
+				const concurrentCloseCalls = 100
+
+				readyGroup := new(sync.WaitGroup)
+				closedGroup := new(sync.WaitGroup)
+				closeThemAll := make(chan (struct{}))
+				errC := make(chan error, concurrentCloseCalls)
+				for i := range concurrentCloseCalls {
+					readyGroup.Add(1)
+					closedGroup.Add(1)
+					ln := must.Get(s.ListenService(serviceName, ServiceModeTCP{
+						Port: uint16(i + 1),
+					}))
+					go func() {
+						readyGroup.Done()
+						<-closeThemAll
+						errC <- ln.Close()
+						closedGroup.Done()
+					}()
+				}
+
+				readyGroup.Wait()
+				close(closeThemAll)
+				closedGroup.Wait()
+				close(errC)
+
+				var errs []error
+				for err := range errC {
+					if err != nil {
+						errs = append(errs, err)
+					}
+				}
+				if len(errs) > 0 {
+					t.Fatalf("%d close errors; sample: %v", len(errs), errs[0])
+				}
+				if diff := diffServeConfig(s.lb.ServeConfig(), (&ipn.ServeConfig{}).View()); diff != "" {
+					t.Fatalf("expected empty config (-got, +want):\n%s", diff)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
+
 			controlURL, control := startControl(t)
-			s, _, _ := startServer(t, ctx, controlURL, "service-host")
+			serviceHost, _, _ := startServer(t, ctx, controlURL, "service-host")
+			serviceClient, _, _ := startServer(t, ctx, controlURL, "service-client")
+			setUpServiceState(t, serviceName, "1.2.3.4", serviceHost, serviceClient, control, nil)
 
-			// Service hosts must be a tagged node (any tag will do).
-			serviceHostNode := control.Node(s.lb.NodeKey())
-			serviceHostNode.Tags = append(serviceHostNode.Tags, "some-tag")
-			control.UpdateNode(serviceHostNode)
-
-			// Wait for an up-to-date netmap before proceeding with the test.
-			netmapUpToDate := func(nm *netmap.NetworkMap) bool {
-				return nm != nil && nm.SelfNode.IsTagged()
-			}
-			waitForLatestNetmap := func(t *testing.T, s *Server) {
-				t.Helper()
-				w := must.Get(s.localClient.WatchIPNBus(t.Context(), ipn.NotifyInitialNetMap))
-				defer w.Close()
-				for n := must.Get(w.Next()); !netmapUpToDate(n.NetMap); n = must.Get(w.Next()) {
-				}
-			}
-			waitForLatestNetmap(t, s)
-
-			tt.run(t, s)
+			tt.run(t, serviceHost)
 		})
-
 	}
 }
 
@@ -2833,7 +2933,7 @@ func TestResolveAuthKey(t *testing.T) {
 		wantErrContains string
 	}{
 		{
-			name:           "successful resolution via OAuth client secret",
+			name:           "success-oauth-client-secret",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
 			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
@@ -2846,7 +2946,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "",
 		},
 		{
-			name:           "failing resolution via OAuth client secret",
+			name:           "fail-oauth-client-secret",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
 			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
@@ -2855,7 +2955,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "resolution failed",
 		},
 		{
-			name:         "successful resolution via federated ID token",
+			name:         "success-federated-id-token",
 			clientID:     "client-id-123",
 			idToken:      "id-token-456",
 			wifAvailable: true,
@@ -2872,7 +2972,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "",
 		},
 		{
-			name:         "successful resolution via federated audience",
+			name:         "success-federated-audience",
 			clientID:     "client-id-123",
 			audience:     "api.tailscale.com",
 			wifAvailable: true,
@@ -2889,7 +2989,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "",
 		},
 		{
-			name:         "failing resolution via federated ID token",
+			name:         "fail-federated-id-token",
 			clientID:     "client-id-123",
 			idToken:      "id-token-456",
 			wifAvailable: true,
@@ -2899,7 +2999,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "resolution failed",
 		},
 		{
-			name:         "empty client ID with ID token",
+			name:         "empty-client-id-with-token",
 			clientID:     "",
 			idToken:      "id-token-456",
 			wifAvailable: true,
@@ -2909,7 +3009,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "empty",
 		},
 		{
-			name:         "empty client ID with audience",
+			name:         "empty-client-id-with-audience",
 			clientID:     "",
 			audience:     "api.tailscale.com",
 			wifAvailable: true,
@@ -2919,7 +3019,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "empty",
 		},
 		{
-			name:         "empty ID token",
+			name:         "empty-id-token",
 			clientID:     "client-id-123",
 			idToken:      "",
 			wifAvailable: true,
@@ -2929,7 +3029,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "empty",
 		},
 		{
-			name:         "audience with ID token",
+			name:         "audience-with-id-token",
 			clientID:     "client-id-123",
 			idToken:      "id-token-456",
 			audience:     "api.tailscale.com",
@@ -2940,7 +3040,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "only one of ID token and audience",
 		},
 		{
-			name:           "workload identity resolution skipped if resolution via OAuth token succeeds",
+			name:           "wif-skipped-oauth-succeeds",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
 			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
@@ -2957,7 +3057,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "",
 		},
 		{
-			name:           "workload identity resolution skipped if resolution via OAuth token fails",
+			name:           "wif-skipped-oauth-fails",
 			clientID:       "tskey-client-id-123",
 			idToken:        "",
 			oauthAvailable: true,
@@ -2971,7 +3071,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "failed",
 		},
 		{
-			name:            "authkey set and no resolution available",
+			name:            "authkey-set-no-resolution",
 			authKey:         "tskey-auth-123",
 			oauthAvailable:  false,
 			wifAvailable:    false,
@@ -2979,14 +3079,14 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "",
 		},
 		{
-			name:            "no authkey set and no resolution available",
+			name:            "no-authkey-no-resolution",
 			oauthAvailable:  false,
 			wifAvailable:    false,
 			wantAuthKey:     "",
 			wantErrContains: "",
 		},
 		{
-			name:           "authkey is client secret and resolution via OAuth client secret succeeds",
+			name:           "authkey-client-secret-oauth-succeeds",
 			authKey:        "tskey-client-secret-123",
 			oauthAvailable: true,
 			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
@@ -2999,7 +3099,7 @@ func TestResolveAuthKey(t *testing.T) {
 			wantErrContains: "",
 		},
 		{
-			name:           "authkey is client secret but resolution via OAuth client secret fails",
+			name:           "authkey-client-secret-oauth-fails",
 			authKey:        "tskey-client-secret-123",
 			oauthAvailable: true,
 			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
@@ -3182,12 +3282,12 @@ func TestListenUnspecifiedAddr(t *testing.T) {
 
 	t.Run("Netstack", func(t *testing.T) {
 		lt := setupTwoClientTest(t, false)
-		t.Run("0.0.0.0", func(t *testing.T) { testUnspec(t, lt, "0.0.0.0:8080", "8080") })
+		t.Run("v4-unspec", func(t *testing.T) { testUnspec(t, lt, "0.0.0.0:8080", "8080") })
 		t.Run("::", func(t *testing.T) { testUnspec(t, lt, "[::]:8081", "8081") })
 	})
 	t.Run("TUN", func(t *testing.T) {
 		lt := setupTwoClientTest(t, true)
-		t.Run("0.0.0.0", func(t *testing.T) { testUnspec(t, lt, "0.0.0.0:8080", "8080") })
+		t.Run("v4-unspec", func(t *testing.T) { testUnspec(t, lt, "0.0.0.0:8080", "8080") })
 		t.Run("::", func(t *testing.T) { testUnspec(t, lt, "[::]:8081", "8081") })
 	})
 }

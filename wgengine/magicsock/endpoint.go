@@ -40,6 +40,11 @@ import (
 var mtuProbePingSizesV4 []int
 var mtuProbePingSizesV6 []int
 
+// discoKeyAdvertisementInterval tells how often a disco update via TSMP can
+// happen. The update is triggered via enqueueCallMeMaybe, and thus it will
+// only be sent if the magicsock is in a state to send out CallMeMaybe.
+const discoKeyAdvertisementInterval = time.Second * 60
+
 func init() {
 	for _, m := range tstun.WireMTUsToProbe {
 		mtuProbePingSizesV4 = append(mtuProbePingSizesV4, pktLenToPingSize(m, false))
@@ -80,7 +85,7 @@ type endpoint struct {
 	lastSendAny               mono.Time      // last time there were outgoing packets sent this peer from any trigger, internal or external to magicsock
 	lastFullPing              mono.Time      // last time we pinged all disco or wireguard only endpoints
 	lastUDPRelayPathDiscovery mono.Time      // last time we ran UDP relay path discovery
-	sentDiscoKeyAdvertisement bool           // whether we sent a TSMPDiscoAdvertisement or not to this endpoint
+	lastDiscoKeyAdvertisement mono.Time      // last time we sent a TSMPDiscoAdvertisement or not to this endpoint
 	derpAddr                  netip.AddrPort // fallback/bootstrap path, if non-zero (non-zero for well-behaved clients)
 
 	bestAddr           addrQuality // best non-DERP path; zero if none; mutate via setBestAddrLocked()
@@ -525,11 +530,6 @@ func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) bool {
 	elapsed := now.Sub(de.lastRecvWG.LoadAtomic())
 	if elapsed > 10*time.Second {
 		de.lastRecvWG.StoreAtomic(now)
-
-		if de.c.noteRecvActivity == nil {
-			return false
-		}
-		de.c.noteRecvActivity(de.publicKey)
 		return true
 	}
 	return false
@@ -892,7 +892,7 @@ func (de *endpoint) wantUDPRelayPathDiscoveryLocked(now mono.Time) bool {
 	if runtime.GOOS == "js" {
 		return false
 	}
-	if !de.c.hasPeerRelayServers.Load() {
+	if !de.c.relayManager.hasPeerRelayServers.Load() {
 		// Changes in this value between its access and a call to
 		// [endpoint.discoverUDPRelayPathsLocked] are fine, we will eventually
 		// do the "right" thing during future path discovery. The worst case is
@@ -1178,8 +1178,7 @@ func (de *endpoint) discoPingTimeout(txid stun.TxID) {
 		return
 	}
 	bestUntrusted := mono.Now().After(de.trustBestAddrUntil)
-	if sp.to == de.bestAddr.epAddr && sp.to.vni.IsSet() && bestUntrusted {
-		// TODO(jwhited): consider applying this to direct UDP paths as well
+	if sp.to == de.bestAddr.epAddr && bestUntrusted {
 		de.clearBestAddrLocked()
 	}
 	if debugDisco() || !de.bestAddr.ap.IsValid() || bestUntrusted {
@@ -1773,12 +1772,8 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 			latency: latency,
 			wireMTU: pingSizeToPktLen(sp.size, sp.to),
 		}
-		// TODO(jwhited): consider checking de.trustBestAddrUntil as well. If
-		//  de.bestAddr is untrusted we may want to clear it, otherwise we could
-		//  get stuck with a forever untrusted bestAddr that blackholes, since
-		//  we don't clear direct UDP paths on disco ping timeout (see
-		//  discoPingTimeout).
-		if betterAddr(thisPong, de.bestAddr) {
+		bestUntrusted := now.After(de.trustBestAddrUntil)
+		if betterAddr(thisPong, de.bestAddr) || bestUntrusted {
 			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
@@ -2093,7 +2088,7 @@ func (de *endpoint) setDERPHome(regionID uint16) {
 	de.mu.Lock()
 	defer de.mu.Unlock()
 	de.derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))
-	if de.c.hasPeerRelayServers.Load() {
+	if de.c.relayManager.hasPeerRelayServers.Load() {
 		de.c.relayManager.handleDERPHomeChange(de.publicKey, regionID)
 	}
 }

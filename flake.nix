@@ -48,14 +48,15 @@
   }: let
     goVersion = nixpkgs.lib.fileContents ./go.toolchain.version;
     toolChainRev = nixpkgs.lib.fileContents ./go.toolchain.rev;
-    gitHash = nixpkgs.lib.fileContents ./go.toolchain.rev.sri;
+    flakeHashes = builtins.fromJSON (builtins.readFile ./flakehashes.json);
+    gitHash = flakeHashes.toolchain.sri;
     eachSystem = f:
       nixpkgs.lib.genAttrs (import systems) (system:
         f (import nixpkgs {
           system = system;
           overlays = [
             (final: prev: {
-              go_1_26 = prev.go_1_26.overrideAttrs {
+              go_1_26 = prev.go_1_26.overrideAttrs (old: {
                 version = goVersion;
                 src = prev.fetchFromGitHub {
                   owner = "tailscale";
@@ -63,7 +64,19 @@
                   rev = toolChainRev;
                   sha256 = gitHash;
                 };
-              };
+                # The Tailscale Go fork carries a placeholder in
+                # src/runtime/debug/mod.go that must be replaced with
+                # the actual toolchain git rev at build time. Without
+                # this, binaries report an empty tailscale.toolchain.rev
+                # and the runtime assertion in
+                # assert_ts_toolchain_match.go panics.
+                postPatch =
+                  (old.postPatch or "")
+                  + ''
+                    substituteInPlace src/runtime/debug/mod.go \
+                      --replace-fail "TAILSCALE_GIT_REV_TO_BE_REPLACED_AT_BUILD_TIME" "${toolChainRev}"
+                  '';
+              });
             })
           ];
         }));
@@ -91,7 +104,7 @@
         name = "tailscale";
         pname = "tailscale";
         src = ./.;
-        vendorHash = pkgs.lib.fileContents ./go.mod.sri;
+        vendorHash = flakeHashes.vendor.sri;
         nativeBuildInputs = [pkgs.makeWrapper pkgs.installShellFiles];
         ldflags = ["-X tailscale.com/version.gitCommitStamp=${tailscaleRev}"];
         env.CGO_ENABLED = 0;
@@ -151,4 +164,4 @@
     });
   };
 }
-# nix-direnv cache busting line: sha256-39axT5Q0+fNTcMgZCMLMNfJEJN46wMaaKDgfI+Uj+Ps=
+# nix-direnv cache busting line: sha256-5zxCDQ12bu8dvJ51RCQk/m07oM2qNNrTB5cbb1Za/sc=

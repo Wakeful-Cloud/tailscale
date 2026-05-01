@@ -154,6 +154,60 @@ func TestMapWithPointers(t *testing.T) {
 	}
 }
 
+func TestNamedMapContainer(t *testing.T) {
+	orig := &clonerex.NamedMapContainer{
+		Attrs: clonerex.NamedMap{
+			"str":  "hello",
+			"num":  int64(42),
+			"bool": true,
+		},
+	}
+
+	cloned := orig.Clone()
+	if !reflect.DeepEqual(orig, cloned) {
+		t.Errorf("Clone() = %v, want %v", cloned, orig)
+	}
+
+	// Mutate the cloned map to verify no aliasing.
+	cloned.Attrs["str"] = "modified"
+	if orig.Attrs["str"] == "modified" {
+		t.Errorf("Clone() aliased memory in Attrs: original was modified")
+	}
+
+	// Verify nil handling.
+	nilContainer := &clonerex.NamedMapContainer{}
+	nilClone := nilContainer.Clone()
+	if !reflect.DeepEqual(nilContainer, nilClone) {
+		t.Errorf("Clone() of nil Attrs = %v, want %v", nilClone, nilContainer)
+	}
+}
+
+func TestMapSlicePointerContainer(t *testing.T) {
+	num := 42
+	orig := &clonerex.MapSlicePointerContainer{
+		Routes: map[string][]*clonerex.SliceContainer{
+			"route1": {
+				{Slice: []*int{&num}},
+				{Slice: []*int{&num, &num}},
+			},
+			"route2": {
+				{Slice: []*int{&num}},
+			},
+		},
+	}
+
+	cloned := orig.Clone()
+	if !reflect.DeepEqual(orig, cloned) {
+		t.Errorf("Clone() = %v, want %v", cloned, orig)
+	}
+
+	// Mutate cloned.Routes pointer values
+	*cloned.Routes["route1"][0].Slice[0] = 999
+	if *orig.Routes["route1"][0].Slice[0] == 999 {
+		t.Errorf("Clone() aliased memory in Routes: original was modified")
+	}
+}
+
 func TestDeeplyNestedMap(t *testing.T) {
 	num := 123
 	orig := &clonerex.DeeplyNestedMap{

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,7 +28,6 @@ import (
 	"golang.org/x/mod/modfile"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/tailscale"
-	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -75,7 +77,7 @@ func newNatTest(tb testing.TB) *natTest {
 		cmd.Stderr = os.Stderr
 		cmd.Stdout = os.Stdout
 		if err := cmd.Run(); err != nil {
-			tb.Fatalf("Error running 'make natlab' in gokrazy directory")
+			tb.Fatalf("Error running 'make natlab' in gokrazy directory: %v", err)
 		}
 		if _, err := os.Stat(nt.base); err != nil {
 			tb.Skipf("still can't find VM image: %v", err)
@@ -194,6 +196,22 @@ func sameLAN(c *vnet.Config) *vnet.Node {
 	return c.AddNode(nw)
 }
 
+func sameLANNoDropCGNAT(c *vnet.Config) *vnet.Node {
+	nw := c.FirstNetwork()
+	if nw == nil {
+		return nil
+	}
+	if !nw.CanTakeMoreNodes() {
+		return nil
+	}
+	return c.AddNode(
+		nw,
+		tailcfg.NodeCapMap{
+			tailcfg.NodeAttrDisableLinuxCGNATDropRule: nil,
+		},
+	)
+}
+
 func one2one(c *vnet.Config) *vnet.Node {
 	n := c.NumNodes() + 1
 	return c.AddNode(c.AddNetwork(
@@ -278,7 +296,7 @@ func hardPMP(c *vnet.Config) *vnet.Node {
 		fmt.Sprintf("10.7.%d.1/24", n), vnet.HardNAT, vnet.NATPMP))
 }
 
-func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
+func (nt *natTest) setupTest(ctx context.Context, addNode ...addNodeFunc) (nodes []*vnet.Node, clients []*vnet.NodeAgentClient, cleanup func()) {
 	if len(addNode) < 1 || len(addNode) > 2 {
 		nt.tb.Fatalf("runTest: invalid number of nodes %v; want 1 or 2", len(addNode))
 	}
@@ -286,7 +304,6 @@ func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
 
 	var c vnet.Config
 	c.SetPCAPFile(*pcapFile)
-	nodes := []*vnet.Node{}
 	for _, fn := range addNode {
 		node := fn(&c)
 		if node == nil {
@@ -327,6 +344,15 @@ func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
 		}
 	})
 
+	haveKVM := false
+	if runtime.GOOS == "linux" {
+		if f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0); err == nil {
+			f.Close()
+			haveKVM = true
+		}
+	}
+
+	qmpSocks := make([]string, len(nodes))
 	for i, node := range nodes {
 		disk := fmt.Sprintf("%s/node-%d.qcow2", nt.tempDir, i)
 		out, err := exec.Command("qemu-img", "create",
@@ -349,22 +375,28 @@ func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
 		}
 		envStr := envBuf.String()
 
-		cmd := exec.Command("qemu-system-x86_64",
+		qmpSocks[i] = fmt.Sprintf("%s/qmp-node-%d.sock", nt.tempDir, i)
+		qemuArgs := []string{
 			"-M", "microvm,isa-serial=off",
 			"-m", "384M",
 			"-nodefaults", "-no-user-config", "-nographic",
 			"-kernel", nt.kernel,
-			"-append", "console=hvc0 root=PARTUUID=60c24cc1-f3f9-427a-8199-76baa2d60001/PARTNROFF=1 ro init=/gokrazy/init panic=10 oops=panic pci=off nousb tsc=unstable clocksource=hpet gokrazy.remote_syslog.target="+sysLogAddr+" tailscale-tta=1"+envStr,
-			"-drive", "id=blk0,file="+disk+",format=qcow2",
+			"-append", "console=hvc0 root=PARTUUID=60c24cc1-f3f9-427a-8199-76baa2d60001/PARTNROFF=1 ro init=/gokrazy/init panic=10 oops=panic pci=off nousb gokrazy.remote_syslog.target=" + sysLogAddr + " tailscale-tta=1" + envStr,
+			"-drive", "id=blk0,file=" + disk + ",format=qcow2",
 			"-device", "virtio-blk-device,drive=blk0",
-			"-netdev", "stream,id=net0,addr.type=unix,addr.path="+sockAddr,
+			"-netdev", "stream,id=net0,addr.type=unix,addr.path=" + sockAddr,
 			"-device", "virtio-serial-device",
 			"-device", "virtio-rng-device",
-			"-device", "virtio-net-device,netdev=net0,mac="+node.MAC().String(),
+			"-device", "virtio-net-device,netdev=net0,mac=" + node.MAC().String(),
 			"-chardev", "stdio,id=virtiocon0,mux=on",
 			"-device", "virtconsole,chardev=virtiocon0",
 			"-mon", "chardev=virtiocon0,mode=readline",
-		)
+			"-qmp", "unix:" + qmpSocks[i] + ",server=on,wait=off",
+		}
+		if haveKVM {
+			qemuArgs = append(qemuArgs, "-enable-kvm", "-cpu", "host")
+		}
+		cmd := exec.Command("qemu-system-x86_64", qemuArgs...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
@@ -376,16 +408,20 @@ func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
 		})
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	for i, node := range nodes {
+		if err := nt.vnet.AwaitFirstPacket(ctx, node.MAC()); err != nil {
+			t.Logf("node %v: no boot progress (no packets received): %v", node, err)
+			t.Logf("node %v: QMP status: %s", node, qmpQueryStatus(qmpSocks[i]))
+			t.FailNow()
+		}
+		t.Logf("node %v: boot detected (first packet received)", node)
+	}
 
-	var clients []*vnet.NodeAgentClient
 	for _, n := range nodes {
 		client := nt.vnet.NodeAgentClient(n)
 		n.SetClient(client)
 		clients = append(clients, client)
 	}
-	sts := make([]*ipnstate.Status, len(nodes))
 
 	var eg errgroup.Group
 	for i, c := range clients {
@@ -405,21 +441,31 @@ func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
 				t.Logf("%v firewalled", node)
 			}
 
-			if err := up(ctx, c); err != nil {
-				return fmt.Errorf("%v up: %w", node, err)
-			}
-			t.Logf("%v up!", node)
+			if node.ShouldJoinTailnet() {
+				if err := up(ctx, c); err != nil {
+					return fmt.Errorf("%v up: %w", node, err)
+				}
+				t.Logf("%v up!", node)
 
-			st, err = c.Status(ctx)
-			if err != nil {
-				return fmt.Errorf("%v status: %w", node, err)
-			}
-			sts[i] = st
+				st, err = c.Status(ctx)
+				if err != nil {
+					return fmt.Errorf("%v status: %w", node, err)
+				}
 
-			if st.BackendState != "Running" {
-				return fmt.Errorf("%v state = %q", node, st.BackendState)
+				if capMap := node.WantCapMap(); capMap != nil {
+					nt.tb.Logf("using capmap for %s: %+v", node.String(), capMap)
+					nt.vnet.ControlServer().SetNodeCapMap(st.Self.PublicKey, capMap)
+				}
+
+				if st.BackendState != "Running" {
+					return fmt.Errorf("%v state = %q", node, st.BackendState)
+				}
+
+				t.Logf("%v AllowedIPs: %v", node, st.Self.Addrs)
+				t.Logf("%v up with %v", node, st.Self.TailscaleIPs)
+			} else {
+				t.Logf("%v skipping joining tailnet", node)
 			}
-			t.Logf("%v up with %v", node, sts[i].Self.TailscaleIPs)
 			return nil
 		})
 	}
@@ -427,14 +473,88 @@ func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
 		t.Fatalf("initial setup: %v", err)
 	}
 
-	defer nt.vnet.Close()
+	return nodes, clients, nt.vnet.Close
+}
+
+type hasDeadline interface {
+	Deadline() (deadline time.Time, ok bool)
+}
+
+// testContext returns a context derived from the test's deadline (from -timeout),
+// leaving a small margin for cleanup. Falls back to 60s if no deadline is set.
+func testContext(tb testing.TB) (context.Context, context.CancelFunc) {
+	if t, ok := tb.(hasDeadline); ok {
+		if dl, ok := t.Deadline(); ok {
+			const margin = 5 * time.Second
+			return context.WithDeadline(context.Background(), dl.Add(-margin))
+		}
+	}
+	return context.WithTimeout(context.Background(), 60*time.Second)
+}
+
+func (nt *natTest) runHostConnectivityTest(addNode ...addNodeFunc) bool {
+	ctx, cancel := testContext(nt.tb)
+	defer cancel()
+	nodes, clients, cleanup := nt.setupTest(ctx, addNode...)
+	defer cleanup()
+
+	if len(nodes) != 2 {
+		nt.tb.Logf("ping can only be done among exactly two nodes")
+		return false
+	}
+	var fromClient, toClient *vnet.NodeAgentClient
+	for i, n := range nodes {
+		if n.ShouldJoinTailnet() && fromClient == nil {
+			fromClient = clients[i]
+		} else {
+			toClient = clients[i]
+		}
+	}
+	got, err := sendHostNetworkPing(ctx, nt.tb, fromClient, toClient)
+	if err != nil {
+		nt.tb.Fatalf("ping host: %v", err)
+	}
+	nt.tb.Logf("ping success: %v", got)
+	return got
+}
+
+func (nt *natTest) runTailscaleConnectivityTest(addNode ...addNodeFunc) pingRoute {
+	ctx, cancel := testContext(nt.tb)
+	defer cancel()
+
+	nodes, clients, cleanup := nt.setupTest(ctx, addNode...)
+	defer cleanup()
+	t := nt.tb
 
 	if len(nodes) < 2 {
 		return ""
 	}
+	for _, n := range nodes {
+		if !n.ShouldJoinTailnet() {
+			t.Logf("%v did not join tailnet", n)
+			return ""
+		}
+	}
+
+	sts := make([]*ipnstate.Status, len(nodes))
+	var eg errgroup.Group
+	for i, c := range clients {
+		eg.Go(func() error {
+			node := nodes[i]
+			st, err := c.Status(ctx)
+			if err != nil {
+				return fmt.Errorf("%v: %w", node, err)
+			}
+			sts[i] = st
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("get node statuses: %v", err)
+	}
 
 	preICMPPing := false
-	for _, node := range c.Nodes() {
+	for _, node := range nodes {
 		node.Network().PostConnectedToControl()
 		if err := node.PostConnectedToControl(ctx); err != nil {
 			t.Fatalf("post control error: %s", err)
@@ -455,7 +575,7 @@ func (nt *natTest) runTest(addNode ...addNodeFunc) pingRoute {
 
 	pingRes, err := ping(ctx, t, clients[0], sts[1].Self.TailscaleIPs[0], tailcfg.PingDisco)
 	if err != nil {
-		t.Fatalf("ping failure: %v", err)
+		t.Logf("ping failure: %v", err)
 	}
 	nt.gotRoute = classifyPing(pingRes)
 	t.Logf("ping route: %v", nt.gotRoute)
@@ -522,6 +642,55 @@ func ping(ctx context.Context, t testing.TB, c *vnet.NodeAgentClient, target net
 	return nil, fmt.Errorf("no ping response (ctx: %v)", ctx.Err())
 }
 
+// qmpQueryStatus connects to a QEMU QMP socket and returns the VM status
+// (e.g. "running", "paused", "prelaunch") or an error string.
+func qmpQueryStatus(sockPath string) string {
+	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	if err != nil {
+		return fmt.Sprintf("dial error: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	dec := json.NewDecoder(conn)
+
+	// Read QMP greeting.
+	var greeting json.RawMessage
+	if err := dec.Decode(&greeting); err != nil {
+		return fmt.Sprintf("greeting error: %v", err)
+	}
+
+	// Enter command mode.
+	if _, err := conn.Write([]byte(`{"execute":"qmp_capabilities"}` + "\n")); err != nil {
+		return fmt.Sprintf("write caps: %v", err)
+	}
+	var capsResp json.RawMessage
+	if err := dec.Decode(&capsResp); err != nil {
+		return fmt.Sprintf("caps response: %v", err)
+	}
+
+	// Query status.
+	if _, err := conn.Write([]byte(`{"execute":"query-status"}` + "\n")); err != nil {
+		return fmt.Sprintf("write query-status: %v", err)
+	}
+	var statusResp struct {
+		Return struct {
+			Running bool   `json:"running"`
+			Status  string `json:"status"`
+		} `json:"return"`
+		Error *struct {
+			Class string `json:"class"`
+			Desc  string `json:"desc"`
+		} `json:"error"`
+	}
+	if err := dec.Decode(&statusResp); err != nil {
+		return fmt.Sprintf("status response: %v", err)
+	}
+	if statusResp.Error != nil {
+		return fmt.Sprintf("qmp error: %s: %s", statusResp.Error.Class, statusResp.Error.Desc)
+	}
+	return fmt.Sprintf("status=%s running=%v", statusResp.Return.Status, statusResp.Return.Running)
+}
+
 func up(ctx context.Context, c *vnet.NodeAgentClient) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", "http://unused/up", nil)
 	if err != nil {
@@ -539,6 +708,60 @@ func up(ctx context.Context, c *vnet.NodeAgentClient) error {
 	return nil
 }
 
+func getClientIP(ctx context.Context, c *vnet.NodeAgentClient) (netip.Addr, error) {
+	getIPReq, err := http.NewRequestWithContext(ctx, "GET", "http://unused/ip", nil)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	res, err := c.HTTPClient.Do(getIPReq)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return netip.Addr{}, fmt.Errorf("client returned http status %q", res.Status)
+	}
+	ipBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	addrPort, err := netip.ParseAddrPort(string(ipBytes))
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	return addrPort.Addr(), nil
+}
+
+// sendHostNetworkPing pings toClient from fromClient, and returns whether
+// toClient responded to the ping.
+func sendHostNetworkPing(ctx context.Context, tb testing.TB, fromClient, toClient *vnet.NodeAgentClient) (bool, error) {
+	toIP, err := getClientIP(ctx, toClient)
+	if err != nil {
+		return false, fmt.Errorf("get ip: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://unused/ping?host=%s", toIP.String()), nil)
+	if err != nil {
+		return false, err
+	}
+	res, err := fromClient.HTTPClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer res.Body.Close()
+	got, err := io.ReadAll(res.Body)
+	if err != nil {
+		tb.Logf("error while reading http body: %v", err)
+	} else {
+		tb.Logf("got response from ping: %q", got)
+	}
+	ec, err := strconv.Atoi(res.Header.Get("Exec-Exit-Code"))
+	if err != nil {
+		return false, fmt.Errorf("parse exit code: %w", err)
+	}
+	tb.Logf("got ec: %v", ec)
+	return ec == 0, nil
+}
+
 type nodeType struct {
 	name string
 	fn   addNodeFunc
@@ -552,6 +775,7 @@ var types = []nodeType{
 	{"hardPMP", hardPMP},
 	{"one2one", one2one},
 	{"sameLAN", sameLAN},
+	{"cgnat", cgnatNoTailnet},
 }
 
 // want sets the expected ping route for the test.
@@ -563,15 +787,35 @@ func (nt *natTest) want(r pingRoute) {
 
 func TestEasyEasy(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(easy, easy)
+	nt.runTailscaleConnectivityTest(easy, easy)
 	nt.want(routeDirect)
 }
 
+// TestTwoEasyNoControlDiscoRotate tests a situation where two nodes have been
+// online and connected through control, but then loose control access and also
+// rotate keys. It is not a perfect proxy for a cached node, as the node will
+// still have a mapState and not use the backup method of inserting keys into
+// the engine directly.
 func TestTwoEasyNoControlDiscoRotate(t *testing.T) {
-	envknob.Setenv("TS_USE_CACHED_NETMAP", "1")
 	nt := newNatTest(t)
-	nt.runTest(easyNoControlDiscoRotate, easyNoControlDiscoRotate)
+	nt.runTailscaleConnectivityTest(easyNoControlDiscoRotate, easyNoControlDiscoRotate)
 	nt.want(routeDirect)
+}
+
+func cgnatNoTailnet(c *vnet.Config) *vnet.Node {
+	n := c.NumNodes() + 1
+	return c.AddNode(c.AddNetwork(
+		fmt.Sprintf("100.65.%d.1/16", n),
+		fmt.Sprintf("2.%d.%d.%d", n, n, n), // public IP
+		vnet.EasyNAT),
+		vnet.DontJoinTailnet)
+}
+
+func TestNonTailscaleCGNATEndpoint(t *testing.T) {
+	nt := newNatTest(t)
+	if !nt.runHostConnectivityTest(cgnatNoTailnet, sameLANNoDropCGNAT) {
+		t.Fatalf("could not ping")
+	}
 }
 
 // Issue tailscale/corp#26438: use learned DERP route as send path of last
@@ -590,13 +834,13 @@ func TestTwoEasyNoControlDiscoRotate(t *testing.T) {
 // packet over a particular DERP from that peer.
 func TestFallbackDERPRegionForPeer(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(hard, hardNoDERPOrEndoints)
+	nt.runTailscaleConnectivityTest(hard, hardNoDERPOrEndoints)
 	nt.want(routeDERP)
 }
 
 func TestSingleJustIPv6(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(just6)
+	nt.runTailscaleConnectivityTest(just6)
 }
 
 var knownBroken = flag.Bool("known-broken", false, "run known-broken tests")
@@ -610,24 +854,24 @@ func TestSingleDualBrokenIPv4(t *testing.T) {
 		t.Skip("skipping known-broken test; set --known-broken to run; see https://github.com/tailscale/tailscale/issues/13346")
 	}
 	nt := newNatTest(t)
-	nt.runTest(v6AndBlackholedIPv4)
+	nt.runTailscaleConnectivityTest(v6AndBlackholedIPv4)
 }
 
 func TestJustIPv6(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(just6, just6)
+	nt.runTailscaleConnectivityTest(just6, just6)
 	nt.want(routeDirect)
 }
 
 func TestEasy4AndJust6(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(easyAnd6, just6)
+	nt.runTailscaleConnectivityTest(easyAnd6, just6)
 	nt.want(routeDirect)
 }
 
 func TestSameLAN(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(easy, sameLAN)
+	nt.runTailscaleConnectivityTest(easy, sameLAN)
 	nt.want(routeLocal)
 }
 
@@ -637,25 +881,25 @@ func TestSameLAN(t *testing.T) {
 // * client machine has a stateful host firewall (e.g. ufw)
 func TestBPFDisco(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(easyPMPFWPlusBPF, hard)
+	nt.runTailscaleConnectivityTest(easyPMPFWPlusBPF, hard)
 	nt.want(routeDirect)
 }
 
 func TestHostFWNoBPF(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(easyPMPFWNoBPF, hard)
+	nt.runTailscaleConnectivityTest(easyPMPFWNoBPF, hard)
 	nt.want(routeDERP)
 }
 
 func TestHostFWPair(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(easyFW, easyFW)
+	nt.runTailscaleConnectivityTest(easyFW, easyFW)
 	nt.want(routeDirect)
 }
 
 func TestOneHostFW(t *testing.T) {
 	nt := newNatTest(t)
-	nt.runTest(easy, easyFW)
+	nt.runTailscaleConnectivityTest(easy, easyFW)
 	nt.want(routeDirect)
 }
 
@@ -677,7 +921,7 @@ func TestPair(t *testing.T) {
 	}
 
 	nt := newNatTest(t)
-	nt.runTest(find(t1), find(t2))
+	nt.runTailscaleConnectivityTest(find(t1), find(t2))
 }
 
 var runGrid = flag.Bool("run-grid", false, "run grid test")
@@ -713,7 +957,7 @@ func TestGrid(t *testing.T) {
 
 				if route == "" {
 					nt := newNatTest(t)
-					route = nt.runTest(a.fn, b.fn)
+					route = nt.runTailscaleConnectivityTest(a.fn, b.fn)
 					if err := os.WriteFile(filename, []byte(string(route)), 0666); err != nil {
 						t.Fatalf("writeFile: %v", err)
 					}
