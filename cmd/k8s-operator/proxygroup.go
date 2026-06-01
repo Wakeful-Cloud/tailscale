@@ -1104,7 +1104,33 @@ func (r *ProxyGroupReconciler) findStaticEndpoints(ctx context.Context, existing
 		return nil, &FindStaticEndpointErr{msg: fmt.Sprintf("failed to find any `status.addresses` of type %q on nodes using configured Selectors on `spec.staticEndpoints.nodePort.selectors` for ProxyClass %q", corev1.NodeExternalIP, proxyClass.Name)}
 	}
 
+	// If we ended up selecting the same set of addresses already in use, keep
+	// the existing order. nodes.Items from r.List is not guaranteed to be in
+	// a stable order across calls, so without this the slice can permute on
+	// each reconcile, making the marshalled config Secret differ byte-for-byte
+	// even though nothing has effectively changed. That trips the DeepEqual
+	// check on the config Secret, which writes the Secret, which fires a
+	// watch event, which re-enqueues the ProxyGroup, and so on.
+	if len(currAddrs) > 0 && sameAddrPortSet(endpoints, currAddrs) {
+		return currAddrs, nil
+	}
+
 	return endpoints, nil
+}
+
+// sameAddrPortSet reports whether a and b contain the same AddrPorts,
+// ignoring order. Both slices are assumed to be free of duplicates, which
+// holds for callers in this package.
+func sameAddrPortSet(a, b []netip.AddrPort) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for _, x := range a {
+		if !slices.Contains(b, x) {
+			return false
+		}
+	}
+	return true
 }
 
 func getStaticEndpointAddress(a *corev1.NodeAddress, port uint16) *netip.AddrPort {
@@ -1160,6 +1186,9 @@ func (r *ProxyGroupReconciler) ensureStateRemovedForProxyGroup(pg *tsapi.ProxyGr
 	gaugeIngressProxyGroupResources.Set(int64(r.ingressProxyGroups.Len()))
 	gaugeAPIServerProxyGroupResources.Set(int64(r.apiServerProxyGroups.Len()))
 	delete(r.authKeyRateLimits, pg.Name)
+	for i := range pgReplicas(pg) {
+		delete(r.authKeyReissuing, pgStateSecretName(pg.Name, i))
+	}
 }
 
 func pgTailscaledConfig(pg *tsapi.ProxyGroup, loginServer string, pc *tsapi.ProxyClass, idx int32, authKey *string, staticEndpoints []netip.AddrPort, oldAdvertiseServices []string) (tailscaledConfigs, error) {

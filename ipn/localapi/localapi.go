@@ -80,6 +80,7 @@ var handler = map[string]LocalAPIHandler{
 	"goroutines":           (*Handler).serveGoroutines,
 	"login-interactive":    (*Handler).serveLoginInteractive,
 	"logout":               (*Handler).serveLogout,
+	"peer-by-id":           (*Handler).servePeerByID,
 	"ping":                 (*Handler).servePing,
 	"prefs":                (*Handler).servePrefs,
 	"reload-config":        (*Handler).reloadConfig,
@@ -89,6 +90,7 @@ var handler = map[string]LocalAPIHandler{
 	"shutdown":             (*Handler).serveShutdown,
 	"start":                (*Handler).serveStart,
 	"status":               (*Handler).serveStatus,
+	"user-profile":         (*Handler).serveUserProfile,
 	"whois":                (*Handler).serveWhoIs,
 }
 
@@ -544,6 +546,8 @@ type localBackendWhoIsMethods interface {
 	WhoIs(string, netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	WhoIsNodeKey(key.NodePublic) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	PeerCaps(netip.Addr) tailcfg.PeerCapMap
+	PeerCapsForIP(src, dst netip.Addr) tailcfg.PeerCapMap
+	PeerCapsForService(src netip.Addr, svcName tailcfg.ServiceName) tailcfg.PeerCapMap
 }
 
 func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, b localBackendWhoIsMethods) {
@@ -591,7 +595,25 @@ func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, 
 		UserProfile: &u,           // always non-nil per WhoIsResponse contract
 	}
 	if n.Addresses().Len() > 0 {
-		res.CapMap = b.PeerCaps(n.Addresses().At(0).Addr())
+		src := n.Addresses().At(0).Addr()
+		switch {
+		case r.FormValue("svc_name") != "":
+			svcName := tailcfg.AsServiceName(r.FormValue("svc_name"))
+			if svcName == "" {
+				http.Error(w, "invalid svc_name", http.StatusBadRequest)
+				return
+			}
+			res.CapMap = b.PeerCapsForService(src, svcName)
+		case r.FormValue("dst_ip") != "":
+			svcAddr, err := netip.ParseAddr(r.FormValue("dst_ip"))
+			if err != nil {
+				http.Error(w, "invalid dst_ip", http.StatusBadRequest)
+				return
+			}
+			res.CapMap = b.PeerCapsForIP(src, svcAddr)
+		default:
+			res.CapMap = b.PeerCaps(src)
+		}
 	}
 	j, err := json.MarshalIndent(res, "", "\t")
 	if err != nil {
@@ -879,6 +901,12 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 		}
 		mask = ipn.NotifyWatchOpt(v)
 	}
+	// NotifyInitialNetMap is permitted alongside NotifyPeerChanges /
+	// NotifyPeerPatches for backwards compatibility with clients that
+	// set both (e.g. the Apple client). On platforms where
+	// goosGetsLegacyNetmapNotify is true, the initial netmap is
+	// delivered regardless; peer-change subscribers simply receive
+	// deltas after that point.
 
 	w.Header().Set("Content-Type", "application/json")
 	ctx := r.Context()
@@ -1110,6 +1138,86 @@ func (h *Handler) serveDNSConfig(w http.ResponseWriter, r *http.Request) {
 	e.Encode(nm.DNS)
 }
 
+// peerByIDBackend is the subset of [ipnlocal.LocalBackend] used by
+// [Handler.servePeerByID]. It exists so the handler can be tested with a
+// trivial mock without spinning up a full LocalBackend.
+type peerByIDBackend interface {
+	PeerByID(tailcfg.NodeID) (tailcfg.NodeView, bool)
+}
+
+// servePeerByID returns the current full [tailcfg.Node] for the peer with the
+// NodeID given in the "id" query parameter. It returns 404 if no such peer is
+// in the current netmap.
+//
+// It is intended for clients that observed a peer-mutation signal (e.g.
+// [ipn.Notify.PeerChangedPatch] or [ipn.Notify.PeersChanged]) and want the
+// latest state of the affected node without having to apply the patch
+// themselves.
+func (h *Handler) servePeerByID(w http.ResponseWriter, r *http.Request) {
+	h.servePeerByIDWithBackend(w, r, h.b)
+}
+
+func (h *Handler) servePeerByIDWithBackend(w http.ResponseWriter, r *http.Request, b peerByIDBackend) {
+	if !h.PermitRead {
+		http.Error(w, "peer-by-id access denied", http.StatusForbidden)
+		return
+	}
+	idStr := r.FormValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid 'id' parameter", http.StatusBadRequest)
+		return
+	}
+	nv, ok := b.PeerByID(tailcfg.NodeID(id))
+	if !ok {
+		http.Error(w, "no peer with that NodeID", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(nv.AsStruct())
+}
+
+// userProfileBackend is the subset of [ipnlocal.LocalBackend] used by
+// [Handler.serveUserProfile]. It exists so the handler can be tested
+// with a trivial mock without spinning up a full LocalBackend.
+type userProfileBackend interface {
+	UserProfile(tailcfg.UserID) (tailcfg.UserProfileView, bool)
+}
+
+// serveUserProfile returns the current [tailcfg.UserProfile] for the User
+// with the UserID given in the "id" query parameter, in O(1) time. It
+// returns 404 if no such user is in the current netmap.
+//
+// It is the LocalAPI fallback for IPN-bus consumers that see a UserID
+// referenced by a peer Node and want to resolve it to a UserProfile.
+func (h *Handler) serveUserProfile(w http.ResponseWriter, r *http.Request) {
+	h.serveUserProfileWithBackend(w, r, h.b)
+}
+
+func (h *Handler) serveUserProfileWithBackend(w http.ResponseWriter, r *http.Request, b userProfileBackend) {
+	if !h.PermitRead {
+		http.Error(w, "user-profile access denied", http.StatusForbidden)
+		return
+	}
+	idStr := r.FormValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid 'id' parameter", http.StatusBadRequest)
+		return
+	}
+	uv, ok := b.UserProfile(tailcfg.UserID(id))
+	if !ok {
+		http.Error(w, "no user with that UserID", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(uv.AsStruct())
+}
+
 // serveSetExpirySooner sets the expiry date on the current machine, specified
 // by an `expiry` unix timestamp as POST or query param.
 func (h *Handler) serveSetExpirySooner(w http.ResponseWriter, r *http.Request) {
@@ -1231,9 +1339,9 @@ func (h *Handler) serveDial(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dial via Tailscale using the resolved IP:port to avoid a TOCTOU
-	// race with DNS re-resolution.
-	outConn, err := h.b.Dialer().UserDial(r.Context(), network, ipp.String())
+	// Dial via Tailscale with the original hostname so UserDial can
+	// resolve all addresses and race across families (happy eyeballs).
+	outConn, err := h.b.Dialer().UserDial(r.Context(), network, addr)
 	if err != nil {
 		http.Error(w, "dial failure: "+err.Error(), http.StatusBadGateway)
 		return

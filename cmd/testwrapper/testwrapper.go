@@ -15,12 +15,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +34,14 @@ import (
 
 const (
 	maxAttempts = 3
+
+	// raceDetectorMarkerLine is the first line of every Go race
+	// detector report, emitted at column 0. We look for it as a
+	// whole line (not as a substring) so that we don't false-fire
+	// on tests that legitimately print the same text indented in
+	// their own logs — for example, this package's own race tests,
+	// which exec a child testwrapper and dump its captured output.
+	raceDetectorMarkerLine = "WARNING: DATA RACE\n"
 )
 
 type testAttempt struct {
@@ -41,6 +53,10 @@ type testAttempt struct {
 	start, end    time.Time
 	isMarkedFlaky bool   // set if the test is marked as flaky
 	issueURL      string // set if the test is marked as flaky
+	// raceDetected is true on a per-test event if that test's output
+	// contained a race report, and true on a pkgFinished event if any
+	// test in the package -- or the package's own output -- did.
+	raceDetected bool
 
 	pkgFinished bool
 }
@@ -71,6 +87,94 @@ type goTestOutput struct {
 
 var debug = os.Getenv("TS_TESTWRAPPER_DEBUG") != ""
 
+// testsForShard returns the test names in pkg that belong to the given shard
+// spec (e.g. "2/3"). It uses "go list -json" to find test source files (no
+// compilation) and scans them for top-level test function names, assigning
+// each to a shard by hashing. Returns nil if the spec is invalid or if
+// listing fails (the main run will surface the error).
+func testsForShard(ctx context.Context, pkg, shardSpec string) ([]string, error) {
+	a, b, ok := strings.Cut(shardSpec, "/")
+	if !ok {
+		return nil, nil
+	}
+	wantShard, err := strconv.Atoi(a)
+	if err != nil || wantShard < 1 {
+		return nil, nil
+	}
+	shards, err := strconv.Atoi(b)
+	if err != nil || shards < 1 {
+		return nil, nil
+	}
+
+	out, err := exec.CommandContext(ctx, "go", "list", "-json", pkg).Output()
+	if err != nil {
+		// Errors will be surfaced by the main test run.
+		return nil, nil
+	}
+
+	type pkgJSON struct {
+		Dir          string
+		TestGoFiles  []string
+		XTestGoFiles []string
+	}
+
+	seen := map[string]bool{}
+	var result []string
+
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for dec.More() {
+		var p pkgJSON
+		if err := dec.Decode(&p); err != nil {
+			break
+		}
+		for _, f := range append(p.TestGoFiles, p.XTestGoFiles...) {
+			names, err := testFuncNames(filepath.Join(p.Dir, f))
+			if err != nil {
+				continue
+			}
+			for _, name := range names {
+				if seen[name] {
+					continue
+				}
+				seen[name] = true
+				h := fnv.New32a()
+				io.WriteString(h, name)
+				if int(h.Sum32()%uint32(shards)) == wantShard-1 {
+					result = append(result, name)
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+// testFuncNames scans a Go source file and returns the names of all top-level
+// test functions (Test*, Benchmark*, Example*, Fuzz*).
+func testFuncNames(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var names []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		rest, ok := strings.CutPrefix(sc.Text(), "func ")
+		if !ok {
+			continue
+		}
+		for _, prefix := range []string{"Test", "Benchmark", "Example", "Fuzz"} {
+			if strings.HasPrefix(rest, prefix) {
+				if i := strings.IndexByte(rest, '('); i > 0 {
+					names = append(names, rest[:i])
+				}
+				break
+			}
+		}
+	}
+	return names, sc.Err()
+}
+
 // runTests runs the tests in pt and sends the results on ch. It sends a
 // testAttempt for each test and a final testAttempt per pkg with pkgFinished
 // set to true. Package build errors will not emit a testAttempt (as no valid
@@ -82,8 +186,24 @@ func runTests(ctx context.Context, attempt int, pt *packageTests, goTestArgs, te
 	args = append(args, goTestArgs...)
 	args = append(args, pt.Pattern)
 	if len(pt.Tests) > 0 {
+		// Specific tests requested (e.g. flaky test retry).
 		runArg := strings.Join(pt.Tests, "|")
 		args = append(args, "--run", runArg)
+	} else if shardSpec := os.Getenv("TS_TEST_SHARD"); shardSpec != "" {
+		// Automatic test-name sharding: list tests and filter by hash.
+		shardTests, err := testsForShard(ctx, pt.Pattern, shardSpec)
+		if err != nil {
+			return err
+		}
+		if len(shardTests) == 0 {
+			ch <- &testAttempt{pkg: pt.Pattern, outcome: "skip", pkgFinished: true}
+			return nil
+		}
+		quoted := make([]string, len(shardTests))
+		for i, name := range shardTests {
+			quoted[i] = regexp.QuoteMeta(name)
+		}
+		args = append(args, "--run", "^("+strings.Join(quoted, "|")+")$")
 	}
 	args = append(args, testArgs...)
 	args = append(args, "-json")
@@ -91,9 +211,6 @@ func runTests(ctx context.Context, attempt int, pt *packageTests, goTestArgs, te
 		fmt.Println("running", strings.Join(args, " "))
 	}
 	cmd := exec.CommandContext(ctx, "go", args...)
-	if len(pt.Tests) > 0 {
-		cmd.Env = append(os.Environ(), "TS_TEST_SHARD=") // clear test shard; run all tests we say to run
-	}
 	r, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Printf("error creating stdout pipe: %v", err)
@@ -101,7 +218,9 @@ func runTests(ctx context.Context, attempt int, pt *packageTests, goTestArgs, te
 	defer r.Close()
 	cmd.Stderr = os.Stderr
 
-	cmd.Env = os.Environ()
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(s string) bool {
+		return strings.HasPrefix(s, "TS_TEST_SHARD=")
+	})
 	cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", flakytest.FlakeAttemptEnv, attempt))
 
 	if err := cmd.Start(); err != nil {
@@ -153,14 +272,46 @@ func runTests(ctx context.Context, attempt int, pt *packageTests, goTestArgs, te
 					outcome = "fail"
 				}
 				pkgTests[""].logs.WriteString(goOutput.Output)
+				// If a data race was detected anywhere in this
+				// package's output -- whether at the package level or
+				// attributed to a specific test -- consolidate all
+				// per-test logs into the package-level logs so the
+				// full race report is visible regardless of which
+				// test test2json happened to attribute it to. The
+				// pkgFinished testAttempt also carries raceDetected
+				// so the main loop can suppress flaky-test retries.
+				raceDetected := pkgTests[""].raceDetected
+				if !raceDetected {
+					for _, t := range pkgTests {
+						if t.raceDetected {
+							raceDetected = true
+							break
+						}
+					}
+				}
+				if raceDetected {
+					var ts []*testAttempt
+					for _, t := range pkgTests {
+						if t.testName != "" && t.logs.Len() > 0 {
+							ts = append(ts, t)
+						}
+					}
+					slices.SortFunc(ts, func(a, b *testAttempt) int {
+						return a.start.Compare(b.start)
+					})
+					for _, t := range ts {
+						pkgTests[""].logs.Write(t.logs.Bytes())
+					}
+				}
 				ch <- &testAttempt{
-					pkg:         goOutput.Package,
-					outcome:     outcome,
-					start:       pkgTests[""].start,
-					end:         goOutput.Time,
-					logs:        pkgTests[""].logs,
-					pkgFinished: true,
-					cached:      pkgCached[goOutput.Package],
+					pkg:          goOutput.Package,
+					outcome:      outcome,
+					start:        pkgTests[""].start,
+					end:          goOutput.Time,
+					logs:         pkgTests[""].logs,
+					pkgFinished:  true,
+					cached:       pkgCached[goOutput.Package],
+					raceDetected: raceDetected,
 				}
 			case "output":
 				// Capture all output from the package except for the final
@@ -168,6 +319,9 @@ func runTests(ctx context.Context, attempt int, pt *packageTests, goTestArgs, te
 				// printPkgOutcome will output a similar line
 				if !strings.HasPrefix(goOutput.Output, fmt.Sprintf("FAIL\t%s\t", goOutput.Package)) {
 					pkgTests[""].logs.WriteString(goOutput.Output)
+					if goOutput.Output == raceDetectorMarkerLine {
+						pkgTests[""].raceDetected = true
+					}
 				}
 			}
 
@@ -178,6 +332,9 @@ func runTests(ctx context.Context, attempt int, pt *packageTests, goTestArgs, te
 			testName = test
 			if goOutput.Action == "output" {
 				resultMap[pkg][testName].logs.WriteString(goOutput.Output)
+				if goOutput.Output == raceDetectorMarkerLine {
+					resultMap[pkg][testName].raceDetected = true
+				}
 			}
 			continue
 		}
@@ -200,6 +357,9 @@ func runTests(ctx context.Context, attempt int, pt *packageTests, goTestArgs, te
 				pkgTests[testName].issueURL = strings.TrimPrefix(suffix, ": ")
 			} else {
 				pkgTests[testName].logs.WriteString(goOutput.Output)
+				if goOutput.Output == raceDetectorMarkerLine {
+					pkgTests[testName].raceDetected = true
+				}
 			}
 		}
 	}
@@ -267,7 +427,7 @@ func main() {
 		if cached {
 			lastCol = "(cached)"
 		} else {
-			lastCol = fmt.Sprintf("%.3f", testDur.Seconds())
+			lastCol = fmt.Sprintf("%.3fs", testDur.Seconds())
 		}
 		fmt.Printf("%s\t%s\t%v\n", outcome, pkg, lastCol)
 	}
@@ -305,6 +465,16 @@ func main() {
 					tr.pkg = packages[0]
 				}
 				if tr.pkgFinished {
+					if tr.raceDetected {
+						// A data race is never something we want to
+						// paper over by retrying flaky tests in the
+						// package: the race indicates a real bug
+						// that may not even be in the failing test,
+						// and a retry could hide it. Discard any
+						// retry plans for this pkg and fail fast.
+						delete(toRetry, tr.pkg)
+						failed = true
+					}
 					if tr.outcome == "fail" && len(toRetry[tr.pkg]) == 0 {
 						// If a package fails and we don't have any tests to
 						// retry, then we should fail. This typically happens

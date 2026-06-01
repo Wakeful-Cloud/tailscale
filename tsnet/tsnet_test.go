@@ -340,7 +340,6 @@ func startServer(t *testing.T, ctx context.Context, controlURL, hostname string)
 }
 
 func TestDialBlocks(t *testing.T) {
-	tstest.Shard(t)
 	tstest.ResourceCheck(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -387,7 +386,6 @@ func TestDialBlocks(t *testing.T) {
 //   - s2 can dial through the subnet router functionality (getting a synthetic RST
 //     that we verify we generated & saw)
 func TestConn(t *testing.T) {
-	tstest.Shard(t)
 	tstest.ResourceCheck(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -520,7 +518,6 @@ func TestConn(t *testing.T) {
 
 func TestLoopbackLocalAPI(t *testing.T) {
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/8557")
-	tstest.Shard(t)
 	tstest.ResourceCheck(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -596,7 +593,6 @@ func TestLoopbackLocalAPI(t *testing.T) {
 
 func TestLoopbackSOCKS5(t *testing.T) {
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/8198")
-	tstest.Shard(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -647,7 +643,6 @@ func TestLoopbackSOCKS5(t *testing.T) {
 }
 
 func TestTailscaleIPs(t *testing.T) {
-	tstest.Shard(t)
 	controlURL, _ := startControl(t)
 
 	tmp := t.TempDir()
@@ -690,7 +685,6 @@ func TestTailscaleIPs(t *testing.T) {
 // TestListenerCleanup is a regression test to verify that s.Close doesn't
 // deadlock if a listener is still open.
 func TestListenerCleanup(t *testing.T) {
-	tstest.Shard(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -733,7 +727,6 @@ func (wc *closeTrackConn) Close() error {
 // tests https://github.com/tailscale/tailscale/issues/6973 -- that we can start a tsnet server,
 // stop it, and restart it, even on Windows.
 func TestStartStopStartGetsSameIP(t *testing.T) {
-	tstest.Shard(t)
 	controlURL, _ := startControl(t)
 
 	tmp := t.TempDir()
@@ -783,7 +776,6 @@ func TestStartStopStartGetsSameIP(t *testing.T) {
 }
 
 func TestFunnel(t *testing.T) {
-	tstest.Shard(t)
 	ctx, dialCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer dialCancel()
 
@@ -848,7 +840,6 @@ func TestFunnel(t *testing.T) {
 // after itself when closed. Specifically, changes made to the serve config
 // should be cleared.
 func TestFunnelClose(t *testing.T) {
-	tstest.Shard(t)
 
 	marshalServeConfig := func(t *testing.T, sc ipn.ServeConfigView) string {
 		t.Helper()
@@ -1022,7 +1013,11 @@ func setUpServiceState(t *testing.T, name, ip string, host, client *Server,
 		t.Helper()
 		w := must.Get(s.localClient.WatchIPNBus(t.Context(), ipn.NotifyInitialNetMap))
 		defer w.Close()
-		for n := must.Get(w.Next()); !netmapUpToDate(n.NetMap); n = must.Get(w.Next()) {
+		for {
+			must.Get(w.Next())
+			if nm := s.lb.NetMapWithPeers(); nm != nil && netmapUpToDate(nm) {
+				return
+			}
 		}
 	}
 	waitForLatestNetmap(t, client)
@@ -1030,7 +1025,6 @@ func setUpServiceState(t *testing.T, name, ip string, host, client *Server,
 }
 
 func TestListenService(t *testing.T) {
-	tstest.Shard(t)
 
 	type dialFn func(context.Context, string, string) (net.Conn, error)
 
@@ -1426,7 +1420,6 @@ func TestListenService(t *testing.T) {
 }
 
 func TestListenServiceClose(t *testing.T) {
-	tstest.Shard(t)
 	const serviceName = "svc:foo"
 
 	diffServeConfig := func(a, b ipn.ServeConfigView) string {
@@ -1582,7 +1575,6 @@ func TestListenServiceClose(t *testing.T) {
 }
 
 func TestListenerClose(t *testing.T) {
-	tstest.Shard(t)
 	ctx := context.Background()
 	controlURL, _ := startControl(t)
 
@@ -1662,7 +1654,6 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 }
 
 func TestFallbackTCPHandler(t *testing.T) {
-	tstest.Shard(t)
 	tstest.ResourceCheck(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1705,7 +1696,6 @@ func TestFallbackTCPHandler(t *testing.T) {
 }
 
 func TestCapturePcap(t *testing.T) {
-	tstest.Shard(t)
 	const timeLimit = 120
 	ctx, cancel := context.WithTimeout(context.Background(), timeLimit*time.Second)
 	defer cancel()
@@ -1759,7 +1749,6 @@ func TestCapturePcap(t *testing.T) {
 }
 
 func TestUDPConn(t *testing.T) {
-	tstest.Shard(t)
 	tstest.ResourceCheck(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1951,7 +1940,6 @@ func sendData(logf func(format string, args ...any), ctx context.Context, bytesC
 }
 
 func TestUserMetricsByteCounters(t *testing.T) {
-	tstest.Shard(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -2066,7 +2054,6 @@ func TestUserMetricsByteCounters(t *testing.T) {
 }
 
 func TestUserMetricsRouteGauges(t *testing.T) {
-	tstest.Shard(t)
 	// Windows does not seem to support or report back routes when running in
 	// userspace via tsnet. So, we skip this check on Windows.
 	// TODO(kradalby): Figure out if this is correct.
@@ -2298,11 +2285,41 @@ type listenTest struct {
 	tun          *chanTUN // nil for netstack mode
 }
 
+// waitForPeerReachable blocks until s's current netmap contains the given peer
+// with a non-zero HomeDERP and endpoints.
+//
+// This is polled via the LocalBackend's netmap rather than via the IPN bus
+// because the bus does not carry HomeDERP or Endpoint deltas; the netmap
+// itself is the source of truth for those fields.
+func waitForPeerReachable(t *testing.T, s *Server, peer key.NodePublic) {
+	t.Helper()
+	if err := tstest.WaitFor(30*time.Second, func() error {
+		nm := s.lb.NetMapWithPeers()
+		if nm == nil {
+			return errors.New("no netmap yet")
+		}
+		for _, p := range nm.Peers {
+			if p.Key() != peer {
+				continue
+			}
+			if p.HomeDERP() == 0 {
+				return fmt.Errorf("peer %v: no HomeDERP", peer.ShortString())
+			}
+			if p.Endpoints().Len() == 0 {
+				return fmt.Errorf("peer %v: no endpoints", peer.ShortString())
+			}
+			return nil
+		}
+		return fmt.Errorf("peer %v not in netmap", peer.ShortString())
+	}); err != nil {
+		t.Fatalf("waitForPeerReachable(%v): %v", peer.ShortString(), err)
+	}
+}
+
 // setupTwoClientTest creates two tsnet servers for testing.
 // If useTUN is true, s2 uses a chanTUN; otherwise it uses netstack only.
 func setupTwoClientTest(t *testing.T, useTUN bool) *listenTest {
 	t.Helper()
-	tstest.Shard(t)
 	tstest.ResourceCheck(t)
 	ctx := t.Context()
 	controlURL, control := startControl(t)
@@ -2341,6 +2358,9 @@ func setupTwoClientTest(t *testing.T, useTUN bool) *listenTest {
 	if len(s2status.TailscaleIPs) > 1 {
 		s2ip6 = s2status.TailscaleIPs[1]
 	}
+
+	waitForPeerReachable(t, s1, s2.lb.NodeKey())
+	waitForPeerReachable(t, s2, s1.lb.NodeKey())
 
 	lc1 := must.Get(s1.LocalClient())
 	must.Get(lc1.Ping(ctx, s2ip4, tailcfg.PingTSMP))
@@ -2900,16 +2920,20 @@ func buildDNSQuery(name string, srcIP netip.Addr) []byte {
 }
 
 func TestDeps(t *testing.T) {
-	tstest.Shard(t)
 	deptest.DepChecker{
 		GOOS:   "linux",
 		GOARCH: "amd64",
 		BadDeps: map[string]string{
 			"golang.org/x/crypto/ssh":                       "tsnet should not depend on SSH",
 			"golang.org/x/crypto/ssh/internal/bcrypt_pbkdf": "tsnet should not depend on SSH",
+			"tailscale.com/ipn/store/awsstore":              "tsnet callers wanting AWS state storage should import awsstore themselves",
+			"tailscale.com/ipn/store/kubestore":             "tsnet callers wanting Kubernetes state storage should import kubestore themselves",
+			"tailscale.com/wif":                             "tsnet callers wanting workload identity federation should import tailscale.com/feature/identityfederation themselves",
 		},
 		OnDep: func(dep string) {
-			if strings.Contains(dep, "portlist") {
+			if strings.Contains(dep, "portlist") ||
+				strings.Contains(dep, "github.com/aws/") ||
+				strings.Contains(dep, "k8s.io/") {
 				t.Errorf("unexpected dep: %q", dep)
 			}
 		},
@@ -3159,7 +3183,6 @@ func TestResolveAuthKey(t *testing.T) {
 // packets were sent to WireGuard (which has no peer for the node's own IP)
 // and silently dropped, causing Dial to hang indefinitely.
 func TestSelfDial(t *testing.T) {
-	tstest.Shard(t)
 	tstest.ResourceCheck(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

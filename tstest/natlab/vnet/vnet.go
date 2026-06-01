@@ -205,7 +205,7 @@ func (n *network) initStack() error {
 		return tcpFwd.HandlePacket(tei, pb)
 	})
 
-	go func() {
+	n.s.wg.Go(func() {
 		for {
 			pkt := n.linkEP.ReadContext(n.s.shutdownCtx)
 			if pkt == nil {
@@ -217,7 +217,7 @@ func (n *network) initStack() error {
 			}
 			n.handleIPPacketFromGvisor(pkt.ToView().AsSlice())
 		}
-	}()
+	})
 	return nil
 }
 
@@ -369,8 +369,11 @@ func (n *network) acceptTCP(r *tcp.ForwarderRequest) {
 	if destPort == 80 && fakeControl.Match(destIP) {
 		r.Complete(false)
 		tc := gonet.NewTCPConn(&wq, ep)
+		context.AfterFunc(n.s.shutdownCtx, func() { tc.SetDeadline(time.Now()) })
 		hs := &http.Server{Handler: n.s.control}
-		go hs.Serve(netutil.NewOneConnListener(tc, nil))
+		n.s.wg.Go(func() {
+			hs.Serve(netutil.NewOneConnListener(tc, nil))
+		})
 		return
 	}
 
@@ -383,39 +386,54 @@ func (n *network) acceptTCP(r *tcp.ForwarderRequest) {
 
 			r.Complete(false)
 			tc := gonet.NewTCPConn(&wq, ep)
+			context.AfterFunc(n.s.shutdownCtx, func() { tc.SetDeadline(time.Now()) })
 			tlsConn := tls.Server(tc, ds.tlsConfig)
 			hs := &http.Server{Handler: ds.handler}
-			go hs.Serve(netutil.NewOneConnListener(tlsConn, nil))
+			n.s.wg.Go(func() {
+				hs.Serve(netutil.NewOneConnListener(tlsConn, nil))
+			})
 			return
 		}
 		if destPort == 80 {
 			r.Complete(false)
 			tc := gonet.NewTCPConn(&wq, ep)
+			context.AfterFunc(n.s.shutdownCtx, func() { tc.SetDeadline(time.Now()) })
 			hs := &http.Server{Handler: n.s.derps[0].handler}
-			go hs.Serve(netutil.NewOneConnListener(tc, nil))
+			n.s.wg.Go(func() {
+				hs.Serve(netutil.NewOneConnListener(tc, nil))
+			})
 			return
 		}
 	}
 	if destPort == 443 && fakeLogCatcher.Match(destIP) {
 		r.Complete(false)
 		tc := gonet.NewTCPConn(&wq, ep)
-		go n.serveLogCatcherConn(clientRemoteIP, tc)
+		context.AfterFunc(n.s.shutdownCtx, func() { tc.SetDeadline(time.Now()) })
+		n.s.wg.Go(func() {
+			n.serveLogCatcherConn(clientRemoteIP, tc)
+		})
 		return
 	}
 
 	if destPort == 80 && fakeCloudInit.Match(destIP) {
 		r.Complete(false)
 		tc := gonet.NewTCPConn(&wq, ep)
+		context.AfterFunc(n.s.shutdownCtx, func() { tc.SetDeadline(time.Now()) })
 		hs := &http.Server{Handler: n.s.cloudInitHandler()}
-		go hs.Serve(netutil.NewOneConnListener(tc, nil))
+		n.s.wg.Go(func() {
+			hs.Serve(netutil.NewOneConnListener(tc, nil))
+		})
 		return
 	}
 
 	if destPort == 80 && fakeFiles.Match(destIP) {
 		r.Complete(false)
 		tc := gonet.NewTCPConn(&wq, ep)
+		context.AfterFunc(n.s.shutdownCtx, func() { tc.SetDeadline(time.Now()) })
 		hs := &http.Server{Handler: n.s.fileServerHandler()}
-		go hs.Serve(netutil.NewOneConnListener(tc, nil))
+		n.s.wg.Go(func() {
+			hs.Serve(netutil.NewOneConnListener(tc, nil))
+		})
 		return
 	}
 
@@ -588,6 +606,9 @@ type network struct {
 	// writers is a map of MAC -> networkWriters to write packets to that MAC.
 	// It contains entries for connected nodes only.
 	writers syncs.Map[MAC, networkWriter] // MAC -> to networkWriter for that MAC
+
+	blackholeMu  sync.Mutex
+	blackholeMap map[netip.Addr]netip.Addr // blackholeMap contains address pairs for dropping traffic (in either direction)
 }
 
 // registerWriter registers a client address with a MAC address.
@@ -633,6 +654,19 @@ func (n *network) MACOfIP(ip netip.Addr) (_ MAC, ok bool) {
 // network.
 func (n *network) SetControlBlackholed(v bool) {
 	n.blackholeControl = v
+}
+
+// BlackholeControlForAddr sets up a map entry, ensuring that traffic to or from
+// control from the addr is dropped.
+func (n *network) BlackholeControlForAddr(addr netip.Addr) {
+	n.blackholeMu.Lock()
+	defer n.blackholeMu.Unlock()
+
+	if addr.Is6() {
+		mak.Set(&n.blackholeMap, addr, fakeControl.v6)
+	} else {
+		mak.Set(&n.blackholeMap, addr, fakeControl.v4)
+	}
 }
 
 // nodeNIC represents a single network interface on a node.
@@ -1603,6 +1637,17 @@ func (n *network) HandleEthernetPacketForRouter(ep EthernetPacket) {
 			// Blackhole the packet.
 			return
 		}
+
+		// Drop traffic to/from address pairs in the blackholeMap.
+		n.blackholeMu.Lock()
+		defer n.blackholeMu.Unlock()
+		if src, ok := n.blackholeMap[flow.dst]; ok && flow.src == src {
+			return
+		}
+		if dst, ok := n.blackholeMap[flow.src]; ok && flow.dst == dst {
+			return
+		}
+
 		var base *layers.BaseLayer
 		proto := header.IPv4ProtocolNumber
 		if v4, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4); ok {
@@ -2538,13 +2583,23 @@ func (s *Server) addIdleAgentConn(ac *agentConn) {
 
 func (s *Server) takeAgentConn(ctx context.Context, n *node) (_ *agentConn, ok bool) {
 	const debug = false
+	// stuckThreshold is how long we wait before deciding the agent is slow
+	// enough to warrant a log line. Below this we stay quiet because, in
+	// healthy runs with many agent dials in flight, even a few-millisecond
+	// wait would otherwise log every poll for every concurrent waiter.
+	const stuckThreshold = 10 * time.Second
+	start := time.Now()
+	var lastWarn time.Time
 	for {
-		ac, ok := s.takeAgentConnOne(n)
-		if ok {
+		ac, miss := s.takeAgentConnOne(n)
+		if ac != nil {
 			if debug {
 				log.Printf("takeAgentConn: got agent conn for %v", n.mac)
 			}
 			return ac, true
+		}
+		if debug && miss > 0 {
+			log.Printf("takeAgentConnOne: missed %d times for %v", miss, n.mac)
 		}
 		s.mu.Lock()
 		ready := make(chan struct{})
@@ -2553,6 +2608,10 @@ func (s *Server) takeAgentConn(ctx context.Context, n *node) (_ *agentConn, ok b
 
 		if debug {
 			log.Printf("takeAgentConn: waiting for agent conn for %v", n.mac)
+		}
+		if elapsed := time.Since(start); elapsed > stuckThreshold && time.Since(lastWarn) > stuckThreshold {
+			log.Printf("takeAgentConn: still waiting for agent conn for %v after %v (%d idle conns for other nodes)", n.mac, elapsed.Round(time.Second), miss)
+			lastWarn = time.Now()
 		}
 		select {
 		case <-ctx.Done():
@@ -2566,21 +2625,21 @@ func (s *Server) takeAgentConn(ctx context.Context, n *node) (_ *agentConn, ok b
 	}
 }
 
-func (s *Server) takeAgentConnOne(n *node) (_ *agentConn, ok bool) {
+// takeAgentConnOne returns an idle agent conn for n if one is available,
+// otherwise nil. miss is the number of idle agent conns for other nodes that
+// were walked over while looking; the caller may use it for diagnostics when
+// a wait drags on.
+func (s *Server) takeAgentConnOne(n *node) (ac *agentConn, miss int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	miss := 0
 	for ac := range s.agentConns {
 		if ac.node == n {
 			s.agentConns.Delete(ac)
-			return ac, true
+			return ac, 0
 		}
 		miss++
 	}
-	if miss > 0 {
-		log.Printf("takeAgentConnOne: missed %d times for %v", miss, n.mac)
-	}
-	return nil, false
+	return nil, miss
 }
 
 type NodeAgentClient struct {

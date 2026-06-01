@@ -185,7 +185,10 @@ type CapabilityVersion int
 //   - 136: 2026-04-09: Client understands [NodeAttrDisableLinuxCGNATDropRule]
 //   - 137: 2026-04-15: Client handles 429 responses to /machine/register.
 //   - 138: 2026-03-31: can handle C2N /debug/tka.
-const CurrentCapabilityVersion CapabilityVersion = 138
+//   - 139: 2026-05-22: Client understands [NodeAttrEmitRuntimeMetrics]
+//   - 140: 2026-05-27: Client understands [NodeAttrDisableUDPGRO], [NodeAttrDisableUDPGSO], [NodeAttrDisableTUNUDPGRO], [NodeAttrDisableTUNTCPGRO]
+//   - 141: 2026-05-28: Client understands [NodeAttrNeverGSOEqualTail]
+const CurrentCapabilityVersion CapabilityVersion = 141
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -1283,7 +1286,7 @@ type RegisterRequest struct {
 	Ephemeral bool `json:",omitempty"`
 
 	// NodeKeySignature is the node's own node-key signature, re-signed
-	// for its new node key using its network-lock key.
+	// for its new node key using its tailnet-lock key.
 	//
 	// This field is set when the client retries registration after learning
 	// its NodeKeySignature (which is in need of rotation).
@@ -2475,6 +2478,10 @@ const (
 	// CapabilityMacUIV2 makes the macOS GUI enable its v2 mode.
 	CapabilityMacUIV2 NodeCapability = "https://tailscale.com/cap/mac-ui-v2"
 
+	// CapabilityServicesInDesktopClients enables services list/menu/section in desktop clients.
+	// If this capability is not present, desktop clients should not show services.
+	CapabilityServicesInDesktopClients NodeCapability = "https://tailscale.com/cap/services-in-desktop-clients"
+
 	// CapabilityBindToInterfaceByRoute changes how Darwin nodes create
 	// sockets (in the net/netns package). See that package for more
 	// details on the behaviour of this capability.
@@ -2784,6 +2791,55 @@ const (
 	// that does not originate from the Tailscale network interface.
 	// This enables access to off-tailnet endpoints within that IP range.
 	NodeAttrDisableLinuxCGNATDropRule NodeCapability = "disable-linux-cgnat-drop-rule"
+
+	// NodeAttrEmitRuntimeMetrics enables emission of [runtime/metrics] as
+	// [tailscale.com/util/clientmetric]'s.
+	NodeAttrEmitRuntimeMetrics NodeCapability = "emit-runtime-metrics"
+
+	// NodeAttrDisableUDPGRO disables UDP GRO (UDP_GRO socket option on Linux)
+	// on the magicsock UDP socket. It exists so control can mitigate kernel
+	// regressions that cause throughput or correctness issues with UDP GRO on
+	// specific OS/kernel versions, without requiring a client release. See
+	// https://github.com/tailscale/tailscale/issues/19777 for example.
+	// Currently only consulted on Linux; may apply to other platforms as they
+	// gain UDP GRO support.
+	NodeAttrDisableUDPGRO NodeCapability = "disable-udp-gro"
+
+	// NodeAttrDisableUDPGSO disables UDP GSO (UDP_SEGMENT socket option on
+	// Linux) on the magicsock UDP socket. It exists so control can mitigate
+	// kernel regressions that cause throughput or correctness issues with UDP
+	// GSO on specific OS/kernel versions, without requiring a client release.
+	// See https://github.com/tailscale/tailscale/issues/19777 for example.
+	// Currently only consulted on Linux; may apply to other platforms as they
+	// gain UDP GSO support.
+	NodeAttrDisableUDPGSO NodeCapability = "disable-udp-gso"
+
+	// NodeAttrDisableTUNUDPGRO disables UDP GRO on the Tailscale TUN device.
+	// It exists so control can mitigate kernel regressions that cause
+	// throughput or correctness issues with TUN UDP GRO on specific OS/kernel
+	// versions, without requiring a client release. See
+	// https://github.com/tailscale/tailscale/issues/13041 for example.
+	// Currently only consulted on Linux; may apply to other platforms as they
+	// gain TUN UDP GRO support.
+	NodeAttrDisableTUNUDPGRO NodeCapability = "disable-tun-udp-gro"
+
+	// NodeAttrDisableTUNTCPGRO disables TCP GRO on the Tailscale TUN device.
+	// It exists so control can mitigate kernel regressions that cause
+	// throughput or correctness issues with TUN TCP GRO on specific OS/kernel
+	// versions, without requiring a client release. See
+	// https://github.com/tailscale/tailscale/issues/13041 for example.
+	// Currently only consulted on Linux; may apply to other platforms as they
+	// gain TUN TCP GRO support.
+	NodeAttrDisableTUNTCPGRO NodeCapability = "disable-tun-tcp-gro"
+
+	// NodeAttrNeverGSOEqualTail enables a sentinel-tail workaround in the
+	// underlay UDP packet TX path on Linux. Applies to magicsock and peer relay
+	// UDP sockets. The workaround avoids emitting UDP GSO batches whose
+	// fragments are all equal in length, at a small payload and packet overhead
+	// cost. It exists so control can mitigate kernel regressions that mangle
+	// UDP headers or checksums for equal-length GSO batches, without requiring
+	// a client release. See https://github.com/tailscale/tailscale/issues/19777.
+	NodeAttrNeverGSOEqualTail NodeCapability = "never-gso-equal-tail"
 )
 
 const (

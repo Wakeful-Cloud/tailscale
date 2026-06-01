@@ -460,9 +460,6 @@ func run() (err error) {
 		return nil
 	}
 
-	if envknob.Bool("TS_DEBUG_MEMORY") {
-		logf = logger.RusagePrefixLog(logf)
-	}
 	logf = logger.RateLimitedFn(logf, 5*time.Second, 5, 100)
 
 	if envknob.Bool("TS_PLEASE_PANIC") {
@@ -828,7 +825,6 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 	if err != nil {
 		return onlyNetstack, err
 	}
-	e = wgengine.NewWatchdog(e)
 	sys.Set(e)
 	sys.NetstackRouter.Set(netstackSubnetRouter)
 

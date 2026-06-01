@@ -51,12 +51,24 @@
 // A [Server] authenticates using, in order of precedence:
 //
 //  1. [Server.AuthKey].
+//
 //  2. The TS_AUTHKEY environment variable.
+//
 //  3. The TS_AUTH_KEY environment variable.
+//
 //  4. An OAuth client secret ([Server.ClientSecret] or TS_CLIENT_SECRET),
 //     used to mint an auth key.
+//
 //  5. Workload identity federation ([Server.ClientID] plus
-//     [Server.IDToken] or [Server.Audience]).
+//     [Server.IDToken] or [Server.Audience]). Available only if the
+//     program imports the feature:
+//
+//     import _ "tailscale.com/feature/identityfederation"
+//
+//     The feature is not linked by default to keep the AWS SDK and
+//     other cloud-provider dependencies out of programs that don't
+//     use workload identity federation.
+//
 //  6. An interactive login URL printed to [Server.UserLogf].
 //
 // If the node is already enrolled (state found in [Server.Store]), the
@@ -151,7 +163,6 @@ import (
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
 	_ "tailscale.com/feature/c2n"
-	_ "tailscale.com/feature/condregister/identityfederation"
 	_ "tailscale.com/feature/condregister/oauthkey"
 	_ "tailscale.com/feature/condregister/portmapper"
 	_ "tailscale.com/feature/condregister/useproxy"
@@ -1251,6 +1262,33 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 // the listening address or use RegisterFallbackTCPHandler.
 func (s *Server) Listen(network, addr string) (net.Listener, error) {
 	return s.listen(network, addr, listenOnTailnet)
+}
+
+// ListenSSH listens on the Tailscale network for SSH connections at the given
+// addr (e.g. ":2222"). The returned listener's Accept method yields net.Conn
+// values that are actually *tailssh.Session, providing access to the
+// connecting peer's Tailscale identity, PTY information, signals, and more.
+//
+// Basic applications can use the returned connections as plain net.Conn
+// (Read/Write/Close). Applications that need richer SSH semantics should
+// type-assert to *tailssh.Session.
+//
+// SSH support must be linked into the binary by importing
+// _ "tailscale.com/feature/ssh". Without that import, ListenSSH returns an
+// error.
+//
+// If s has not been started yet, it will be started.
+func (s *Server) ListenSSH(addr string) (net.Listener, error) {
+	rawLn, err := s.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	sshLn, err := s.lb.ListenSSH(rawLn, s.logf)
+	if err != nil {
+		rawLn.Close()
+		return nil, err
+	}
+	return sshLn, nil
 }
 
 // ListenPacket announces on the Tailscale network.

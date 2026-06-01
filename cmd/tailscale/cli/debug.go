@@ -268,8 +268,7 @@ func debugCmd() *ffcli.Command {
 				ShortHelp:  "Subscribe to IPN message bus",
 				FlagSet: (func() *flag.FlagSet {
 					fs := newFlagSet("watch-ipn")
-					fs.BoolVar(&watchIPNArgs.netmap, "netmap", true, "include netmap in messages")
-					fs.BoolVar(&watchIPNArgs.initial, "initial", false, "include initial status")
+					fs.BoolVar(&watchIPNArgs.initial, "initial", false, "include the initial backend State and Prefs in the first message")
 					fs.BoolVar(&watchIPNArgs.rateLimit, "rate-limit", true, "rate limit messages")
 					fs.IntVar(&watchIPNArgs.count, "count", 0, "exit after printing this many statuses, or 0 to keep going forever")
 					return fs
@@ -632,16 +631,15 @@ func runPrefs(ctx context.Context, args []string) error {
 }
 
 var watchIPNArgs struct {
-	netmap    bool
 	initial   bool
 	rateLimit bool
 	count     int
 }
 
 func runWatchIPN(ctx context.Context, args []string) error {
-	var mask ipn.NotifyWatchOpt
+	mask := ipn.NotifyPeerChanges | ipn.NotifyPeerPatches
 	if watchIPNArgs.initial {
-		mask = ipn.NotifyInitialState | ipn.NotifyInitialPrefs | ipn.NotifyInitialNetMap
+		mask |= ipn.NotifyInitialState | ipn.NotifyInitialPrefs
 	}
 	if watchIPNArgs.rateLimit {
 		mask |= ipn.NotifyRateLimit
@@ -657,9 +655,6 @@ func runWatchIPN(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		if !watchIPNArgs.netmap {
-			n.NetMap = nil
-		}
 		j, _ := json.MarshalIndent(n, "", "\t")
 		fmt.Printf("%s\n", j)
 	}
@@ -670,18 +665,11 @@ func runNetmap(ctx context.Context, args []string) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	var mask ipn.NotifyWatchOpt = ipn.NotifyInitialNetMap
-	watcher, err := localClient.WatchIPNBus(ctx, mask)
+	raw, err := localClient.DebugResultJSON(ctx, "current-netmap")
 	if err != nil {
 		return err
 	}
-	defer watcher.Close()
-
-	n, err := watcher.Next()
-	if err != nil {
-		return err
-	}
-	j, _ := json.MarshalIndent(n.NetMap, "", "\t")
+	j, _ := json.MarshalIndent(raw, "", "\t")
 	fmt.Printf("%s\n", j)
 	return nil
 }
@@ -798,10 +786,13 @@ func runDaemonLogs(ctx context.Context, args []string) error {
 	}
 	d := json.NewDecoder(logs)
 	for {
+		type logtail struct {
+			Time string `json:"client_time"`
+		}
 		var line struct {
-			Text    string `json:"text"`
-			Verbose int    `json:"v"`
-			Time    string `json:"client_time"`
+			Text    string  `json:"text"`
+			Verbose int     `json:"v"`
+			Logtail logtail `json:"logtail"`
 		}
 		err := d.Decode(&line)
 		if err != nil {
@@ -811,8 +802,8 @@ func runDaemonLogs(ctx context.Context, args []string) error {
 		if line.Text == "" || line.Verbose > daemonLogsArgs.verbose {
 			continue
 		}
-		if daemonLogsArgs.time {
-			fmt.Printf("%s %s\n", line.Time, line.Text)
+		if daemonLogsArgs.time && line.Logtail.Time != "" {
+			fmt.Printf("%s %s\n", line.Logtail.Time, line.Text)
 		} else {
 			fmt.Println(line.Text)
 		}

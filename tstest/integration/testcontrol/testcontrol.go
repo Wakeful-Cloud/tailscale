@@ -162,6 +162,10 @@ type Server struct {
 	// tkaStorage records the Tailnet Lock state, if any.
 	// If nil, Tailnet Lock is not enabled in the Tailnet.
 	tkaStorage tka.CompactableChonk
+
+	// onMapRequest, if non-nil, is called at the start of each map poll request.
+	// It can be used in tests to panic or fail if a node contacts control unexpectedly.
+	onMapRequest func(nodeKey key.NodePublic)
 }
 
 // BaseURL returns the server's base URL, without trailing slash.
@@ -426,8 +430,12 @@ type peerMachinePublicContextKey struct{}
 
 func (s *Server) serveNoiseUpgrade(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if r.Method != "POST" {
-		http.Error(w, "POST required", 400)
+	// Allow GET for WebSocket-based clients (e.g. cmd/tsconnect/wasm) in
+	// addition to POST for the raw HTTP-upgrade path. AcceptHTTP routes by
+	// the Upgrade header and the underlying websocket library enforces
+	// GET for WebSocket upgrades.
+	if r.Method != "POST" && r.Method != "GET" {
+		http.Error(w, "POST or GET required", 400)
 		return
 	}
 
@@ -1169,6 +1177,12 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 		go panic(fmt.Sprintf("bad map request: %v", err))
 	}
 
+	s.mu.Lock()
+	if s.onMapRequest != nil {
+		s.onMapRequest(req.NodeKey)
+	}
+	s.mu.Unlock()
+
 	if s.AltMapStream != nil {
 		// The caller takes over the stream entirely; it must handle
 		// keeping the HTTP response alive until ctx is done.
@@ -1201,19 +1215,31 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 	var peersToUpdate []tailcfg.NodeID
 	if !req.ReadOnly && !streamingNonUpdate {
 		endpoints := filterInvalidIPv6Endpoints(req.Endpoints)
-		node.Endpoints = endpoints
-		node.DiscoKey = req.DiscoKey
-		node.Cap = req.Version
+		var hi tailcfg.HostinfoView
+		var newDERP int
 		if req.Hostinfo != nil {
-			node.Hostinfo = req.Hostinfo.View()
-			if ni := node.Hostinfo.NetInfo(); ni.Valid() {
-				if ni.PreferredDERP() != 0 {
-					node.HomeDERP = ni.PreferredDERP()
-				}
+			hi = req.Hostinfo.View()
+			if ni := hi.NetInfo(); ni.Valid() {
+				newDERP = ni.PreferredDERP()
 			}
 		}
+		// Mutate the live node under the mutex; writing back the clone
+		// obtained above would clobber any concurrent writer's changes
+		// to other fields (e.g. UpdateNode, SetNodeCapMap).
 		s.mu.Lock()
-		peersToUpdate = s.updateNodeLocked(node)
+		live := s.nodes[req.NodeKey]
+		if live != nil {
+			live.Endpoints = endpoints
+			live.DiscoKey = req.DiscoKey
+			live.Cap = req.Version
+			if hi.Valid() {
+				live.Hostinfo = hi
+				if newDERP != 0 {
+					live.HomeDERP = newDERP
+				}
+			}
+			peersToUpdate = s.nodeIDsLocked(live.ID)
+		}
 		s.mu.Unlock()
 	}
 
@@ -1618,6 +1644,15 @@ func (s *Server) encode(compress bool, v any) (b []byte, err error) {
 		b = zstdframe.AppendEncode(nil, b, zstdframe.FastestCompression)
 	}
 	return b, nil
+}
+
+// SetOnMapRequest sets callback used for testing when a new mapRequest happens.
+// Pass nil to remove the callback.
+func (s *Server) SetOnMapRequest(f func(key.NodePublic)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.onMapRequest = f
 }
 
 // filterInvalidIPv6Endpoints removes invalid IPv6 endpoints from eps,

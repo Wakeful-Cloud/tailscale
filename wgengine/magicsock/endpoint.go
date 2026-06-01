@@ -138,6 +138,13 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 func (de *endpoint) setBestAddrLocked(v addrQuality) {
 	if v.epAddr != de.bestAddr.epAddr {
 		de.probeUDPLifetime.resetCycleEndpointLocked()
+
+		// Reaching here, if we are using data from a cached netmap and we are
+		// upgrading from an invalid (missing) address to a valid one, increment
+		// the counter for peers established.
+		if !de.bestAddr.ap.IsValid() && v.ap.IsValid() && de.c.usingCachedNetmap.Load() {
+			metricCachedPeerContactDirect.Add(1)
+		}
 	}
 	de.bestAddr = v
 }
@@ -1374,12 +1381,19 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 		de.startDiscoPingLocked(epAddr{ap: ep}, now, pingDiscovery, 0, nil)
 	}
 	derpAddr := de.derpAddr
-	if sentAny && sendCallMeMaybe && derpAddr.IsValid() {
+	if sendCallMeMaybe && derpAddr.IsValid() && (sentAny || de.c.usingCachedNetmap.Load()) {
 		// Have our magicsock.Conn figure out its STUN endpoint (if
 		// it doesn't know already) and then send a CallMeMaybe
 		// message to our peer via DERP informing them that we've
 		// sent so our firewall ports are probably open and now
 		// would be a good time for them to connect.
+		//
+		// When working off of a cached netmap, send out a CallMeMaybe
+		// even if we don't know about any peer endpoints.
+		// Since we cannot rely on control to transfer endpoints for us,
+		// this makes establishing direct connections more reliable
+		// as the peer will respond with its own message and initiate
+		// the connection.
 		go de.c.enqueueCallMeMaybe(derpAddr, de)
 	}
 }

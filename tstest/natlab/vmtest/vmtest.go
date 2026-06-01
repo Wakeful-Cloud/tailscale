@@ -7,7 +7,7 @@
 // and multi-NIC configurations for scenarios like subnet routing.
 //
 // Prerequisites:
-//   - qemu-system-x86_64 and KVM access (typically the "kvm" group; no root required)
+//   - qemu-system-x86_64 (KVM is used automatically on Linux when /dev/kvm is accessible)
 //   - A built gokrazy natlabapp image (auto-built on first run via "make natlab" in gokrazy/)
 //
 // Run tests with:
@@ -38,6 +38,8 @@ import (
 	"time"
 
 	"github.com/google/gopacket/layers"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"go4.org/mem"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/local"
@@ -52,7 +54,7 @@ import (
 )
 
 var (
-	runVMTests     = flag.Bool("run-vm-tests", false, "run tests that require VMs with KVM")
+	runVMTests     = flag.Bool("run-vm-tests", false, "run tests that require QEMU VMs")
 	verboseVMDebug = flag.Bool("verbose-vm-debug", false, "enable verbose debug logging for VM tests")
 	testVersion    = flag.String("test-version", "", `if non-empty, download tailscale & tailscaled at the given release version (e.g. "1.97.255", "unstable", or "stable") instead of building from the source tree`)
 )
@@ -66,6 +68,7 @@ type Env struct {
 	nodes   []*Node
 	tempDir string
 
+	sockDir       string // short-path dir for Unix sockets (macOS has 104-byte limit)
 	sockAddr      string // shared Unix socket path for all QEMU netdevs
 	dgramSockAddr string // Unix dgram socket path for macOS VMs (tailmac)
 	binDir        string // directory for compiled binaries
@@ -88,6 +91,7 @@ type Env struct {
 
 	sameTailnetUser bool // all nodes register as the same Tailnet user
 	allOnline       bool // mark every peer as Online=true in MapResponses
+	peerRelayGrants bool // grant peer-relay capabilities on the wildcard packet filter
 
 	// Shared resource initialization (sync.Once for things multiple nodes share).
 	vnetOnce      sync.Once
@@ -310,9 +314,20 @@ func New(t testing.TB, opts ...EnvOption) *Env {
 	}
 
 	tempDir := t.TempDir()
+
+	// Unix sockets have a short path limit (104 bytes on macOS). The Go
+	// test TempDir path easily exceeds that, so create a dedicated short
+	// directory under /tmp for sockets.
+	sockDir, err := os.MkdirTemp("", "vmtest")
+	if err != nil {
+		t.Fatalf("creating socket tempdir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
 	e := &Env{
 		t:          t,
 		tempDir:    tempDir,
+		sockDir:    sockDir,
 		binDir:     filepath.Join(tempDir, "bin"),
 		eventBus:   newEventBus(),
 		testStatus: newTestStatus(),
@@ -357,6 +372,16 @@ func SameTailnetUser() EnvOption {
 // from disco-key rotations.
 func AllOnline() EnvOption {
 	return envOptFunc(func(e *Env) { e.allOnline = true })
+}
+
+// PeerRelayGrants returns an [EnvOption] that makes the test control server
+// grant [tailcfg.PeerCapabilityRelay] and [tailcfg.PeerCapabilityRelayTarget]
+// on the wildcard packet filter (testcontrol.Server.PeerRelayGrants). Without
+// those capabilities, magicsock does not consider any peer a candidate
+// peer-relay server, so a node that has [ipn.Prefs.RelayServerPort] set
+// cannot actually be used as a relay by its peers.
+func PeerRelayGrants() EnvOption {
+	return envOptFunc(func(e *Env) { e.peerRelayGrants = true })
 }
 
 // AddNetwork creates a new virtual network. Arguments follow the same pattern as
@@ -420,20 +445,36 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 		}
 	}
 
+	// macOS VMs require a macOS arm64 host (Apple Virtualization.framework via
+	// tailmac). Skip the test now rather than letting it proceed through the
+	// rest of the setup only to fail later.
+	if n.os.IsMacOS && (runtime.GOOS != "darwin" || runtime.GOARCH != "arm64") {
+		e.t.Skipf("macOS VM tests require a macOS arm64 host (got %s/%s)", runtime.GOOS, runtime.GOARCH)
+	}
+
 	n.vnetNode = e.cfg.AddNode(vnetOpts...)
 	n.num = n.vnetNode.Num()
 	return n
 }
 
-// LanIP returns the LAN IPv4 address of this node on the given network.
-// This is only valid after Env.Start() has been called.
-// Name returns the node's name as set in [Env.AddNode].
+// Name returns the name of the Node.
 func (n *Node) Name() string {
 	return n.name
 }
 
+// LanIP returns the LAN IPv4 address of this node on the given network.
+// This is only valid after Env.Start() has been called.
+// Name returns the node's name as set in [Env.AddNode].
 func (n *Node) LanIP(net *vnet.Network) netip.Addr {
 	return n.vnetNode.LanIP(net)
+}
+
+// DropControlTraffic sets up a blackhole for control traffic for just this
+// node on all the networks belonging to the node.
+func (n *Node) DropControlTraffic() {
+	for _, network := range n.nets {
+		network.BlackholeControlForAddr(n.LanIP(network))
+	}
 }
 
 // NodeOption types for configuring nodes.
@@ -494,12 +535,6 @@ func (e *Env) Start() {
 		}
 		e.testVersion = v
 		t.Logf("using Tailscale release version %s (from --test-version=%q)", v, *testVersion)
-	}
-
-	for _, n := range e.nodes {
-		if n.os.IsMacOS && (runtime.GOOS != "darwin" || runtime.GOARCH != "arm64") {
-			t.Skip("macOS VM tests require macOS arm64 host")
-		}
 	}
 
 	// Dry-run: let each platform register its steps with the web UI.
@@ -586,6 +621,31 @@ func (e *Env) Start() {
 				if st2.BackendState != "Running" {
 					return fmt.Errorf("[%s] state = %q, want Running", n.name, st2.BackendState)
 				}
+
+				// Apply any capabilities for the node to the map.
+				// SetNodeCapMap pushes an updated map response immediately, then wait
+				// until the node reports the capability in its status.
+				if cm := n.vnetNode.WantCapMap(); cm != nil {
+					e.server.ControlServer().SetNodeCapMap(st2.Self.PublicKey, cm)
+					if err := tstest.WaitFor(15*time.Second, func() error {
+						st, err := n.agent.Status(ctx)
+						if err != nil {
+							return err
+						}
+						if st.Self == nil {
+							return fmt.Errorf("self is nil")
+						}
+						for c := range cm {
+							if !st.Self.HasCap(c) {
+								return fmt.Errorf("cap %v not yet received", c)
+							}
+						}
+						return nil
+					}); err != nil {
+						return fmt.Errorf("[%s] waiting for capabilities: %w", n.name, err)
+					}
+				}
+
 				ips := fmt.Sprintf("%v", st2.Self.TailscaleIPs)
 				e.setNodeTailscale(n.name, "Running "+ips)
 				t.Logf("[%s] up with %v", n.name, st2.Self.TailscaleIPs)
@@ -799,6 +859,68 @@ func (e *Env) Status(n *Node) *ipnstate.Status {
 		e.t.Fatalf("Status(%s): %v", n.name, err)
 	}
 	return st
+}
+
+// ClientMetrics returns the client metrics exported by the given node.
+func (e *Env) ClientMetrics(n *Node) ClientMetrics {
+	e.t.Helper()
+	raw, err := n.Agent().DaemonMetrics(e.t.Context())
+	if err != nil {
+		e.t.Fatalf("Node %q DaemonMetrics: %v", n.Name(), err)
+	}
+
+	// Metrics are reported in Prometheus exposition format.
+	var parser expfmt.TextParser
+	mfs, err := parser.TextToMetricFamilies(bytes.NewReader(raw))
+	if err != nil {
+		e.t.Fatalf("Node %q parse client metrics: %v", n.Name(), err)
+	}
+
+	// Tailscale client metrics are all unlabelled integer-valued counters and
+	// gauges, so we don't need to handle the full generality of the Prometheus
+	// representation. If we see anything else, we'll log and skip it.
+	out := make(ClientMetrics)
+	for _, mf := range mfs {
+		name := mf.GetName()
+		if _, ok := out[name]; ok {
+			e.t.Logf("Node %q: duplicate client metric %q (ignored)", n.Name(), name)
+			continue
+		} else if len(mf.Metric) != 1 {
+			e.t.Logf("Node %q: got %d values for client metric %q, want 1 (ignored)", n.Name(), len(mf.Metric), name)
+			continue
+		}
+
+		var mtype string
+		var value int64
+		switch mf.GetType() {
+		case dto.MetricType_COUNTER:
+			mtype = "counter"
+			value = int64(mf.Metric[0].GetCounter().GetValue())
+		case dto.MetricType_GAUGE:
+			mtype = "gauge"
+			value = int64(mf.Metric[0].GetGauge().GetValue())
+		default:
+			e.t.Logf("Node %q unexpected client metric %q type %q (ignored)", n.Name(), name, mf.GetType().String())
+			continue
+		}
+		out[name] = ClientMetric{
+			Name:  name,
+			Type:  mtype,
+			Value: value,
+		}
+	}
+	return out
+}
+
+// ClientMetrics is a view of the client metrics exported by a node.
+// The keys of the map are the metric names.
+type ClientMetrics map[string]ClientMetric
+
+// ClientMetric is a view of a node client metric.
+type ClientMetric struct {
+	Name  string // as published to the clientmetrics package
+	Type  string // either "gauge" or "counter"
+	Value int64  // the gauge or counter value
 }
 
 // SetAcceptRoutes toggles the node's RouteAll preference (the
@@ -1254,6 +1376,9 @@ func (e *Env) initVnet() {
 		if e.allOnline {
 			e.server.ControlServer().AllOnline = true
 		}
+		if e.peerRelayGrants {
+			e.server.ControlServer().PeerRelayGrants = true
+		}
 	})
 }
 
@@ -1261,7 +1386,7 @@ func (e *Env) initVnet() {
 func (e *Env) ensureQEMUSocket() {
 	e.qemuSockOnce.Do(func() {
 		e.initVnet()
-		e.sockAddr = filepath.Join(e.tempDir, "vnet.sock")
+		e.sockAddr = filepath.Join(e.sockDir, "vnet.sock")
 		srv, err := net.Listen("unix", e.sockAddr)
 		if err != nil {
 			e.t.Fatalf("listen unix: %v", err)
@@ -1283,8 +1408,7 @@ func (e *Env) ensureQEMUSocket() {
 func (e *Env) ensureDgramSocket() {
 	e.dgramSockOnce.Do(func() {
 		e.initVnet()
-		e.dgramSockAddr = fmt.Sprintf("/tmp/vmtest-dgram-%d.sock", os.Getpid())
-		e.t.Cleanup(func() { os.Remove(e.dgramSockAddr) })
+		e.dgramSockAddr = filepath.Join(e.sockDir, "dgram.sock")
 		dgramAddr, err := net.ResolveUnixAddr("unixgram", e.dgramSockAddr)
 		if err != nil {
 			e.t.Fatalf("resolve dgram addr: %v", err)
@@ -1643,4 +1767,74 @@ func findKernelPath(goMod string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("gokrazy-kernel not found in %s", goMod)
+}
+
+// PingRoute describes what connection type was used to transfer a Disco ping.
+type PingRoute string
+
+const (
+	PingRouteDirect PingRoute = "direct"
+	PingRouteDERP   PingRoute = "derp"
+	PingRouteLocal  PingRoute = "local"
+	PingRouteNil    PingRoute = "nil"
+)
+
+// classifyPing finds what kind of route has been used on a ping path.
+// It is only really relevant for DiscoPings.
+func classifyPing(pr *ipnstate.PingResult) PingRoute {
+	if pr == nil {
+		return PingRouteNil
+	}
+
+	if pr.Endpoint == "" {
+		return PingRouteDERP
+	}
+
+	ap, err := netip.ParseAddrPort(pr.Endpoint)
+	if err == nil && ap.Addr().IsPrivate() {
+		return PingRouteLocal
+	}
+	return PingRouteDirect
+}
+
+// PingExpect retries disco pings until the result matches wantRoute or the
+// timeout is reached. It is using DiscoPings as this is the only ping type
+// that can classify the connection type.
+func (e *Env) PingExpect(from, to *Node, wantRoute PingRoute, timeout time.Duration) error {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(e.t.Context(), timeout)
+	defer cancel()
+	var lastRoute PingRoute
+	toSt, err := to.agent.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("ping: can't get %s status: %w", to.name, err)
+	}
+	if len(toSt.Self.TailscaleIPs) == 0 {
+		return fmt.Errorf("ping: %s has no Tailscale IPs", to.name)
+	}
+	targetIP := toSt.Self.TailscaleIPs[0]
+	for ctx.Err() == nil {
+		pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
+		pr, err := from.agent.PingWithOpts(pingCtx, targetIP, tailcfg.PingDisco, local.PingOpts{})
+		pingCancel()
+		if err == nil && pr.Err == "" {
+			if got := classifyPing(pr); got == wantRoute {
+				e.t.Logf("Saw ping type %q", got)
+				return nil
+			} else {
+				e.t.Logf("Saw ping type %q", got)
+				lastRoute = got
+			}
+		}
+		select {
+		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+		}
+	}
+	return fmt.Errorf("ping route = %q, want %q (after %v)", lastRoute, wantRoute, timeout)
+}
+
+// NumNodes returns the current number of nodes configured in the env.
+func (env *Env) NumNodes() int {
+	return len(env.nodes)
 }

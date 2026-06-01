@@ -1,6 +1,6 @@
 module tailscale.com
 
-go 1.26.2
+go 1.26.3
 
 require (
 	filippo.io/mkcert v1.4.4
@@ -19,6 +19,8 @@ require (
 	github.com/bradfitz/go-tool-cache v0.0.0-20260216153636-9e5201344fe5
 	github.com/bradfitz/monogok v0.0.0-20260429173803-229ef7981a6b
 	github.com/bramvdbogaerde/go-scp v1.4.0
+	github.com/chromedp/cdproto v0.0.0-20260321001828-e3e3800016bc
+	github.com/chromedp/chromedp v0.15.1
 	github.com/cilium/ebpf v0.16.0
 	github.com/coder/websocket v1.8.12
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6
@@ -38,9 +40,10 @@ require (
 	github.com/frankban/quicktest v1.14.6
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/gaissmai/bart v0.26.1
-	github.com/go-json-experiment/json v0.0.0-20250813024750-ebf49471dced
+	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433
 	github.com/go-logr/zapr v1.3.0
 	github.com/go-ole/go-ole v1.3.0
+	github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689
 	github.com/go4org/plan9netshell v0.0.0-20250324183649-788daa080737
 	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466
 	github.com/gokrazy/breakglass v0.0.0-20251229072214-9dbc0478d486
@@ -82,7 +85,6 @@ require (
 	github.com/pires/go-proxyproto v0.8.1
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/sftp v1.13.6
-	github.com/prometheus-community/pro-bing v0.4.0
 	github.com/prometheus/client_golang v1.23.0
 	github.com/prometheus/common v0.65.0
 	github.com/prometheus/prometheus v0.49.2-0.20240125131847-c3b8ef1694ff
@@ -114,14 +116,14 @@ require (
 	go.uber.org/zap v1.27.0
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
-	golang.org/x/crypto v0.50.0
+	golang.org/x/crypto v0.52.0
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b
 	golang.org/x/mod v0.35.0
-	golang.org/x/net v0.53.0
+	golang.org/x/net v0.55.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.43.0
-	golang.org/x/term v0.42.0
+	golang.org/x/sys v0.45.0
+	golang.org/x/term v0.43.0
 	golang.org/x/time v0.12.0
 	golang.org/x/tools v0.44.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
@@ -160,6 +162,7 @@ require (
 	github.com/armon/go-metrics v0.4.1 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/beevik/ntp v0.3.0 // indirect
+	github.com/benbjohnson/immutable v0.4.3
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/bombsimon/wsl/v4 v4.2.1 // indirect
@@ -167,6 +170,7 @@ require (
 	github.com/catenacyber/perfsprint v0.7.1 // indirect
 	github.com/ccojocar/zxcvbn-go v1.0.2 // indirect
 	github.com/chai2010/gettext-go v1.0.2 // indirect
+	github.com/chromedp/sysutil v1.1.0 // indirect
 	github.com/ckaznocha/intrange v0.1.0 // indirect
 	github.com/containerd/containerd v1.7.29 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
@@ -189,6 +193,9 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/gobuffalo/flect v1.0.3 // indirect
+	github.com/gobwas/httphead v0.1.0 // indirect
+	github.com/gobwas/pool v0.2.1 // indirect
+	github.com/gobwas/ws v1.4.0 // indirect
 	github.com/goccy/go-yaml v1.12.0 // indirect
 	github.com/gokrazy/gokapi v0.0.0-20250222071133-506fdb322775 // indirect
 	github.com/gokrazy/internal v0.0.0-20251208203110-3c1aa9087c82 // indirect
@@ -228,7 +235,7 @@ require (
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/moby/api v1.54.1 // indirect
 	github.com/moby/moby/client v0.4.0 // indirect
-	github.com/moby/spdystream v0.5.0 // indirect
+	github.com/moby/spdystream v0.5.1 // indirect
 	github.com/moby/term v0.5.2 // indirect
 	github.com/monochromegane/go-gitignore v0.0.0-20200626010858-205db1a8cc00 // indirect
 	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
@@ -488,7 +495,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20240314144324-c7f7c6466f7f // indirect
 	golang.org/x/image v0.27.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect

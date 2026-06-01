@@ -35,12 +35,13 @@ import (
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/health"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/kube/egressservices"
 	"tailscale.com/kube/kubeclient"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
-	"tailscale.com/types/netmap"
+	"tailscale.com/types/key"
 )
 
 const configFileAuthKey = "some-auth-key"
@@ -52,6 +53,7 @@ func TestContainerBoot(t *testing.T) {
 		t.Fatalf("Building containerboot: %v", err)
 	}
 	egressStatus := egressSvcStatus("foo", "foo.tailnetxyz.ts.net", "100.64.0.2")
+	egressStatusUpdated := egressSvcStatus("foo", "foo.tailnetxyz.ts.net", "100.64.0.3")
 
 	metricsURL := func(port int) string {
 		return fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
@@ -105,12 +107,10 @@ func TestContainerBoot(t *testing.T) {
 	}
 	runningNotify := &ipn.Notify{
 		State: new(ipn.Running),
-		NetMap: &netmap.NetworkMap{
-			SelfNode: (&tailcfg.Node{
-				StableID:  tailcfg.StableNodeID("myID"),
-				Name:      "test-node.test.ts.net.",
-				Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-			}).View(),
+		SelfChange: &tailcfg.Node{
+			StableID:  tailcfg.StableNodeID("myID"),
+			Name:      "test-node.test.ts.net.",
+			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 		},
 	}
 	type testCase struct {
@@ -383,18 +383,16 @@ func TestContainerBoot(t *testing.T) {
 					{
 						Notify: &ipn.Notify{
 							State: new(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("myID"),
-									Name:      "test-node.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-								}).View(),
-								Peers: []tailcfg.NodeView{
-									(&tailcfg.Node{
-										StableID:  tailcfg.StableNodeID("ipv6ID"),
-										Name:      "ipv6-node.test.ts.net.",
-										Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
-									}).View(),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							},
+							PeersChanged: []*tailcfg.Node{
+								{
+									StableID:  tailcfg.StableNodeID("ipv6ID"),
+									Name:      "ipv6-node.test.ts.net.",
+									Addresses: []netip.Prefix{netip.MustParsePrefix("::1/128")},
 								},
 							},
 						},
@@ -631,12 +629,10 @@ func TestContainerBoot(t *testing.T) {
 					{
 						Notify: &ipn.Notify{
 							State: new(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("newID"),
-									Name:      "new-name.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-								}).View(),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("newID"),
+								Name:      "new-name.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
 							},
 						},
 						WantKubeSecret: map[string]string{
@@ -1095,18 +1091,16 @@ func TestContainerBoot(t *testing.T) {
 					{
 						Notify: &ipn.Notify{
 							State: new(ipn.Running),
-							NetMap: &netmap.NetworkMap{
-								SelfNode: (&tailcfg.Node{
-									StableID:  tailcfg.StableNodeID("myID"),
-									Name:      "test-node.test.ts.net.",
-									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
-								}).View(),
-								Peers: []tailcfg.NodeView{
-									(&tailcfg.Node{
-										StableID:  tailcfg.StableNodeID("fooID"),
-										Name:      "foo.tailnetxyz.ts.net.",
-										Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")},
-									}).View(),
+							SelfChange: &tailcfg.Node{
+								StableID:  tailcfg.StableNodeID("myID"),
+								Name:      "test-node.test.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+							},
+							PeersChanged: []*tailcfg.Node{
+								{
+									StableID:  tailcfg.StableNodeID("fooID"),
+									Name:      "foo.tailnetxyz.ts.net.",
+									Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.2/32")},
 								},
 							},
 						},
@@ -1120,6 +1114,23 @@ func TestContainerBoot(t *testing.T) {
 						},
 						EndpointStatuses: map[string]int{
 							egressSvcTerminateURL(env.localAddrPort): 200,
+						},
+					},
+					{
+						Notify: &ipn.Notify{
+							PeersChanged: []*tailcfg.Node{{
+								StableID:  tailcfg.StableNodeID("fooID"),
+								Name:      "foo.tailnetxyz.ts.net.",
+								Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.3/32")},
+							}},
+						},
+						WantKubeSecret: map[string]string{
+							"egress-services":   string(mustJSON(t, egressStatusUpdated)),
+							"authkey":           "tskey-key",
+							"device_fqdn":       "test-node.test.ts.net.",
+							"device_id":         "myID",
+							"device_ips":        `["100.64.0.1"]`,
+							kubetypes.KeyCapVer: capver,
 						},
 					},
 				},
@@ -1275,6 +1286,12 @@ func TestContainerBoot(t *testing.T) {
 					if err := os.Chtimes(fullPath, now, now); err != nil {
 						t.Fatalf("phase %d: updating mtime for %q: %v", i, path, err)
 					}
+				}
+				if p.Notify != nil && p.Notify.InitialStatus == nil {
+					// Shallow-copy before mutating to avoid a race with
+					// parallel subtests that share the same *ipn.Notify.
+					p.Notify = new(*p.Notify)
+					p.Notify.InitialStatus = statusFromNotify(p.Notify)
 				}
 				env.lapi.Notify(p.Notify)
 				if p.Signal != nil {
@@ -1502,6 +1519,43 @@ func (lc *localAPI) Notify(n *ipn.Notify) {
 	defer lc.Unlock()
 	lc.notify = n
 	lc.cond.Broadcast()
+}
+
+func statusFromNotify(n *ipn.Notify) *ipnstate.Status {
+	st := new(ipnstate.Status)
+	if n.State != nil {
+		st.BackendState = n.State.String()
+	}
+	if n.SelfChange != nil {
+		st.Self = peerStatusFromNode(n.SelfChange.View())
+	}
+	if len(n.PeersChanged) != 0 {
+		st.Peer = map[key.NodePublic]*ipnstate.PeerStatus{}
+		for _, p := range n.PeersChanged {
+			pv := p.View()
+			st.Peer[pv.Key()] = peerStatusFromNode(pv)
+		}
+	}
+	return st
+}
+
+func peerStatusFromNode(n tailcfg.NodeView) *ipnstate.PeerStatus {
+	ps := &ipnstate.PeerStatus{
+		ID:        n.StableID(),
+		NodeID:    n.ID(),
+		PublicKey: n.Key(),
+		DNSName:   n.Name(),
+	}
+	for _, p := range n.Addresses().All() {
+		if p.IsSingleIP() {
+			ps.TailscaleIPs = append(ps.TailscaleIPs, p.Addr())
+		}
+	}
+	if n.AllowedIPs().Len() != 0 {
+		v := n.AllowedIPs()
+		ps.AllowedIPs = &v
+	}
+	return ps
 }
 
 func (lc *localAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
