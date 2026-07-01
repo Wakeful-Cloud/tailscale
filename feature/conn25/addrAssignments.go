@@ -79,7 +79,7 @@ func (a *addrAssignments) insertWithExpiry(as *addrs, d time.Duration) error {
 
 func (a *addrAssignments) lookupByDomainDst(domain dnsname.FQDN, dst netip.Addr) (*addrs, bool) {
 	v, ok := a.byDomainDst[domainDst{domain: domain, dst: dst}]
-	if !ok || v.expiresAt.Before(a.clock.Now()) {
+	if !ok {
 		return &addrs{}, false
 	}
 	return v, true
@@ -87,7 +87,7 @@ func (a *addrAssignments) lookupByDomainDst(domain dnsname.FQDN, dst netip.Addr)
 
 func (a *addrAssignments) lookupByMagicIP(mip netip.Addr) (*addrs, bool) {
 	v, ok := a.byMagicIP[mip]
-	if !ok || v.expiresAt.Before(a.clock.Now()) {
+	if !ok {
 		return &addrs{}, false
 	}
 	return v, true
@@ -95,22 +95,56 @@ func (a *addrAssignments) lookupByMagicIP(mip netip.Addr) (*addrs, bool) {
 
 func (a *addrAssignments) lookupByTransitIP(tip netip.Addr) (*addrs, bool) {
 	v, ok := a.byTransitIP[tip]
-	if !ok || v.expiresAt.Before(a.clock.Now()) {
+	if !ok {
 		return &addrs{}, false
 	}
 	return v, true
 }
 
-// popExpired returns the member of addrAssignments that expired earliest,
-// or an invalid addrs if there are no expired members of addrAssignments.
+const (
+	// deadFlowWaitTimeout is the minimum time after the active flow count
+	// drops to zero that we keep an address mapping in our table of address
+	// mappings.
+	deadFlowWaitTimeout = 2 * time.Minute
+
+	// extendForActiveFlowDuration is the minimum time we will wait to recheck
+	// an address mapping with a positive active flow count for removal from
+	// the table of address mappings.
+	extendForActiveFlowDuration = 24 * time.Hour
+)
+
+// popExpired attempts to remove from all the indexes one address
+// mapping, and return that mapping, or nil if there were no eligible mappings.
+// An address mapping is eligible for removal if:
+// - the current time is past the expiresAt time on the mapping
+// - and, the active flow count is 0
+// - and, it's been long enough since the active flow count dropped to 0
+// We're using a heap on expiresAt to efficiently find addresses that
+// are eligible for removal. expiresAt is initially set according to the
+// TTL on the DNS response. If the current time is past the expiresAt, but
+// there are active flows, we extend the expiresAt time into the future.
 func (a *addrAssignments) popExpired(now time.Time) *addrs {
 	if a.byExpiresAt.Len() == 0 {
 		return nil
 	}
-	if !a.byExpiresAt.peek().expiresAt.Before(now) {
-		return nil
+	var v *addrs
+	// Look for an address we can remove.
+	for {
+		if !a.byExpiresAt.peek().expiresAt.Before(now) {
+			// There's no longer anything outside the expiry window.
+			return nil
+		}
+		candidate := heap.Pop(&a.byExpiresAt).(*addrs)
+		if candidate.activeFlowCount == 0 && candidate.zeroFlowTime.Add(deadFlowWaitTimeout).Before(now) {
+			// Found one.
+			v = candidate
+			break
+		}
+		// Candidate can't be removed due to active flows. Extend expiresAt, and put it back in the heap.
+		candidate.expiresAt = now.Add(extendForActiveFlowDuration)
+		// TODO(mzb/fran): This is an expensive operation we could consider optimizing.
+		heap.Push(&a.byExpiresAt, candidate)
 	}
-	v := heap.Pop(&a.byExpiresAt).(*addrs)
 	delete(a.byMagicIP, v.magic)
 	delete(a.byTransitIP, v.transit)
 	dd := domainDst{domain: v.domain, dst: v.dst}

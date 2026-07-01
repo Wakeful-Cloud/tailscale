@@ -81,6 +81,7 @@ func init() {
 		}, nil
 	})
 	ipnlocal.RegisterPeerAPIHandler("/v0/connector/transit-ip", handleConnectorTransitIP)
+	ipnlocal.HookReplyToDNSQueries.Add(handleHookReplyToDNSQueries)
 }
 
 func handleConnectorTransitIP(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, r *http.Request) {
@@ -95,6 +96,18 @@ func handleConnectorTransitIP(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, 
 		return
 	}
 	e.handleConnectorTransitIP(h, w, r)
+}
+
+func handleHookReplyToDNSQueries(h ipnlocal.PeerAPIHandler) bool {
+	// TODO(tailscale/corp#39033): Remove for alpha release.
+	if !envknob.UseWIPCode() && !testenv.InTest() {
+		return false
+	}
+	e, ok := ipnlocal.GetExt[*extension](h.LocalBackend())
+	if !ok {
+		return false
+	}
+	return e.handleHookReplyToDNSQueries(h)
 }
 
 // extension is an [ipnext.Extension] managing the connector on platforms
@@ -134,6 +147,7 @@ func (e *extension) Init(host ipnext.Host) error {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	e.ctxCancel = cancel
 	go e.sendLoop(ctx)
+	dph.StartFlowExpirySweepers(ctx)
 	return nil
 }
 
@@ -195,11 +209,17 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 		}
 		return dph.HandlePacketFromTunDevice(p)
 	}
-	tun.PostFilterPacketInboundFromWireGuardAppConnector = func(p *packet.Parsed, _ *tstun.Wrapper) filter.Response {
+	tun.PostFilterPacketInboundFromWireGuardAppConnector = func(p *packet.Parsed, tun *tstun.Wrapper) filter.Response {
 		if !e.conn25.isConfigured() {
 			return filter.Accept
 		}
-		return dph.HandlePacketFromWireGuard(p)
+		return dph.HandlePacketFromWireGuard(p, tun)
+	}
+	tun.OnUnmappedTransitIPMessage = func(pkt packet.TailscaleRejectedHeader) {
+		if !e.conn25.isConfigured() {
+			return
+		}
+		e.conn25.client.resendTransitIPMapping(pkt.Dst.Addr())
 	}
 
 	// Manage how we react to changes to the current node,
@@ -256,7 +276,7 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 	return nil
 }
 
-// ClientTransitIPForMagicIP implements [IPMapper].
+// ClientTransitIPForMagicIP implements [Conn25Datapath].
 func (c *Conn25) ClientTransitIPForMagicIP(m netip.Addr) (netip.Addr, error) {
 	if addr, ok := c.client.transitIPForMagicIP(m); ok {
 		return addr, nil
@@ -271,7 +291,21 @@ func (c *Conn25) ClientTransitIPForMagicIP(m netip.Addr) (netip.Addr, error) {
 	return netip.Addr{}, ErrUnmappedMagicIP
 }
 
-// ConnectorRealIPForTransitIPConnection implements [IPMapper].
+// ClientFlowCreated implements [Conn25Datapath].
+// The datapath notifies Conn25 that a flow with transitIP has been created so
+// that Conn25 can prevent that transit IP and associated addresses from being
+// removed from its state and returned to their pools.
+func (c *Conn25) ClientFlowCreated(transitIP netip.Addr) {
+	c.client.flowCreated(transitIP)
+}
+
+// ClientFlowRemoved implements [Conn25Datapath].
+// See [Conn25.ClientFlowCreated].
+func (c *Conn25) ClientFlowRemoved(transitIP netip.Addr) {
+	c.client.flowRemoved(transitIP)
+}
+
+// ConnectorRealIPForTransitIPConnection implements [Conn25Datapath].
 func (c *Conn25) ConnectorRealIPForTransitIPConnection(src, transit netip.Addr) (netip.Addr, error) {
 	if addr, ok := c.connector.realIPForTransitIPConnection(src, transit); ok {
 		return addr, nil
@@ -326,6 +360,15 @@ func (e *extension) handleConnectorTransitIP(h ipnlocal.PeerAPIHandler, w http.R
 	w.Write(bs)
 }
 
+func (e *extension) handleHookReplyToDNSQueries(h ipnlocal.PeerAPIHandler) bool {
+	if !e.conn25.isConfigured() {
+		return false
+	}
+	// TODO(tailscale/corp#40076): verify the peer has access to the query's
+	// app (if any) domain.
+	return true
+}
+
 // onSelfChange implements the [ipnext.Hooks.OnSelfChange] hook.
 func (e *extension) onSelfChange(selfNode tailcfg.NodeView) {
 	cfg, err := configFromNodeView(selfNode)
@@ -373,21 +416,25 @@ func (c *Conn25) isConfigured() bool {
 
 func newConn25(logf logger.Logf) *Conn25 {
 	c := &Conn25{
-		logf:      logf,
-		connector: &connector{logf: logf},
+		logf: logf,
+	}
+	getIPSets := func() ipSets {
+		cfg, ok := c.getConfig()
+		if !ok {
+			return emptyIPSets()
+		}
+		return cfg.ipSets
 	}
 	c.config.Store(&config{}) // initialize with empty to avoid nil checks
 	c.client = &client{
 		logf:        logf,
 		addrsCh:     make(chan addrs, 64),
 		assignments: addrAssignments{clock: tstime.StdClock{}},
-		getIPSets: func() ipSets {
-			cfg, ok := c.getConfig()
-			if !ok {
-				return emptyIPSets()
-			}
-			return cfg.ipSets
-		},
+		getIPSets:   getIPSets,
+	}
+	c.connector = &connector{
+		logf:      logf,
+		getIPSets: getIPSets,
 	}
 	return c
 }
@@ -703,8 +750,8 @@ type client struct {
 	byConnKey       map[key.NodePublic]set.Set[netip.Prefix]
 }
 
-// transitIPForMagicIP is part of the implementation of the IPMapper interface for dataflows lookups.
-// See also [IPMapper.ClientTransitIPForMagicIP].
+// transitIPForMagicIP is part of the implementation of the [Conn25Datapath] interface for dataflow lookups.
+// See also [Conn25Datapath.ClientTransitIPForMagicIP].
 func (c *client) transitIPForMagicIP(magicIP netip.Addr) (netip.Addr, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -901,6 +948,29 @@ func (c *client) enqueueAddressAssignment(addrs *addrs) error {
 	default:
 		c.logf("address assignment queue full, dropping transit assignment for %v", addrs.domain)
 		return errors.New("queue full")
+	}
+}
+
+func (c *client) flowCreated(transit netip.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.assignments.byTransitIP[transit]
+	if !ok {
+		return
+	}
+	entry.activeFlowCount++
+}
+
+func (c *client) flowRemoved(transit netip.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.assignments.byTransitIP[transit]
+	if !ok {
+		return
+	}
+	entry.activeFlowCount--
+	if entry.activeFlowCount == 0 {
+		entry.zeroFlowTime = c.assignments.clock.Now()
 	}
 }
 
@@ -1253,7 +1323,8 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 }
 
 type connector struct {
-	logf logger.Logf
+	logf      logger.Logf
+	getIPSets func() ipSets
 
 	mu sync.Mutex // protects the fields below
 	// transitIPs is a map of connector client peer IP -> client transitIPs that we update as connector client peers instruct us to, and then use to route traffic to its destination on behalf of connector clients.
@@ -1261,8 +1332,8 @@ type connector struct {
 	transitIPs map[netip.Addr]map[netip.Addr]appAddr
 }
 
-// realIPForTransitIPConnection is part of the implementation of the IPMapper interface for dataflows lookups.
-// See also [IPMapper.ConnectorRealIPForTransitIPConnection].
+// realIPForTransitIPConnection is part of the implementation of the [Conn25Datapath] interface for dataflow lookups.
+// See also [Conn25Datapath.ConnectorRealIPForTransitIPConnection].
 func (c *connector) realIPForTransitIPConnection(srcIP netip.Addr, transitIP netip.Addr) (netip.Addr, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1275,13 +1346,16 @@ func (c *connector) realIPForTransitIPConnection(srcIP netip.Addr, transitIP net
 
 const packetFilterAllowReason = "app connector transit IP"
 
-// packetFilterAllow returns true if the provided packet has a Src that maps to a peer
-// that has a transit IP with us that is the packet Dst, and false otherwise.
+// packetFilterAllow returns true if the provided packet has a Src that is in
+// the configured transit IP range for this connector, false otherwise.
 func (c *connector) packetFilterAllow(p packet.Parsed) (bool, string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, ok := c.lookupBySrcIPAndTransitIP(p.Src.Addr(), p.Dst.Addr())
-	if ok {
+	ipSets := c.getIPSets()
+	if ipSets.v4Transit != nil && ipSets.v4Transit.Contains(p.Dst.Addr()) {
+		return true, packetFilterAllowReason
+	}
+	if ipSets.v6Transit != nil && ipSets.v6Transit.Contains(p.Dst.Addr()) {
 		return true, packetFilterAllowReason
 	}
 	return false, ""
@@ -1297,12 +1371,14 @@ func (c *connector) lookupBySrcIPAndTransitIP(srcIP, transitIP netip.Addr) (appA
 }
 
 type addrs struct {
-	dst       netip.Addr
-	magic     netip.Addr
-	transit   netip.Addr
-	domain    dnsname.FQDN
-	app       string
-	expiresAt time.Time
+	dst             netip.Addr
+	magic           netip.Addr
+	transit         netip.Addr
+	domain          dnsname.FQDN
+	app             string
+	expiresAt       time.Time
+	activeFlowCount int
+	zeroFlowTime    time.Time
 }
 
 func (as addrs) isValid() bool {
@@ -1327,11 +1403,7 @@ func (c *client) insertTransitConnMapping(tip netip.Addr, connKey key.NodePublic
 
 	ctips, ok := c.byConnKey[connKey]
 	tipp := netip.PrefixFrom(tip, tip.BitLen())
-	if ok {
-		if ctips.Contains(tipp) {
-			return errors.New("byConnKey already contains transit")
-		}
-	} else {
+	if !ok {
 		ctips.Make()
 		mak.Set(&c.byConnKey, connKey, ctips)
 	}
@@ -1348,4 +1420,20 @@ func (c *client) lookupTransitIPsByConnKey(k key.NodePublic) ([]netip.Prefix, bo
 		return nil, false
 	}
 	return s.Slice(), true
+}
+
+// resendTransitIPMapping enqueues a request to re-establish an existing
+// transit IP-real IP mapping after a connector tells the client that the
+// mapping does not exist on its end. If a mapping is not found on the client
+// either, this is a no-op.
+func (c *client) resendTransitIPMapping(transitIP netip.Addr) {
+	mapping, ok := c.assignments.lookupByTransitIP(transitIP)
+	if !ok {
+		// We have no mappings for this transit IP, so nothing to resend.
+		return
+	}
+	err := c.enqueueAddressAssignment(mapping)
+	if err != nil {
+		c.logf("error enqueueing address assignment for resend: %v", err)
+	}
 }
