@@ -63,19 +63,20 @@ func (rh TailscaleRejectedHeader) String() string {
 	return fmt.Sprintf("TSMP-reject-flow{%s %s > %s}: %s", rh.Proto, rh.Src, rh.Dst, rh.Reason)
 }
 
+// TSMPType is the type byte of a TSMP message. It follows the IPv4 or IPv6 header.
 type TSMPType uint8
 
 const (
-	// TSMPTypeRejectedConn is the type byte for a TailscaleRejectedHeader.
+	// TSMPTypeRejectedConn is the type byte for a [TailscaleRejectedHeader].
 	TSMPTypeRejectedConn TSMPType = '!'
 
-	// TSMPTypePing is the type byte for a TailscalePingRequest.
+	// TSMPTypePing is the type byte for a [TSMPPingRequest].
 	TSMPTypePing TSMPType = 'p'
 
-	// TSMPTypePong is the type byte for a TailscalePongResponse.
+	// TSMPTypePong is the type byte for a [TSMPPongReply].
 	TSMPTypePong TSMPType = 'o'
 
-	// TSPMTypeDiscoAdvertisement is the type byte for sending disco keys
+	// TSMPTypeDiscoAdvertisement is the type byte for a [TSMPDiscoKeyAdvertisement].
 	TSMPTypeDiscoAdvertisement TSMPType = 'a'
 )
 
@@ -272,7 +273,9 @@ func (h TSMPPongReply) Marshal(buf []byte) error {
 	return nil
 }
 
-// TSMPDiscoKeyAdvertisement is a TSMP message that's used for distributing Disco Keys.
+// TSMPDiscoKeyAdvertisement is a TSMP message that's used for distributing
+// [key.DiscoPublic]. It is sent immediately following eligible WireGuard
+// session establishment starting at [tailscale.com/tailcfg.CapabilityVersion] 144.
 //
 // On the wire, after the IP header, it's currently 33 bytes:
 //   - 'a' (TSMPTypeDiscoAdvertisement)
@@ -282,6 +285,10 @@ type TSMPDiscoKeyAdvertisement struct {
 	Key      key.DiscoPublic
 }
 
+// Marshal marshals ka to a wire representation appropriate for transmission
+// over WireGuard to a remote client. A marshaled [TSMPDiscoKeyAdvertisement]
+// must not exceed [github.com/tailscale/wireguard-go/device.MaxPriorityMessageContentSize],
+// or wireguard-go will reject and discard the payload.
 func (ka *TSMPDiscoKeyAdvertisement) Marshal() ([]byte, error) {
 	var iph Header
 	if ka.Src.Is4() {
@@ -297,7 +304,7 @@ func (ka *TSMPDiscoKeyAdvertisement) Marshal() ([]byte, error) {
 			Dst:     ka.Dst,
 		}
 	}
-	payload := make([]byte, 0, 33)
+	payload := make([]byte, 0, 1+key.DiscoPublicRawLen)
 	payload = append(payload, byte(TSMPTypeDiscoAdvertisement))
 	payload = ka.Key.AppendTo(payload)
 	if len(payload) != 33 {

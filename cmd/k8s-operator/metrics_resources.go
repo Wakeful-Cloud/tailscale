@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -36,6 +37,16 @@ const (
 	serviceMonitorCRD = "servicemonitors.monitoring.coreos.com"
 )
 
+func hasServiceMonitorCRD(ctx context.Context, cl client.Client) (bool, error) {
+	sm := &apiextensionsv1.CustomResourceDefinition{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: serviceMonitorCRD}, sm); apierrors.IsNotFound(err) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ServiceMonitor contains a subset of fields of servicemonitors.monitoring.coreos.com Custom Resource Definition.
 // Duplicating it here allows us to avoid importing prometheus-operator library.
 // https://github.com/prometheus-operator/prometheus-operator/blob/bb4514e0d5d69f20270e29cfd4ad39b87865ccdf/pkg/apis/monitoring/v1/servicemonitor_types.go#L40
@@ -55,7 +66,7 @@ type ServiceMonitorSpec struct {
 	JobLabel string `json:"jobLabel"`
 	// NamespaceSelector selects the namespace of Service(s) that this ServiceMonitor allows to scrape.
 	// https://github.com/prometheus-operator/prometheus-operator/blob/bb4514e0d5d69f20270e29cfd4ad39b87865ccdf/pkg/apis/monitoring/v1/servicemonitor_types.go#L88
-	NamespaceSelector ServiceMonitorNamespaceSelector `json:"namespaceSelector,omitempty"`
+	NamespaceSelector ServiceMonitorNamespaceSelector `json:"namespaceSelector"`
 	// Selector is the label selector for Service(s) that this ServiceMonitor allows to scrape.
 	// https://github.com/prometheus-operator/prometheus-operator/blob/bb4514e0d5d69f20270e29cfd4ad39b87865ccdf/pkg/apis/monitoring/v1/servicemonitor_types.go#L85
 	Selector metav1.LabelSelector `json:"selector"`

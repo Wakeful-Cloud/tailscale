@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -227,12 +228,23 @@ func (er *egressPodsReconciler) lookupPodRouteViaSvc(ctx context.Context, pod *c
 		lg.Debugf("Pod does not have health check enabled, unable to verify if it is currently routable via Service")
 		return cannotVerify, nil
 	}
-	wantsIP, err := podIPv4(pod)
-	if err != nil {
-		return -1, fmt.Errorf("error determining Pod's IP address: %w", err)
-	}
-	if wantsIP == "" {
+	// Use the Pod's primary IP (PodIPs[0]) to identify this Pod in the health check
+	// response. The primary IP family is determined by the cluster's IP family configuration.
+
+	// Note: we do not control which IP family the request uses, so on a dual-stack
+	// cluster either IPv4 or IPv6 could be used. In either case, a matching IP header
+	// comfirms the request reached this Pod.
+	if len(pod.Status.PodIPs) == 0 || pod.Status.PodIPs[0].IP == "" {
 		return podNotReady, nil
+	}
+	wantsIP := pod.Status.PodIPs[0].IP
+	parsed, err := netip.ParseAddr(wantsIP)
+	if err != nil {
+		return -1, fmt.Errorf("error parsing Pod IP %q: %w", wantsIP, err)
+	}
+	header := kubetypes.PodIPv4Header
+	if parsed.Is6() {
+		header = kubetypes.PodIPv6Header
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
@@ -250,7 +262,7 @@ func (er *egressPodsReconciler) lookupPodRouteViaSvc(ctx context.Context, pod *c
 		return unreachable, nil
 	}
 	defer resp.Body.Close()
-	gotIP := resp.Header.Get(kubetypes.PodIPv4Header)
+	gotIP := resp.Header.Get(header)
 	if gotIP == "" {
 		lg.Debugf("Health check does not return Pod's IP header, unable to verify if Pod is currently routable via Service")
 		return cannotVerify, nil

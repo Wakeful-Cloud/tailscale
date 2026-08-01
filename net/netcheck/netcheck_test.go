@@ -468,7 +468,7 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			for _, s := range tt.steps {
 				fakeTime = fakeTime.Add(s.after)
 				rs.start = fakeTime.Add(-100 * time.Millisecond)
-				c.addReportHistoryAndSetPreferredDERP(rs, s.r, dm.View())
+				c.addReportHistoryAndSetPreferredDERP(rs, s.r, dm.View(), fakeTime)
 			}
 			lastReport := tt.steps[len(tt.steps)-1].r
 			if got, want := len(c.prev), tt.wantPrevLen; got != want {
@@ -512,7 +512,7 @@ func TestRecentReportsRetainFullNetcheck(t *testing.T) {
 	const tick = time.Minute
 	start := time.Unix(1700000000, 0)
 	var lastFull time.Time // zero => first report is full, as in GetReport
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		now = start.Add(time.Duration(i) * tick)
 
 		// Mirror GetReport's full-vs-incremental decision.
@@ -522,7 +522,7 @@ func TestRecentReportsRetainFullNetcheck(t *testing.T) {
 			regions = allRegions
 			lastFull = now
 		}
-		c.addReportHistoryAndSetPreferredDERP(&reportState{c: c, start: now}, mkReport(regions), dm.View())
+		c.addReportHistoryAndSetPreferredDERP(&reportState{c: c, start: now}, mkReport(regions), dm.View(), now)
 
 		// Recent latency must always cover every region, which is only
 		// possible while a full report remains in c.prev.
@@ -1099,5 +1099,120 @@ func TestNoUDPNilGetReportOpts(t *testing.T) {
 	}
 	if r.UDP {
 		t.Fatal("unexpected working UDP")
+	}
+}
+
+func TestRegionLatencyCompare(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lat  RegionLatency
+		i    int
+		j    int
+		want int
+	}{
+		{
+			name: "no-lat-ids-equal",
+			lat:  RegionLatency{},
+			i:    1,
+			j:    1,
+			want: 0,
+		},
+		{
+			name: "no-lat-ids-increasing",
+			lat:  RegionLatency{},
+			i:    1,
+			j:    2,
+			want: -1,
+		},
+		{
+			name: "no-lat-ids-decreasing",
+			lat:  RegionLatency{},
+			i:    2,
+			j:    1,
+			want: +1,
+		},
+		{
+			name: "i-lat-only-ids-increasing",
+			lat:  RegionLatency{1: 10},
+			i:    1,
+			j:    2,
+			want: -1,
+		},
+		{
+			name: "i-lat-only-ids-decreasing",
+			lat:  RegionLatency{2: 20},
+			i:    2,
+			j:    1,
+			want: -1,
+		},
+		{
+			name: "j-lat-only-ids-increasing",
+			lat:  RegionLatency{2: 20},
+			i:    1,
+			j:    2,
+			want: +1,
+		},
+		{
+			name: "j-lat-only-ids-decreasing",
+			lat:  RegionLatency{1: 10},
+			i:    2,
+			j:    1,
+			want: +1,
+		},
+		{
+			name: "i-lower-lat-ids-increasing",
+			lat:  RegionLatency{1: 10, 2: 20},
+			i:    1,
+			j:    2,
+			want: -1,
+		},
+		{
+			name: "i-lower-lat-ids-decreasing",
+			lat:  RegionLatency{2: 20, 1: 100},
+			i:    2,
+			j:    1,
+			want: -1,
+		},
+		{
+			name: "j-lower-lat-ids-increasing",
+			lat:  RegionLatency{1: 100, 2: 20},
+			i:    1,
+			j:    2,
+			want: +1,
+		},
+		{
+			name: "j-lower-lat-ids-decreasing",
+			lat:  RegionLatency{2: 20, 1: 10},
+			i:    2,
+			j:    1,
+			want: +1,
+		},
+		{
+			name: "equal-lat-ids-increasing",
+			lat:  RegionLatency{1: 10, 2: 10},
+			i:    1,
+			j:    2,
+			want: -1,
+		},
+		{
+			name: "equal-lat-ids-decreasing",
+			lat:  RegionLatency{2: 20, 1: 20},
+			i:    2,
+			j:    1,
+			want: +1,
+		},
+		{
+			name: "equal-lat-ids-equal",
+			lat:  RegionLatency{1: 10},
+			i:    1,
+			j:    1,
+			want: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.lat.Compare(tc.i, tc.j); got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

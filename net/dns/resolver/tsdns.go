@@ -49,8 +49,26 @@ const dnsSymbolicFQDN = "magicdns.localhost-tailscale-daemon."
 // truncation in a platform-agnostic way.
 const maxResponseBytes = 4095
 
-// defaultTTL is the TTL of all responses from Resolver.
-const defaultTTL = 600 * time.Second
+// defaultTTL is the TTL of positive responses from Resolver.
+//
+// It's short because the source of truth (the netmap-fed host maps)
+// is local and in-memory, so re-queries are nearly free, while
+// anything cached downstream (e.g. mDNSResponder on macOS) delays
+// clients noticing node renames for the full TTL (tailscale/corp#45631).
+const defaultTTL = 5 * time.Second
+
+// negativeTTL is how long resolvers may cache the nonexistence of a
+// name (or of records of the queried type) for domains we're
+// authoritative for. It's advertised via the SOA record attached to
+// the authority section of NXDOMAIN and no-data responses, per RFC
+// 2308. Without it, some resolvers (notably mDNSResponder) seem to
+// cache negative entries for a really long time, so a name queried
+// shortly before a node rename doesn't start resolving for a while
+// (tailscale/corp#45631).
+const negativeTTL = 10 * time.Second
+
+// timeNow is time.Now, except in tests.
+var timeNow = time.Now
 
 var (
 	errNotQuery   = errors.New("not a DNS query")
@@ -229,6 +247,53 @@ type Resolver struct {
 	hostToIP       map[dnsname.FQDN][]netip.Addr
 	ipToHost       map[netip.Addr]dnsname.FQDN
 	subdomainHosts set.Set[dnsname.FQDN]
+	magicHosts     MagicDNSHosts // or nil if none installed
+}
+
+// MagicDNSHosts is a live source of MagicDNS host records, installed
+// via [Resolver.SetMagicDNSHosts].
+//
+// It replaces the per-node entries of [Config.Hosts]: instead of the
+// caller pushing a full snapshot of every node's name and addresses
+// into the resolver on every (possibly incremental) netmap change,
+// the resolver pulls the answer for one name on demand from the
+// caller's live indexes. [Config.Hosts] remains for control's
+// DNS.ExtraRecords entries, which are few, and is consulted first.
+//
+// Implementations must be safe for concurrent use and cheap: the
+// methods are called on the DNS query serving path. Name lookups are
+// case-insensitive: the resolver passes lowercase names, but
+// implementations must not rely on that.
+type MagicDNSHosts interface {
+	// LookupHost returns the IPs to answer for the node with the
+	// given MagicDNS FQDN, and whether the name is known. It returns
+	// all answerable IPs regardless of record type; the resolver
+	// filters them by the query's type, and a known name with no IPs
+	// of the query's family is "name exists, no records", not
+	// NXDOMAIN.
+	LookupHost(dnsname.FQDN) (ips []netip.Addr, ok bool)
+
+	// LookupPTR returns the MagicDNS FQDN of the node that owns
+	// the given Tailscale IP, and whether the IP is known.
+	LookupPTR(netip.Addr) (_ dnsname.FQDN, ok bool)
+
+	// SubdomainHost reports whether fqdn names a node with the
+	// [tailcfg.NodeAttrDNSSubdomainResolve] attribute, whose
+	// subdomains all resolve to the node's own addresses.
+	SubdomainHost(dnsname.FQDN) bool
+}
+
+// SetMagicDNSHosts installs the live MagicDNS host source consulted
+// by forward and reverse MagicDNS lookups that miss [Config.Hosts].
+// It is expected to be called once, before the resolver serves
+// queries.
+func (r *Resolver) SetMagicDNSHosts(h MagicDNSHosts) {
+	if !buildfeatures.HasDNS {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.magicHosts = h
 }
 
 type ForwardLinkSelector interface {
@@ -682,13 +747,21 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 	hosts := r.hostToIP
 	localDomains := r.localDomains
 	subdomainHosts := r.subdomainHosts
+	magicHosts := r.magicHosts
 	r.mu.Unlock()
 
 	addrs, found := hosts[domain]
+	if !found && magicHosts != nil {
+		addrs, found = magicHosts.LookupHost(domain)
+	}
 	if !found {
 		for parent := domain.Parent(); parent != ""; parent = parent.Parent() {
 			if subdomainHosts.Contains(parent) {
 				addrs, found = hosts[parent]
+				break
+			}
+			if magicHosts != nil && magicHosts.SubdomainHost(parent) {
+				addrs, found = magicHosts.LookupHost(parent)
 				break
 			}
 		}
@@ -865,6 +938,9 @@ func (r *Resolver) fqdnForIPLocked(ip netip.Addr, name dnsname.FQDN) (dnsname.FQ
 	}
 
 	ret, ok := r.ipToHost[ip]
+	if !ok && r.magicHosts != nil {
+		ret, ok = r.magicHosts.LookupPTR(ip)
+	}
 	if !ok {
 		for _, suffix := range r.localDomains {
 			if suffix.Contains(name) {
@@ -902,6 +978,14 @@ type response struct {
 
 	// NSs are the responses to an NS query.
 	NSs []*net.NS
+
+	// SOAZone, if non-empty, is the zone we're authoritative for
+	// that contains Question's name. marshalResponse attaches its
+	// SOA record to the authority section so that resolvers bound
+	// their negative caching to negativeTTL, per RFC 2308. It must
+	// only be set on negative responses: NXDOMAIN, or success with
+	// no records of the queried type.
+	SOAZone dnsname.FQDN
 }
 
 var dnsParserPool = &sync.Pool{
@@ -1083,6 +1167,35 @@ func marshalSRV(queryName dns.Name, srvs []*net.SRV, builder *dns.Builder) error
 	return nil
 }
 
+// marshalSOA serializes zone's SOA record into the authority section
+// of an active builder, which must have had StartAuthorities called.
+// Its only purpose is communicating negativeTTL to caching resolvers
+// (RFC 2308), so all fields other than the TTLs are placeholders.
+func marshalSOA(zone dnsname.FQDN, builder *dns.Builder) error {
+	name, err := dns.NewName(zone.WithTrailingDot())
+	if err != nil {
+		return err
+	}
+	return builder.SOAResource(dns.ResourceHeader{
+		Name:  name,
+		Type:  dns.TypeSOA,
+		Class: dns.ClassINET,
+		TTL:   uint32(negativeTTL / time.Second),
+	}, dns.SOAResource{
+		NS:   name,
+		MBox: name,
+		// A serial should only change when the zone data does,
+		// but nothing consumes ours (no secondaries, no zone
+		// transfers), and the current time is at least monotonic
+		// and cheap. Unix seconds fit in the uint32 until 2106.
+		Serial:  uint32(timeNow().Unix()),
+		Refresh: uint32(negativeTTL / time.Second),
+		Retry:   uint32(negativeTTL / time.Second),
+		Expire:  uint32(negativeTTL / time.Second),
+		MinTTL:  uint32(negativeTTL / time.Second),
+	})
+}
+
 // marshalResponse serializes the DNS response into a new buffer.
 func marshalResponse(resp *response) ([]byte, error) {
 	resp.Header.Response = true
@@ -1117,6 +1230,14 @@ func marshalResponse(resp *response) ([]byte, error) {
 
 	// Only successful responses contain answers.
 	if !isSuccess {
+		if resp.SOAZone != "" {
+			if err := builder.StartAuthorities(); err != nil {
+				return nil, err
+			}
+			if err := marshalSOA(resp.SOAZone, &builder); err != nil {
+				return nil, err
+			}
+		}
 		return builder.Finish()
 	}
 
@@ -1148,6 +1269,15 @@ func marshalResponse(resp *response) ([]byte, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	if resp.SOAZone != "" {
+		if err := builder.StartAuthorities(); err != nil {
+			return nil, err
+		}
+		if err := marshalSOA(resp.SOAZone, &builder); err != nil {
+			return nil, err
+		}
 	}
 
 	return builder.Finish()
@@ -1267,6 +1397,19 @@ func rdnsNameToIPv6(name dnsname.FQDN) (ip netip.Addr, ok bool) {
 
 // respondReverse returns a DNS response to a PTR query.
 // It is assumed that resp.Question is populated by respond before this is called.
+// authoritativeZoneFor returns the zone from the configured local
+// domains that contains name, or "" if none does.
+func (r *Resolver) authoritativeZoneFor(name dnsname.FQDN) dnsname.FQDN {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, suffix := range r.localDomains {
+		if suffix.Contains(name) {
+			return suffix
+		}
+	}
+	return ""
+}
+
 func (r *Resolver) respondReverse(query []byte, name dnsname.FQDN, resp *response) ([]byte, error) {
 	if hasRDNSBonjourPrefix(name) {
 		metricDNSReverseMissBonjour.Add(1)
@@ -1277,6 +1420,9 @@ func (r *Resolver) respondReverse(query []byte, name dnsname.FQDN, resp *respons
 	if resp.Header.RCode == dns.RCodeRefused {
 		metricDNSReverseMissOther.Add(1)
 		return nil, errNotOurName
+	}
+	if resp.Header.RCode == dns.RCodeNameError {
+		resp.SOAZone = r.authoritativeZoneFor(name)
 	}
 
 	metricDNSMagicDNSSuccessReverse.Add(1)
@@ -1334,6 +1480,17 @@ func (r *Resolver) respond(query []byte) ([]byte, error) {
 	resp := parser.response()
 	resp.Header.RCode = rcode
 	resp.IP = ip
+	switch {
+	case rcode == dns.RCodeNameError:
+		resp.SOAZone = r.authoritativeZoneFor(name)
+	case rcode == dns.RCodeSuccess && !ip.IsValid():
+		switch parser.Question.Type {
+		case dns.TypeA, dns.TypeAAAA, dns.TypeALL:
+			// The name exists but has no records of the queried
+			// type (e.g. an AAAA query for an IPv4-only node).
+			resp.SOAZone = r.authoritativeZoneFor(name)
+		}
+	}
 	metricDNSMagicDNSSuccessName.Add(1)
 	return marshalResponse(resp)
 }

@@ -6,7 +6,9 @@
 package acme
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -20,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,7 +34,7 @@ import (
 	"tailscale.com/ipn/ipnlocal/ipnlocaltest"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tempfork/acme"
+	xacme "tailscale.com/tempfork/acme"
 	"tailscale.com/tsconst"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
@@ -263,7 +266,7 @@ func TestACMETLSALPNCertHook(t *testing.T) {
 
 	if got, ok := b.ForTest().GetACMETLSALPNCert(&tls.ClientHelloInfo{
 		ServerName:      "example.com",
-		SupportedProtos: []string{acme.ALPNProto},
+		SupportedProtos: []string{xacme.ALPNProto},
 	}); !ok || got != cert {
 		t.Fatalf("getACMETLSALPNCert = %v, %v; want stored cert, true", got, ok)
 	}
@@ -275,7 +278,7 @@ func TestACMETLSALPNCertHook(t *testing.T) {
 	}
 	if _, ok := b.ForTest().GetACMETLSALPNCert(&tls.ClientHelloInfo{
 		ServerName:      "other.example.com",
-		SupportedProtos: []string{acme.ALPNProto},
+		SupportedProtos: []string{xacme.ALPNProto},
 	}); ok {
 		t.Fatal("getACMETLSALPNCert for other name = ok, want false")
 	}
@@ -283,7 +286,7 @@ func TestACMETLSALPNCertHook(t *testing.T) {
 	otherBackend := ipnlocaltest.NewBackend(t)
 	if _, ok := otherBackend.ForTest().GetACMETLSALPNCert(&tls.ClientHelloInfo{
 		ServerName:      "example.com",
-		SupportedProtos: []string{acme.ALPNProto},
+		SupportedProtos: []string{xacme.ALPNProto},
 	}); ok {
 		t.Fatal("getACMETLSALPNCert on different LocalBackend = ok, want false")
 	}
@@ -642,7 +645,8 @@ func TestDebugACMEDirectoryURL(t *testing.T) {
 		const setting = "TS_DEBUG_ACME_DIRECTORY_URL"
 		t.Run(tc, func(t *testing.T) {
 			t.Setenv(setting, tc)
-			ac, err := acmeClient(certStateStore{StateStore: new(mem.Store)})
+			e := &extension{}
+			ac, err := e.acmeClient(certStateStore{StateStore: new(mem.Store)})
 			if err != nil {
 				t.Fatalf("acmeClient creation err: %v", err)
 			}
@@ -799,6 +803,81 @@ func TestGetCertPEMWithValidity(t *testing.T) {
 				t.Errorf("wants getCertPem to be called: %v, got called %v", tt.wantIssuance, gotIssuance)
 			}
 		})
+	}
+}
+
+// TestGetCertPEMWithValidityTrimsTrailingDot verifies that an SNI
+// ServerName with a trailing dot (e.g. "example.com.") resolves to the
+// same cached certificate as the dotless form. Per RFC 6066 §3 the SNI
+// HostName carries no trailing dot, but some clients send an FQDN with
+// one; the cert store keys certs by the dotless domain, so the trailing
+// dot must be trimmed before lookup. See tailscale/tailscale#10233.
+func TestGetCertPEMWithValidityTrimsTrailingDot(t *testing.T) {
+	tstest.AssertNotParallel(t)
+
+	const testDomain = "example.com"
+	b := ipnlocaltest.NewBackend(t)
+	b.SetVarRoot(t.TempDir())
+	e := extOf(t, b)
+
+	// Set up netmap with CertDomains so resolveCertDomain works. Note
+	// CertDomains holds the dotless domain, matching what control sends.
+	b.ForTest().SetNetMap(&netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{}).View(),
+		DNS: tailcfg.DNSConfig{
+			CertDomains: []string{testDomain},
+		},
+	})
+
+	certDirPath, err := certDir(b)
+	if err != nil {
+		t.Fatalf("certDir error: %v", err)
+	}
+	if _, err := e.getCertStore(b); err != nil {
+		t.Fatalf("getCertStore error: %v", err)
+	}
+	testRoot, err := certTestFS.ReadFile("testdata/rootCA.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(testRoot) {
+		t.Fatal("Unable to add test CA to the cert pool")
+	}
+	testX509Roots = roots
+	defer func() { testX509Roots = nil }()
+
+	// Store a valid, unexpired cached cert under the dotless domain.
+	os.MkdirAll(certDirPath, 0755)
+	if err := os.WriteFile(filepath.Join(certDirPath, "example.com.crt"),
+		must.Get(certTestFS.ReadFile("testdata/example.com.pem")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(certDirPath, "example.com.key"),
+		must.Get(certTestFS.ReadFile("testdata/example.com-key.pem")), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A time at which the stored cert is valid and does not need renewal.
+	b.ForTest().SetClock(tstest.NewClock(tstest.ClockOpts{
+		Start: time.Date(2023, time.February, 20, 0, 0, 0, 0, time.UTC),
+	}))
+
+	// Fail loudly if issuance/renewal is attempted: a trailing-dot lookup
+	// must hit the cached cert, not trigger a fresh ACME order.
+	orig := getCertPEM
+	getCertPEM = func(ctx context.Context, e *extension, b *ipnlocal.LocalBackend, cs certStore, logf logger.Logf, traceACME func(any), domain string, now time.Time, minValidity time.Duration) (*ipnlocal.TLSCertKeyPair, error) {
+		t.Errorf("unexpected getCertPEM call for domain %q; trailing-dot lookup should have hit the cache", domain)
+		return nil, nil
+	}
+	t.Cleanup(func() { getCertPEM = orig })
+
+	pair, err := b.GetCertPEMWithValidity(context.Background(), testDomain+".", 0)
+	if err != nil {
+		t.Fatalf("GetCertPEMWithValidity(%q) error = %v, want cached cert", testDomain+".", err)
+	}
+	if pair == nil || !pair.Cached {
+		t.Fatalf("GetCertPEMWithValidity(%q) = %+v, want cached cert", testDomain+".", pair)
 	}
 }
 
@@ -968,5 +1047,110 @@ func TestRefreshApplicableCerts(t *testing.T) {
 	case h := <-gotCh:
 		t.Errorf("unexpected extra fetch for %q", h)
 	default:
+	}
+}
+
+// TestLockDomain_SameDomainReturnsSameMutex verifies the repeat
+// calls for the same domain return the same mutex, and different
+// domains get distinct mutexes.
+func TestLockDomain_SameDomainReturnsSameMutex(t *testing.T) {
+	const domA, domB = "a.example.com", "b.example.com"
+	e := &extension{}
+	a1 := e.lockDomain(domA)
+	a2 := e.lockDomain(domA)
+	b := e.lockDomain(domB)
+	if a1 != a2 {
+		t.Errorf("lockDomain(%q) second call = %p, want %p", domA, a2, a1)
+	}
+	if a1 == b {
+		t.Errorf("lockDomain(%q) = lockDomain(%q) = %p, want different", domA, domB, a1)
+	}
+}
+
+// TestLockDomain_PerDomainConcurrency verifies a lock on one
+// domain doesn't block another, and the same domain blocks while held
+// and is acquireable again after release.
+func TestLockDomain_PerDomainConcurrency(t *testing.T) {
+	const domA, domB = "a.example.com", "b.example.com"
+	e := &extension{}
+
+	aLock := e.lockDomain(domA)
+	aLock.Lock()
+
+	bLock := e.lockDomain(domB)
+	if !bLock.TryLock() {
+		t.Errorf("lockDomain(%q).TryLock() = false while %q held, want true", domB, domA)
+	} else {
+		bLock.Unlock()
+	}
+
+	if aLock.TryLock() {
+		t.Errorf("lockDomain(%q).TryLock() = true while held, want false", domA)
+	}
+
+	aLock.Unlock()
+
+	if !aLock.TryLock() {
+		t.Errorf("lockDomain(%q).TryLock() = false after release, want true", domA)
+	}
+	aLock.Unlock()
+}
+
+// TestAcmeKey_ConcurrentFirstCall verifies that N goroutines racing on
+// an empty store all return the key that ends up persisted.
+func TestAcmeKey_ConcurrentFirstCall(t *testing.T) {
+	e := &extension{}
+	cs := certStateStore{StateStore: new(mem.Store)}
+
+	const n = 16
+	type result struct {
+		key crypto.Signer
+		err error
+	}
+	results := make(chan result, n)
+	var start sync.WaitGroup
+	start.Add(1)
+	for range n {
+		go func() {
+			start.Wait()
+			k, err := e.acmeKey(cs)
+			results <- result{k, err}
+		}()
+	}
+	start.Done()
+
+	var keys []crypto.Signer
+	for range n {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("acmeKey: %v", r.err)
+		}
+		keys = append(keys, r.key)
+	}
+
+	persisted, err := cs.ACMEKey()
+	if err != nil {
+		t.Fatalf("cs.ACMEKey after race: %v", err)
+	}
+	block, _ := pem.Decode(persisted)
+	if block == nil {
+		t.Fatal("no PEM block in persisted ACME key")
+	}
+	want, err := parsePrivateKey(block.Bytes)
+	if err != nil {
+		t.Fatalf("parsing persisted key: %v", err)
+	}
+	wantPub, err := x509.MarshalPKIXPublicKey(want.Public())
+	if err != nil {
+		t.Fatalf("marshaling persisted pubkey: %v", err)
+	}
+	for i, k := range keys {
+		gotPub, err := x509.MarshalPKIXPublicKey(k.Public())
+		if err != nil {
+			t.Fatalf("marshaling returned key %d: %v", i, err)
+		}
+		if !bytes.Equal(gotPub, wantPub) {
+			t.Errorf("goroutine %d returned a different account key than the persisted one", i)
+		}
 	}
 }

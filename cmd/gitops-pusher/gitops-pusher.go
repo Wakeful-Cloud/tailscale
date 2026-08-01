@@ -83,13 +83,11 @@ func apply(cache *Cache, tailnet string) func(context.Context, []string) error {
 		}
 
 		if cache.PrevETag != controlEtag {
-			if err := modifiedExternallyError(); err != nil {
-				if *failOnManualEdits {
-					return err
-				} else {
-					fmt.Println(err)
-				}
+			err := modifiedExternallyError()
+			if *failOnManualEdits {
+				return err
 			}
+			fmt.Println(err)
 		}
 
 		if err := applyNewACL(ctx, tailnet, *policyFname, controlEtag); err != nil {
@@ -129,13 +127,11 @@ func test(cache *Cache, tailnet string) func(context.Context, []string) error {
 		}
 
 		if cache.PrevETag != controlEtag {
-			if err := modifiedExternallyError(); err != nil {
-				if *failOnManualEdits {
-					return err
-				} else {
-					fmt.Println(err)
-				}
+			err := modifiedExternallyError()
+			if *failOnManualEdits {
+				return err
 			}
+			fmt.Println(err)
 		}
 
 		if err := testNewACLs(ctx, tailnet, *policyFname); err != nil {
@@ -255,7 +251,11 @@ func getCredentials() (*http.Client, string) {
 		} else if idok && idToken != "" && oiok && oauthId != "" {
 			if exchangeJWTForToken, ok := tailscale.HookExchangeJWTForTokenViaWIF.GetOk(); ok {
 				var err error
-				apiKeyEnv, err = exchangeJWTForToken(context.Background(), fmt.Sprintf("https://%s", *apiServer), oauthId, idToken)
+				apiKeyEnv, err = exchangeJWTForToken(context.Background(), tailscale.ExchangeJWTForTokenWIFArgs{
+					BaseURL:  fmt.Sprintf("https://%s", *apiServer),
+					ClientID: oauthId,
+					IDToken:  idToken,
+				})
 				if err != nil {
 					log.Fatal(err)
 				}

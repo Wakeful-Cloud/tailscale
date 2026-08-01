@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -36,8 +37,8 @@ func TestTsappConfigs(t *testing.T) {
 			name:     "tsapp",
 			app:      "tsapp",
 			goarch:   "amd64",
-			kernel:   "github.com/tailscale/gokrazy-kernel",
-			firmware: "github.com/tailscale/gokrazy-kernel",
+			kernel:   "github.com/gokrazy/kernel.amd64",
+			firmware: "github.com/gokrazy/kernel.amd64",
 		},
 		{
 			name:     "tsapp-vm-arm64",
@@ -75,9 +76,14 @@ func TestTsappConfigs(t *testing.T) {
 			if err := json.Unmarshal(cfgBytes, &raw); err != nil {
 				t.Fatalf("unmarshaling config.json as map: %v", err)
 			}
-			gokCfg := gokrazyConfig{Environment: cfg.Environment}
-			if got := gokCfg.GOARCH(); got != tt.goarch {
-				t.Errorf("GOARCH = %q; want %q", got, tt.goarch)
+			var goarch string
+			for _, e := range cfg.Environment {
+				if v, ok := strings.CutPrefix(e, "GOARCH="); ok {
+					goarch = v
+				}
+			}
+			if goarch != tt.goarch {
+				t.Errorf("GOARCH = %q; want %q", goarch, tt.goarch)
 			}
 			if cfg.KernelPackage != tt.kernel {
 				t.Errorf("KernelPackage = %q; want %q", cfg.KernelPackage, tt.kernel)
@@ -111,11 +117,11 @@ func findKernelPath(t *testing.T) string {
 		t.Fatalf("go env GOMODCACHE: %v", err)
 	}
 	for _, r := range mf.Require {
-		if r.Mod.Path == "github.com/tailscale/gokrazy-kernel" {
+		if r.Mod.Path == "github.com/gokrazy/kernel.amd64" {
 			return strings.TrimSpace(string(goModB)) + "/" + r.Mod.String() + "/vmlinuz"
 		}
 	}
-	t.Fatal("failed to find gokrazy-kernel in go.mod")
+	t.Fatal("failed to find kernel.amd64 in go.mod")
 	return ""
 }
 
@@ -181,12 +187,7 @@ func (sl *serialLog) lastN(n int) []string {
 func (sl *serialLog) findLine(pred func(string) bool) bool {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
-	for _, line := range sl.lines {
-		if pred(line) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(sl.lines, pred)
 }
 
 // TestBusyboxInTsapp boots the tsapp image in QEMU and verifies that

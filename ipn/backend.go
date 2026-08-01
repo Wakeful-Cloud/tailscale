@@ -294,6 +294,9 @@ func ValidateNotifyWatchOpt(mask NotifyWatchOpt) error {
 // In any given notification, any or all of these may be nil, meaning
 // that they have not changed.
 // They are JSON-encoded on the wire, despite the lack of struct tags.
+//
+// API maturity: this type is not considered a stable API and is
+// subject to change between releases.
 type Notify struct {
 	_       structs.Incomparable
 	Version string // version number of IPN backend
@@ -339,10 +342,10 @@ type Notify struct {
 	//   - On the initial Notify if the watcher requested
 	//     [NotifyInitialNetMap] (any platform).
 	//   - On subsequent Notify messages, only when tailscaled is running
-	//     on Windows, macOS, or iOS. On Linux and other platforms it is
-	//     always nil after the initial notify.
+	//     on Windows. On all other platforms it is always nil after the
+	//     initial notify.
 	//
-	// Deprecated: this field is only populated on Windows, macOS, and iOS and
+	// Deprecated: this field is only populated on Windows and
 	// is slated for removal in favor of [Notify.InitialStatus] +
 	// [Notify.SelfChange] / [Notify.PeerChanges], etc, as this field
 	// doesn't scale.

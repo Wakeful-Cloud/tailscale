@@ -286,10 +286,10 @@ type UserProfileUpdater interface {
 	UpdateUserProfiles(profiles map[tailcfg.UserID]tailcfg.UserProfileView) bool
 }
 
-// patchDiscoKeyer is an optional interface that can be implemented by an [Observer] to be
+// DiscoKeyUpdater is an optional interface that can be implemented by an [Observer] to be
 // notified about node disco keys received out-of-band from control, via
 // existing connection state.
-type patchDiscoKeyer interface {
+type DiscoKeyUpdater interface {
 	// PatchDiscoKey reports to the receiver that the specified disco key
 	// for node was obtained out-of-band from control.
 	PatchDiscoKey(key.NodePublic, key.DiscoPublic)
@@ -426,7 +426,7 @@ func NewDirect(opts Options) (*Direct, error) {
 	c.controlTimePub = eventbus.Publish[ControlTime](c.busClient)
 	discoKeyPub := eventbus.Publish[events.PeerDiscoKeyUpdate](c.busClient)
 	eventbus.SubscribeFunc(c.busClient, func(update events.DiscoKeyAdvertisement) {
-		c.logf("controlclient direct: got TSMP disco key advertisement from %v via eventbus", update.Src)
+		c.logf("[v1] controlclient direct: got TSMP disco key advertisement from %v via eventbus", update.Src)
 		var peerID tailcfg.NodeID
 		var peerKey key.NodePublic
 		var ok bool
@@ -438,7 +438,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		}
 
 		if sess != nil && ok {
-			c.logf("controlclient direct: updating discoKey for %v via mapSession", update.Src)
+			c.logf("[v1] controlclient direct: updating discoKey for %v via mapSession", update.Src)
 
 			// If we update without error, return. If the err indicates that the
 			// mapSession has gone away, we want to fall back to pushing the key
@@ -453,7 +453,7 @@ func NewDirect(opts Options) (*Direct, error) {
 		// We need to push the update further down the chain. Either because we do
 		// not have a mapSession (we are not connected to control) or because the
 		// mapSession queue has closed.
-		c.logf("controlclient direct: updating discoKey for %v via magicsock", update.Src)
+		c.logf("[v1] controlclient direct: updating discoKey for %v via magicsock", update.Src)
 		discoKeyPub.Publish(events.PeerDiscoKeyUpdate(update))
 	})
 

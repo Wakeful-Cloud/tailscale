@@ -11,9 +11,12 @@ import (
 	"crypto/x509"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,6 +53,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	klog "sigs.k8s.io/controller-runtime/pkg/log"
 	kzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/cmd"
@@ -73,18 +77,29 @@ const (
 var (
 	tsClient           *tailscale.Client // For API calls to control.
 	tnClient           *tsnet.Server     // For testing real tailnet traffic on first tailnet.
+	tnTarget           tailnetTarget     // Egress target on the first tailnet.
 	secondTSClient     *tailscale.Client // For API calls to the secondary tailnet (_second_tailnet).
 	secondTNClient     *tsnet.Server     // For testing real tailnet traffic on second tailnet.
+	secondTNTarget     tailnetTarget     // Egress target on the second tailnet.
 	restCfg            *rest.Config      // For constructing a client-go client if necessary.
 	kubeClient         client.WithWatch  // For k8s API calls.
 	clusterLoginServer string
+	clusterIPv4Support bool // whether the test cluster supports IPv4.
+	clusterIPv6Support bool // whether the test cluster supports IPv6.
 
 	//go:embed certs/pebble.minica.crt
 	pebbleMiniCACert []byte
 
-	// Either nil (system) or pebble CAs if pebble is deployed for devcontrol.
-	// pebble has a static "mini" CA that its ACME directory URL serves a cert
-	// from, and also dynamically generates a different CA for issuing certs.
+	// Let's Encrypt staging environment root "Pretend Pear X1", used when
+	// running against real tailnets.
+	// Available from https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem
+	//go:embed certs/letsencrypt-stg-root-x1.pem
+	leStagingRootX1 []byte
+
+	// Either  pebble CAs (if pebble is deployed for devcontrol) or
+	// Let's Encrypt staging when running against real tailnets).
+	// pebble has a static "mini" CA that its ACME directory URL serves a cert from,
+	// and also dynamically generates a different CA for issuing certs.
 	testCAs *x509.CertPool
 
 	//go:embed acl.hujson
@@ -136,6 +151,11 @@ func runTests(m *testing.M) (int, error) {
 
 		if !slices.Contains(clusters, kindClusterName) {
 			if err := kindProvider.Create(kindClusterName,
+				cluster.CreateWithV1Alpha4Config(&v1alpha4.Cluster{
+					Networking: v1alpha4.Networking{
+						IPFamily: v1alpha4.DualStackFamily,
+					},
+				}),
 				cluster.CreateWithWaitForReady(5*time.Minute),
 				cluster.CreateWithKubeconfigPath(kubeconfig),
 				cluster.CreateWithNodeImage("kindest/node:v1.35.0"),
@@ -161,6 +181,10 @@ func runTests(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("error creating Kubernetes client: %w", err)
 	}
 
+	if err := detectClusterIPFamilies(ctx, logger, kubeClient); err != nil {
+		return 0, fmt.Errorf("error detecting cluster IP families: %w", err)
+	}
+
 	var (
 		clientID, clientSecret string   // OAuth client for the first tailnet (for the operator to use).
 		caPaths                []string // Extra CA cert file paths to add to images.
@@ -168,6 +192,7 @@ func runTests(m *testing.M) (int, error) {
 		certsDir                           = filepath.Join(tmp, "certs") // Directory containing extra CA certs to add to images.
 		secondClientID, secondClientSecret string                        // OAuth client for the second tailnet (for the operator to use).
 	)
+	testCAs = x509.NewCertPool()
 	if *fDevcontrol {
 		// Deploy pebble and get its certs.
 		if err = applyPebbleResources(ctx, kubeClient); err != nil {
@@ -183,7 +208,6 @@ func runTests(m *testing.M) (int, error) {
 			return 0, fmt.Errorf("failed to set up port forwarding to pebble: %w", err)
 		}
 
-		testCAs = x509.NewCertPool()
 		if ok := testCAs.AppendCertsFromPEM(pebbleMiniCACert); !ok {
 			return 0, fmt.Errorf("failed to parse pebble minica cert")
 		}
@@ -340,6 +364,10 @@ func runTests(m *testing.M) (int, error) {
 		}
 
 	} else {
+		if ok := testCAs.AppendCertsFromPEM(leStagingRootX1); !ok {
+			return 0, fmt.Errorf("failed to parse Let's Encrypt staging root")
+		}
+
 		clientSecret = os.Getenv("TS_API_CLIENT_SECRET")
 		if clientSecret == "" {
 			return 0, fmt.Errorf("must use --devcontrol or set TS_API_CLIENT_SECRET to an OAuth client suitable for the operator")
@@ -439,6 +467,8 @@ func runTests(m *testing.M) (int, error) {
 	}
 	if *fDevcontrol {
 		extraEnv = append(extraEnv, map[string]any{"name": "TS_DEBUG_ACME_DIRECTORY_URL", "value": "https://pebble:14000/dir"})
+	} else {
+		extraEnv = append(extraEnv, map[string]any{"name": "TS_DEBUG_ACME_DIRECTORY_URL", "value": "https://acme-staging-v02.api.letsencrypt.org/directory"})
 	}
 	values := map[string]any{
 		"loginServer": clusterLoginServer,
@@ -514,6 +544,10 @@ func runTests(m *testing.M) (int, error) {
 		return 0, err
 	}
 	defer tnClient.Close()
+	tnTarget, err = startTailnetHTTPServer(ctx, tnClient)
+	if err != nil {
+		return 0, fmt.Errorf("failed to start tailnet HTTP server on first tailnet: %w", err)
+	}
 
 	secondTNClient = &tsnet.Server{
 		ControlURL: secondTSClient.BaseURL.String(),
@@ -527,6 +561,10 @@ func runTests(m *testing.M) (int, error) {
 		return 0, err
 	}
 	defer secondTNClient.Close()
+	secondTNTarget, err = startTailnetHTTPServer(ctx, secondTNClient)
+	if err != nil {
+		return 0, fmt.Errorf("failed to start tailnet HTTP server on second tailnet: %w", err)
+	}
 
 	// Create the tailnet Secret in the tailscale namespace.
 	secret := &corev1.Secret{
@@ -660,6 +698,7 @@ func applyDefaultProxyClass(ctx context.Context, logger *zap.SugaredLogger, cl c
 			Name: "default",
 		},
 		Spec: tsapi.ProxyClassSpec{
+			UseLetsEncryptStagingEnvironment: !*fDevcontrol,
 			StatefulSet: &tsapi.StatefulSet{
 				Pod: &tsapi.Pod{
 					TailscaleInitContainer: &tsapi.Container{
@@ -840,6 +879,88 @@ func createOrUpdate(ctx context.Context, cl client.Client, obj client.Object) er
 		return cl.Update(ctx, obj)
 	}
 	return nil
+}
+
+// detectClusterIPFamilies determines which IP families the cluster supports by
+// creating a throwaway ClusterIP Service with PreferDualStack and reading back
+// the IP families the API server assigns.
+func detectClusterIPFamilies(ctx context.Context, logger *zap.SugaredLogger, cl client.Client) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      generateName("ipfamily-probe"),
+			Namespace: ns,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:           corev1.ServiceTypeClusterIP,
+			IPFamilyPolicy: new(corev1.IPFamilyPolicyPreferDualStack),
+			Ports: []corev1.ServicePort{
+				{Name: "probe", Protocol: corev1.ProtocolTCP, Port: 80},
+			},
+		},
+	}
+	if err := cl.Create(ctx, svc); err != nil {
+		return fmt.Errorf("failed to create IP family Service: %w", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := cl.Delete(ctx, svc); err != nil {
+			logger.Warnf("failed to clean up IP family Service %s/%s: %v", svc.Namespace, svc.Name, err)
+		}
+	}()
+
+	for _, ip := range svc.Spec.IPFamilies {
+		switch ip {
+		case corev1.IPv4Protocol:
+			clusterIPv4Support = true
+		case corev1.IPv6Protocol:
+			clusterIPv6Support = true
+		}
+	}
+	if !clusterIPv4Support && !clusterIPv6Support {
+		return fmt.Errorf("Service %s/%s reported no IP families", svc.Namespace, svc.Name)
+	}
+	return nil
+}
+
+// tailnetTarget holds the FQDN, IPv4, and IPv6 addresses of the tailnet
+// HTTP server used as the egress target.
+type tailnetTarget struct {
+	fqdn, ipv4, ipv6 string
+}
+
+// startTailnetHTTPServer starts an HTTP server that returns the tailnet FQDN, IPv4,
+// and IPv6 addresses of the created node. Used as an egress target in tests.
+func startTailnetHTTPServer(ctx context.Context, cl *tsnet.Server) (tailnetTarget, error) {
+	ln, err := cl.Listen("tcp", ":80")
+	if err != nil {
+		return tailnetTarget{}, fmt.Errorf("failed to listen on tailnet: %w", err)
+	}
+	go func() {
+		if err := http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("tailnet HTTP server exited: %v", err)
+		}
+	}()
+
+	lc, err := cl.LocalClient()
+	if err != nil {
+		return tailnetTarget{}, fmt.Errorf("failed to get local client: %w", err)
+	}
+	status, err := lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return tailnetTarget{}, fmt.Errorf("failed to get status: %w", err)
+	}
+	target := tailnetTarget{fqdn: strings.TrimSuffix(status.Self.DNSName, ".")}
+	for _, ip := range status.TailscaleIPs {
+		if ip.Is4() {
+			target.ipv4 = ip.String()
+		} else {
+			target.ipv6 = ip.String()
+		}
+	}
+	return target, nil
 }
 
 // createTailnet creates a new tailnet and returns a tailscale.Client

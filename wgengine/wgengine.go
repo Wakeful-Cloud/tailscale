@@ -9,14 +9,15 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/gaissmai/bart"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/routemanager"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/filter"
-	"tailscale.com/wgengine/netlog"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgint"
@@ -99,45 +100,19 @@ type Engine interface {
 	// Unlike Reconfig, it does not return ErrNoChanges.
 	ResetAndStop() (*Status, error)
 
-	// PeerForIP returns the node to which the provided IP routes,
-	// if any. If none is found, (zero, false) is returned.
+	// SetPeerForIPFunc installs the IP-to-node lookup used by the
+	// engine's internal cold paths (Ping, TSMP, pendopen diagnostics).
+	// It parallels [Engine.SetPeerByIPPacketFunc] but returns richer
+	// data (a full NodeView, the matched route prefix, and the IsSelf
+	// flag).
 	//
-	// Despite the name, it can return the self node (with
-	// PeerForIP.IsSelf set). It handles Tailscale IPs, subnet-routed
-	// IPs, and exit-node global internet IPs, returning whichever
-	// node would handle that traffic.
-	//
-	// This is the cold path used by Ping, TSMP, pendopen diagnostics,
-	// and debug endpoints. It uses the same underlying data structures
-	// as the wireguard-go outbound packet path
-	// ([Engine.SetPeerByIPPacketFunc]), but is slower because it
-	// returns richer data (a full NodeView, the matched route prefix,
-	// and the IsSelf flag) requiring extra lookups.
-	//
-	// In production, the lookup is implemented by LocalBackend and
-	// plumbed in via [Engine.SetPeerForIPFunc]; the engine itself holds
-	// no peer-lookup state on this path.
-	PeerForIP(netip.Addr) (_ PeerForIP, ok bool)
-
-	// SetPeerForIPFunc installs a callback used by [Engine.PeerForIP].
-	// It parallels [Engine.SetPeerByIPPacketFunc] but serves the
-	// cold-path control lookups (Ping, TSMP, pendopen diagnostics,
-	// [tsdial.Dialer.UseNetstackForIP], debug endpoints).
-	//
-	// If fn is nil, PeerForIP returns (zero, false) for every IP.
+	// If fn is nil, those lookups fail for every IP.
 	//
 	// LocalBackend installs a func backed by the live nodeBackend for
-	// exact-match and self addresses, with [Engine.PeerKeyForIP]
-	// supplying the subnet-route / exit-node fallback.
+	// exact-match and self addresses, with the RouteManager's outbound
+	// table supplying the subnet-route / exit-node fallback; the engine
+	// itself holds no peer-lookup state on this path.
 	SetPeerForIPFunc(fn func(netip.Addr) (_ PeerForIP, ok bool))
-
-	// PeerKeyForIP returns the peer's NodePublic and the matched prefix
-	// for the longest-prefix match of ip in the engine's AllowedIPs
-	// table (the wireguard config most recently installed via
-	// [Engine.Reconfig]). Exit-node selection is honored: an unselected
-	// exit node's 0.0.0.0/0 is not matched. It is the same table the
-	// outbound packet hot path consults via [Engine.SetPeerByIPPacketFunc].
-	PeerKeyForIP(netip.Addr) (_ key.NodePublic, _ netip.Prefix, ok bool)
 
 	// GetFilter returns the current packet filter, if any.
 	GetFilter() *filter.Filter
@@ -151,6 +126,17 @@ type Engine interface {
 
 	// SetJailedFilter updates the packet filter for jailed nodes.
 	SetJailedFilter(*filter.Filter)
+
+	// SetPeerRoutes updates the per-peer route attributes used by the
+	// tun-layer data plane for per-packet NAT rewrites and
+	// jailed-filter selection. native4 and native6 are this node's own
+	// Tailscale addresses, and routes maps each peer's addresses and
+	// routed prefixes to its attributes; it is a shared immutable
+	// snapshot from [routemanager.RouteManager.Outbound].
+	//
+	// A nil routes table disables all per-packet peer processing;
+	// callers pass nil when no current peer has any such attributes.
+	SetPeerRoutes(native4, native6 netip.Addr, routes *bart.Table[*routemanager.PeerRoute])
 
 	// SetStatusCallback sets the function to call when the
 	// WireGuard status changes.
@@ -198,12 +184,50 @@ type Engine interface {
 	// look up which peer should handle an outbound packet by destination IP.
 	SetPeerByIPPacketFunc(func(netip.Addr) (_ key.NodePublic, ok bool))
 
-	// SetNetLogNodeSource installs the [netlog.NodeSource] used by the engine's
-	// network logger to look up Tailscale node info on demand.
+	// SetPeerConfigFunc installs the live source of per-peer WireGuard
+	// configuration: given a peer's public key, fn returns the prefixes
+	// the peer is currently allowed to originate traffic from, or
+	// ok=false if the peer is unknown (in which case it must not exist
+	// in the WireGuard device). The engine installs a single
+	// [device.PeerLookupFunc] wrapping fn, so lazily-created peers
+	// always see current state and the lookup func never needs to be
+	// reinstalled as peers come and go.
+	//
+	// It is expected to be called once during LocalBackend construction,
+	// before the first [Engine.Reconfig]. fn is called rarely (when
+	// wireguard-go first hears from a peer it doesn't have) and may
+	// acquire locks.
+	SetPeerConfigFunc(fn func(key.NodePublic) (allowedIPs []netip.Prefix, ok bool))
+
+	// SyncDevicePeer synchronizes the WireGuard device's state for a
+	// single peer with the config source installed via
+	// [Engine.SetPeerConfigFunc]: if the source no longer knows the
+	// peer, it is removed from the device; if the peer is active in the
+	// device, its allowed IPs are updated. It does O(1) work (plus the
+	// config source lookup) and is intended to be called for each peer
+	// added, updated, or removed by an incremental netmap delta,
+	// avoiding a full [Engine.Reconfig].
+	//
+	// It is a no-op if no config source is installed.
+	SyncDevicePeer(key.NodePublic)
+
+	// ResetDevicePeer removes the peer from the WireGuard device,
+	// discarding any session key material and in-flight handshake
+	// state. If the peer is still known to the config source installed
+	// via [Engine.SetPeerConfigFunc], it is lazily re-created on demand
+	// with fresh state.
+	//
+	// LocalBackend calls it when a peer's disco key changes, which
+	// means the peer restarted and its old sessions are dead.
+	ResetDevicePeer(key.NodePublic)
+
+	// SetNetLogSource installs the [NetLogSource] consulted by the
+	// engine's network flow logger for node lookups and the current
+	// audit logging identity.
 	//
 	// It is expected to be called once during LocalBackend construction,
 	// before any [Engine.Reconfig] call that starts up the network logger.
-	SetNetLogNodeSource(netlog.NodeSource)
+	SetNetLogSource(NetLogSource)
 
 	// SetWGPeerLookup installs the function used by the engine's
 	// wireguard-go log wrapper to rewrite peer references in log lines
@@ -230,6 +254,8 @@ type Engine interface {
 	// ipnlocal.LocalBackend.onPeerWireGuardState, installed early in
 	// LocalBackend construction.
 	SetPeerSessionStateFunc(func(key.NodePublic, PeerWireGuardState))
+
+	SetPeerPriorityMessageOnEstablishmentFunc(fn func(key.NodePublic) (msg []byte))
 
 	// ProbeLocks acquires and releases the engine's internal locks so
 	// that [ipnlocal.LocalBackend]'s watchdog can detect deadlocks in

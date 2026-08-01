@@ -189,135 +189,6 @@ func TestShrinkDefaultRoute(t *testing.T) {
 	}
 }
 
-func TestPeerRoutes(t *testing.T) {
-	pp := netip.MustParsePrefix
-	tests := []struct {
-		name  string
-		peers []wgcfg.Peer
-		want  []netip.Prefix
-	}{
-		{
-			name: "small_v4",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.101.102.103/32"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("100.101.102.103/32"),
-			},
-		},
-		{
-			name: "big_v4",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.101.102.103/32"),
-						pp("100.101.102.104/32"),
-						pp("100.101.102.105/32"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("100.64.0.0/10"),
-			},
-		},
-		{
-			name: "has_1_v6",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b240/128"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("fd7a:115c:a1e0::/48"),
-			},
-		},
-		{
-			name: "has_2_v6",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b240/128"),
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b241/128"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("fd7a:115c:a1e0::/48"),
-			},
-		},
-		{
-			name: "big_v4_big_v6",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.101.102.103/32"),
-						pp("100.101.102.104/32"),
-						pp("100.101.102.105/32"),
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b240/128"),
-						pp("fd7a:115c:a1e0:ab12:4843:cd96:6258:b241/128"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("100.64.0.0/10"),
-				pp("fd7a:115c:a1e0::/48"),
-			},
-		},
-		{
-			name: "output-should-be-sorted",
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.64.0.2/32"),
-						pp("10.0.0.0/16"),
-					},
-				},
-				{
-					AllowedIPs: []netip.Prefix{
-						pp("100.64.0.1/32"),
-						pp("10.0.0.0/8"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("10.0.0.0/8"),
-				pp("10.0.0.0/16"),
-				pp("100.64.0.1/32"),
-				pp("100.64.0.2/32"),
-			},
-		},
-		{
-			name: "skip-unmasked-prefixes",
-			peers: []wgcfg.Peer{
-				{
-					PublicKey: key.NewNode().Public(),
-					AllowedIPs: []netip.Prefix{
-						pp("100.64.0.2/32"),
-						pp("10.0.0.100/16"),
-					},
-				},
-			},
-			want: []netip.Prefix{
-				pp("100.64.0.2/32"),
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := peerRoutes(t.Logf, tt.peers, 2, true)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("got = %v; want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestPeerAPIBase(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2123,8 +1994,7 @@ func TestWatchNotificationsCallbacks(t *testing.T) {
 
 func TestWatchNotificationsClosesSlowConsumer(t *testing.T) {
 	b := newTestLocalBackend(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	watchAdded := make(chan struct{})
 	firstNotify := make(chan struct{}, 1)
@@ -2752,7 +2622,7 @@ func TestNotifyForSessionUserProfilesDedupResetsOnSelfChange(t *testing.T) {
 // tests LocalBackend.updateNetmapDeltaLocked
 func TestUpdateNetmapDelta(t *testing.T) {
 	b := newTestLocalBackend(t)
-	if b.currentNode().UpdateNetmapDelta(nil) {
+	if _, handled := b.currentNode().UpdateNetmapDelta(nil); handled {
 		t.Errorf("updateNetmapDeltaLocked() = true, want false with nil netmap")
 	}
 
@@ -2791,7 +2661,7 @@ func TestUpdateNetmapDelta(t *testing.T) {
 		t.Fatal("netmap.MutationsFromMapResponse failed")
 	}
 
-	if !b.currentNode().UpdateNetmapDelta(muts) {
+	if _, handled := b.currentNode().UpdateNetmapDelta(muts); !handled {
 		t.Fatalf("updateNetmapDeltaLocked() = false, want true with new netmap")
 	}
 
@@ -3497,7 +3367,7 @@ func TestCoveredRouteRangeNoDefault(t *testing.T) {
 
 func TestReconfigureAppConnector(t *testing.T) {
 	b := newTestBackend(t)
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("unexpected app connector")
 	}
@@ -3510,7 +3380,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	if b.appConnector == nil {
 		t.Fatal("expected app connector")
 	}
@@ -3533,7 +3403,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 
 	b.currentNode().SetNetMap(nm)
 
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	b.appConnector.Wait(context.Background())
 
 	want := []string{"example.com"}
@@ -3553,7 +3423,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("expected no app connector")
 	}
@@ -3585,7 +3455,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 
 	// Smoke check that AdvertiseRoutes doesn't have the test IP.
 	ip := netip.MustParseAddr("1.2.3.4")
@@ -3606,7 +3476,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 
 	// Mimic b.authReconfigure for the app connector bits.
 	b.mu.Lock()
-	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.currentNode().Self(), b.pm.prefs)
 	b.mu.Unlock()
 	b.readvertiseAppConnectorRoutes()
 
@@ -5497,6 +5367,12 @@ func withAddresses(addresses ...netip.Prefix) peerOptFunc {
 	}
 }
 
+func withAllowedIPs(prefixes ...netip.Prefix) peerOptFunc {
+	return func(n *tailcfg.Node) {
+		n.AllowedIPs = append(n.AllowedIPs, prefixes...)
+	}
+}
+
 func deterministicRegionForTest(t testing.TB, want views.Slice[int], use int) selectRegionFunc {
 	t.Helper()
 
@@ -6062,7 +5938,7 @@ func TestSuggestExitNode(t *testing.T) {
 				regionLatency = tt.lastReport.RegionLatency
 			}
 
-			got, err := suggestExitNode(preferredDERP, regionLatency, nb, tt.lastSuggestion, selectRegion, selectNode, allowList)
+			got, err := suggestExitNode(preferredDERP, regionLatency, nil, nb, tt.lastSuggestion, selectRegion, selectNode, allowList)
 			if got.Name != tt.wantName {
 				t.Errorf("name=%v, want %v", got.Name, tt.wantName)
 			}
@@ -6620,7 +6496,7 @@ func TestSuggestExitNodeTrafficSteering(t *testing.T) {
 			defer nb.shutdown(errShutdown)
 			nb.SetNetMap(tt.netMap)
 
-			got, err := suggestExitNodeUsingTrafficSteering(nb, allowList)
+			got, err := suggestExitNodeUsingTrafficSteering(nil, nb, allowList)
 			if tt.wantErr == nil && err != nil {
 				t.Fatalf("err=%v, want nil", err)
 			}
@@ -8161,6 +8037,165 @@ func TestSrcCapPacketFilter(t *testing.T) {
 	}
 }
 
+func TestSrcCapPacketFilterUnsignedPeer(t *testing.T) {
+	lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+		return newClient(tb, opts)
+	})
+	if err := lb.Start(ipn.Options{}); err != nil {
+		t.Fatalf("(*LocalBackend).Start(): %v", err)
+	}
+
+	var signedKey, unsignedKey key.NodePublic
+	must.Do(signedKey.UnmarshalText([]byte("nodekey:5c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf261")))
+	must.Do(unsignedKey.UnmarshalText([]byte("nodekey:6c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf262")))
+
+	controlClient := lb.cc.(*mockControl)
+	controlClient.send(sendOpt{nm: &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")},
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			// A normal (signed) peer holding cap-X: it should be accepted.
+			(&tailcfg.Node{
+				Addresses: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				ID:        2,
+				Key:       signedKey,
+				CapMap:    tailcfg.NodeCapMap{"cap-X": nil},
+			}).View(),
+			// An unsigned peer that control has also granted cap-X: it must be
+			// dropped despite holding the capability, because tailnet lock does
+			// not trust it.
+			(&tailcfg.Node{
+				Addresses:           []netip.Prefix{netip.MustParsePrefix("3.3.3.3/32")},
+				ID:                  3,
+				Key:                 unsignedKey,
+				UnsignedPeerAPIOnly: true,
+				CapMap:              tailcfg.NodeCapMap{"cap-X": nil},
+			}).View(),
+		},
+		PacketFilter: []filtertype.Match{{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
+			SrcCaps: []tailcfg.NodeCapability{"cap-X"},
+			Dsts: []filtertype.NetPortRange{{
+				Net: netip.MustParsePrefix("1.1.1.1/32"),
+				Ports: filtertype.PortRange{
+					First: 22,
+					Last:  22,
+				},
+			}},
+		}},
+	}})
+
+	f := lb.ForTest().GetFilter()
+
+	// The signed peer with the capability is accepted
+	if res := f.Check(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP); res != filter.Accept {
+		t.Errorf("Check(signed 2.2.2.2, ...) = %s, want %s", res, filter.Accept)
+	}
+
+	// The unsigned peer with the same capability is dropped
+	if res := f.Check(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP); !res.IsDrop() {
+		t.Errorf("Check(unsigned 3.3.3.3, ...) = %s, want drop", res)
+	}
+
+	// Directly exercise the runtime capability test used by the filter
+	if lb.srcIPHasCapForFilter(netip.MustParseAddr("3.3.3.3"), "cap-X") {
+		t.Error("srcIPHasCapForFilter returned true for UnsignedPeerAPIOnly peer")
+	}
+	if !lb.srcIPHasCapForFilter(netip.MustParseAddr("2.2.2.2"), "cap-X") {
+		t.Error("srcIPHasCapForFilter returned false for signed peer with cap")
+	}
+}
+
+// TestCapsGrantPacketFilterUnsignedPeer verifies that a CapGrant-style packet filter match
+// (Srcs + Caps, no Dsts) whose broad Srcs covers an unsigned peer's AllowedIPs does NOT cause
+// the packet filter to be discarded: a grant alone permits no traffic, so legitimate rules for
+// signed peers must keep working.
+func TestCapsGrantPacketFilterUnsignedPeer(t *testing.T) {
+	lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+		return newClient(tb, opts)
+	})
+	if err := lb.Start(ipn.Options{}); err != nil {
+		t.Fatalf("(*LocalBackend).Start(): %v", err)
+	}
+
+	var signedKey, unsignedKey key.NodePublic
+	must.Do(signedKey.UnmarshalText([]byte("nodekey:5c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf261")))
+	must.Do(unsignedKey.UnmarshalText([]byte("nodekey:6c8f86d5fc70d924e55f02446165a5dae8f822994ad26bcf4b08fd841f9bf262")))
+
+	controlClient := lb.cc.(*mockControl)
+	// Send a netmap with:
+	//  - a broad CapGrant-style match (Srcs 0.0.0.0/0) covering both peers
+	//  - a legitimate traffic rule for the signed peer
+	controlClient.send(sendOpt{nm: &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Addresses: []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")},
+		}).View(),
+		Peers: []tailcfg.NodeView{
+			(&tailcfg.Node{
+				Addresses:  []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				ID:         2,
+				Key:        signedKey,
+			}).View(),
+			(&tailcfg.Node{
+				Addresses:           []netip.Prefix{netip.MustParsePrefix("3.3.3.3/32")},
+				AllowedIPs:          []netip.Prefix{netip.MustParsePrefix("3.3.3.3/32")},
+				ID:                  3,
+				Key:                 unsignedKey,
+				UnsignedPeerAPIOnly: true,
+			}).View(),
+		},
+		PacketFilter: []filtertype.Match{
+			{
+				// Broad grant covering both peers: must NOT trigger vetting
+				Srcs: []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
+				Caps: []filtertype.CapMatch{{
+					Dst: netip.MustParsePrefix("1.1.1.1/32"),
+					Cap: "cap-X",
+				}},
+			},
+			{
+				// Legitimate traffic rule for the signed peer
+				IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
+				Srcs:    []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+				Dsts: []filtertype.NetPortRange{{
+					Net:   netip.MustParsePrefix("1.1.1.1/32"),
+					Ports: filtertype.PortRange{First: 22, Last: 22},
+				}},
+			},
+		},
+	}})
+
+	f := lb.ForTest().GetFilter()
+
+	// The filter must be installed, not discarded: the signed peer's legitimate traffic rule accepts traffic
+	if res := f.Check(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP); res != filter.Accept {
+		t.Errorf("Check(signed 2.2.2.2, ...) = %s, want %s (filter must not be discarded for a caps-only grant)", res, filter.Accept)
+	}
+
+	// The unsigned peer has no traffic rule, so its packets are dropped
+	if res := f.Check(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP); !res.IsDrop() {
+		t.Errorf("Check(unsigned 3.3.3.3, ...) = %s, want drop", res)
+	}
+
+	// The unsigned peer is denied the granted capability at resolution time
+	if caps := lb.PeerCapsForIP(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1")); len(caps) != 0 {
+		t.Errorf("PeerCapsForIP(unsigned src) = %v, want empty", caps)
+	}
+	if caps := lb.PeerCaps(netip.MustParseAddr("3.3.3.3")); len(caps) != 0 {
+		t.Errorf("PeerCaps(unsigned src) = %v, want empty", caps)
+	}
+
+	// The signed peer keeps its grant: legitimate functionality is unaffected
+	if caps := lb.PeerCapsForIP(netip.MustParseAddr("2.2.2.2"), netip.MustParseAddr("1.1.1.1")); !caps.HasCapability("cap-X") {
+		t.Errorf("PeerCapsForIP(signed src) missing cap-X: %v", caps)
+	}
+	if caps := lb.PeerCaps(netip.MustParseAddr("2.2.2.2")); !caps.HasCapability("cap-X") {
+		t.Errorf("PeerCaps(signed src) missing cap-X: %v", caps)
+	}
+}
+
 func TestDisplayMessages(t *testing.T) {
 	b := newTestLocalBackend(t)
 
@@ -8301,7 +8336,7 @@ func TestDisplayMessageIPNBus(t *testing.T) {
 					if ok {
 						if diff := cmp.Diff(tt.wantWarning, got, cmpopts.IgnoreFields(health.UnhealthyState{}, "ETag")); diff != "" {
 							t.Errorf("unexpected warning details (-want/+got):\n%s", diff)
-							return true // we failed the test so tell the watcher we've seen what we need to to stop it waiting
+							return true // we failed the test so tell the watcher we've seen what we need to stop it waiting
 						}
 					} else {
 						got := slices.Collect(maps.Keys(n.Health.Warnings))
@@ -8774,72 +8809,65 @@ func TestStripKeysFromPrefs(t *testing.T) {
 func TestRouteAllDisabled(t *testing.T) {
 	pp := netip.MustParsePrefix
 
+	peer := &tailcfg.Node{
+		ID:       1,
+		Key:      key.NewNode().Public(),
+		HomeDERP: 1,
+		Addresses: []netip.Prefix{
+			pp("100.80.207.38/32"),
+		},
+		AllowedIPs: []netip.Prefix{
+			pp("100.80.207.38/32"),
+
+			// If one IP in the Tailscale ULA range is added, the
+			// entire range is added to the router config.
+			pp("fd7a:115c:a1e0::2501:9b83/128"),
+
+			// Other single CGNAT IPs (such as VIP service addresses)
+			// are added individually regardless of RouteAll.
+			pp("100.80.207.56/32"),
+			pp("100.80.207.40/32"),
+			pp("100.94.122.93/32"),
+			pp("100.79.141.115/32"),
+
+			// A /28 is a subnet route, added only with RouteAll.
+			pp("100.64.0.0/28"),
+
+			// Single IPs outside the Tailscale CGNAT/ULA ranges are
+			// subnet routes too.
+			pp("192.168.0.45/32"),
+			pp("fd7a:115c:b1e0::2501:9b83/128"),
+			pp("fdf8:f966:e27c:0:5:0:0:10/128"),
+		},
+	}
+
 	tests := []struct {
-		name          string
-		peers         []wgcfg.Peer
-		wantEndpoints []netip.Prefix
-		routeAll      bool
+		name     string
+		routeAll bool
+		want     []netip.Prefix
 	}{
 		{
 			name:     "route_all_disabled",
 			routeAll: false,
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						// if one ip in the Tailscale ULA range is added, the entire range is added to the router config
-						pp("fd7a:115c:a1e0::2501:9b83/128"),
-						pp("100.80.207.38/32"),
-						pp("100.80.207.56/32"),
-						pp("100.80.207.40/32"),
-						pp("100.94.122.93/32"),
-						pp("100.79.141.115/32"),
-
-						// a /28 range will not be added, since this is not a Service IP range (which is always /32, a single IP)
-						pp("100.64.0.0/28"),
-
-						// ips outside the tailscale cgnat/ula range are not added to the router config
-						pp("192.168.0.45/32"),
-						pp("fd7a:115c:b1e0::2501:9b83/128"),
-						pp("fdf8:f966:e27c:0:5:0:0:10/128"),
-					},
-				},
-			},
-			wantEndpoints: []netip.Prefix{
-				pp("100.80.207.38/32"),
-				pp("100.80.207.56/32"),
-				pp("100.80.207.40/32"),
-				pp("100.94.122.93/32"),
+			want: []netip.Prefix{
 				pp("100.79.141.115/32"),
+				pp("100.80.207.38/32"),
+				pp("100.80.207.40/32"),
+				pp("100.80.207.56/32"),
+				pp("100.94.122.93/32"),
 				pp("fd7a:115c:a1e0::/48"),
 			},
 		},
 		{
 			name:     "route_all_enabled",
 			routeAll: true,
-			peers: []wgcfg.Peer{
-				{
-					AllowedIPs: []netip.Prefix{
-						// if one ip in the Tailscale ULA range is added, the entire range is added to the router config
-						pp("fd7a:115c:a1e0::2501:9b83/128"),
-						pp("100.80.207.38/32"),
-						pp("100.80.207.56/32"),
-						pp("100.80.207.40/32"),
-						pp("100.94.122.93/32"),
-						pp("100.79.141.115/32"),
-
-						// ips outside the tailscale cgnat/ula range are not added to the router config
-						pp("192.168.0.45/32"),
-						pp("fd7a:115c:b1e0::2501:9b83/128"),
-						pp("fdf8:f966:e27c:0:5:0:0:10/128"),
-					},
-				},
-			},
-			wantEndpoints: []netip.Prefix{
-				pp("100.80.207.38/32"),
-				pp("100.80.207.56/32"),
-				pp("100.80.207.40/32"),
-				pp("100.94.122.93/32"),
+			want: []netip.Prefix{
+				pp("100.64.0.0/28"),
 				pp("100.79.141.115/32"),
+				pp("100.80.207.38/32"),
+				pp("100.80.207.40/32"),
+				pp("100.80.207.56/32"),
+				pp("100.94.122.93/32"),
 				pp("192.168.0.45/32"),
 				pp("fd7a:115c:a1e0::/48"),
 				pp("fd7a:115c:b1e0::2501:9b83/128"),
@@ -8852,9 +8880,6 @@ func TestRouteAllDisabled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			prefs := ipn.Prefs{RouteAll: tt.routeAll}
 			lb := newTestLocalBackend(t)
-			cfg := &wgcfg.Config{
-				Peers: tt.peers,
-			}
 			ServiceIPMappings := tailcfg.ServiceIPMappings{
 				"svc:test-service": []netip.Addr{
 					netip.MustParseAddr("100.64.1.2"),
@@ -8877,20 +8902,15 @@ func TestRouteAllDisabled(t *testing.T) {
 						},
 					},
 				}).View(),
+				Peers: []tailcfg.NodeView{peer.View()},
 			}
+			cn := lb.currentNode()
+			cn.SetNetMap(nm)
+			cn.updateRouteManagerPrefs(routePrefs{RouteAll: tt.routeAll})
 
-			rcfg := lb.routerConfigLocked(cfg, prefs.View(), nm, false)
-			for _, p := range rcfg.Routes {
-				found := false
-				for _, r := range tt.wantEndpoints {
-					if p.Addr() == r.Addr() {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Errorf("unexpected prefix %q in router config", p.String())
-				}
+			rcfg := lb.routerConfigLocked(&wgcfg.Config{}, prefs.View(), nm)
+			if !slices.Equal(rcfg.Routes, tt.want) {
+				t.Errorf("Routes = %v; want %v", rcfg.Routes, tt.want)
 			}
 		})
 	}
@@ -9324,44 +9344,6 @@ func TestShouldUseOneCGNATRoute(t *testing.T) {
 
 }
 
-func TestPeerRoutesCGNATCollapse(t *testing.T) {
-	pp := netip.MustParsePrefix
-
-	// With cgnatThreshold=1 (oneCGNATRoute), adding a peer should not
-	// change the route list. Both collapse to a single 100.64.0.0/10.
-	twoPeers := []wgcfg.Peer{
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.1/32")}},
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.2/32")}},
-	}
-	threePeers := []wgcfg.Peer{
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.1/32")}},
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.2/32")}},
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.3/32")}},
-	}
-
-	routesTwo := peerRoutes(t.Logf, twoPeers, 1, true)
-	routesThree := peerRoutes(t.Logf, threePeers, 1, true)
-
-	wantCGNAT := []netip.Prefix{pp("100.64.0.0/10")}
-	if !reflect.DeepEqual(routesTwo, wantCGNAT) {
-		t.Errorf("two peers: got %v; want %v", routesTwo, wantCGNAT)
-	}
-	if !reflect.DeepEqual(routesThree, wantCGNAT) {
-		t.Errorf("three peers: got %v; want %v", routesThree, wantCGNAT)
-	}
-
-	// Subnet routes must still appear alongside the collapsed CGNAT route.
-	peersWithSubnet := []wgcfg.Peer{
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.1/32")}},
-		{AllowedIPs: []netip.Prefix{pp("100.64.0.2/32"), pp("10.0.0.0/24")}},
-	}
-	got := peerRoutes(t.Logf, peersWithSubnet, 1, true)
-	want := []netip.Prefix{pp("100.64.0.0/10"), pp("10.0.0.0/24")}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("with subnet: got %v; want %v", got, want)
-	}
-}
-
 func TestResetAuthClearsMachineKey(t *testing.T) {
 	store := new(mem.Store)
 
@@ -9489,13 +9471,13 @@ func TestEnginePeerForIPAdjustsForPrefs(t *testing.T) {
 
 	nm := buildNetmapWithPeers(selfNode, exitA, exitB, subnetBig, subnetSmall)
 
-	var eng wgengine.Engine
+	var curLB *LocalBackend
 	var curT *testing.T // active subtest, for test helpers
 
 	wantPeer := func(ip string, n tailcfg.NodeView) {
 		t := curT
 		t.Helper()
-		pip, ok := eng.PeerForIP(netip.MustParseAddr(ip))
+		pip, ok := curLB.PeerForIP(netip.MustParseAddr(ip))
 		if !ok {
 			t.Fatalf("PeerForIP(%s): ok=false, want true", ip)
 		}
@@ -9509,32 +9491,32 @@ func TestEnginePeerForIPAdjustsForPrefs(t *testing.T) {
 	wantNotPeer := func(ip string) {
 		t := curT
 		t.Helper()
-		if _, ok := eng.PeerForIP(netip.MustParseAddr(ip)); ok {
+		if _, ok := curLB.PeerForIP(netip.MustParseAddr(ip)); ok {
 			t.Fatalf("PeerForIP(%s): ok=true, want false", ip)
 		}
 	}
 	wantKey := func(ip string, n tailcfg.NodeView) {
 		t := curT
 		t.Helper()
-		pk, _, ok := eng.PeerKeyForIP(netip.MustParseAddr(ip))
+		pr, ok := curLB.currentNode().routeMgr.Outbound().Lookup(netip.MustParseAddr(ip))
 		if !ok {
-			t.Fatalf("PeerKeyForIP(%s): ok=false, want true", ip)
+			t.Fatalf("routeMgr.Outbound().Lookup(%s): ok=false, want true", ip)
 		}
-		if pk != n.Key() {
-			t.Fatalf("PeerKeyForIP(%s): key=%v, want %v", ip, pk, n.Key())
+		if pr.Key != n.Key() {
+			t.Fatalf("routeMgr.Outbound().Lookup(%s): key=%v, want %v", ip, pr.Key, n.Key())
 		}
 	}
 	wantNotKey := func(ip string) {
 		t := curT
 		t.Helper()
-		if _, _, ok := eng.PeerKeyForIP(netip.MustParseAddr(ip)); ok {
-			t.Fatalf("PeerKeyForIP(%s): ok=true, want false", ip)
+		if _, ok := curLB.currentNode().routeMgr.Outbound().Lookup(netip.MustParseAddr(ip)); ok {
+			t.Fatalf("routeMgr.Outbound().Lookup(%s): ok=true, want false", ip)
 		}
 	}
 	wantSelf := func(ip string) {
 		t := curT
 		t.Helper()
-		pip, ok := eng.PeerForIP(netip.MustParseAddr(ip))
+		pip, ok := curLB.PeerForIP(netip.MustParseAddr(ip))
 		if !ok {
 			t.Fatalf("PeerForIP(%s): ok=false, want true", ip)
 		}
@@ -9663,9 +9645,51 @@ func TestEnginePeerForIPAdjustsForPrefs(t *testing.T) {
 				LoggedIn: true,
 			})
 
-			eng = lb.sys.Engine.Get()
+			curLB = lb
 			curT = t
 			tt.check()
 		})
+	}
+}
+
+// Tests that selecting an exit node that doesn't resolve to any
+// current peer (a nonexistent node, or MDM's "auto:any" placeholder
+// before it is resolved) still installs the blackhole default routes,
+// so internet traffic is dropped rather than escaping to the local
+// network. That behavior is documented on [ipn.Prefs.ExitNodeID] and
+// must survive the migration of OS route computation to
+// net/routemanager.
+func TestRouterConfigExitNodeBlackhole(t *testing.T) {
+	lb := newTestLocalBackend(t)
+	nm := &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name:      "test-node",
+			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.1.1/32")},
+		}).View(),
+	}
+	cfg := &wgcfg.Config{} // no peer carries the default routes
+
+	hasDefaults := func(routes []netip.Prefix) bool {
+		return slices.Contains(routes, tsaddr.AllIPv4()) && slices.Contains(routes, tsaddr.AllIPv6())
+	}
+	// Push the netmap and prefs into the route manager first, as
+	// authReconfigLocked does before calling routerConfigLocked, now
+	// that the OS routes are derived from the route manager.
+	cn := lb.currentNode()
+	cn.SetNetMap(nm)
+	for _, exitID := range []tailcfg.StableNodeID{"auto:any", "no-such-node"} {
+		prefs := ipn.Prefs{ExitNodeID: exitID}
+		cn.updateRouteManagerPrefs(routePrefs{ExitNodeID: exitID, ExitNodeSelected: true})
+		rcfg := lb.routerConfigLocked(cfg, prefs.View(), nm)
+		if !hasDefaults(rcfg.Routes) {
+			t.Errorf("ExitNodeID=%q: Routes = %v; want blackhole default routes", exitID, rcfg.Routes)
+		}
+	}
+
+	// With no exit node selected, there must be no default routes.
+	cn.updateRouteManagerPrefs(routePrefs{})
+	rcfg := lb.routerConfigLocked(cfg, new(ipn.Prefs).View(), nm)
+	if hasDefaults(rcfg.Routes) {
+		t.Errorf("no exit node: Routes = %v; want no default routes", rcfg.Routes)
 	}
 }

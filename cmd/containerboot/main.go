@@ -154,19 +154,20 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
 	"tailscale.com/util/deephash"
+	"tailscale.com/util/def"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/linuxfw"
 )
 
 func newNetfilterRunner(logf logger.Logf) (linuxfw.NetfilterRunner, error) {
-	if defaultBool("TS_TEST_FAKE_NETFILTER", false) {
+	if def.Bool(os.Getenv("TS_TEST_FAKE_NETFILTER"), false) {
 		return linuxfw.NewFakeIPTablesRunner(), nil
 	}
 	return linuxfw.New(logf, "")
 }
 
 func getAutoAdvertiseBool() bool {
-	return defaultBool("TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT", true)
+	return def.Bool(os.Getenv("TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT"), true)
 }
 
 const containerbootWatchMask = ipn.NotifyInitialStatus |
@@ -423,7 +424,7 @@ func run() error {
 		mux := http.NewServeMux()
 
 		log.Printf("Running healthcheck endpoint at %s/healthz", cfg.HealthCheckAddrPort)
-		healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, log.Printf)
+		healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, cfg.PodIPv6, log.Printf)
 
 		close := runHTTPServer(mux, cfg.HealthCheckAddrPort)
 		defer close()
@@ -439,7 +440,7 @@ func run() error {
 
 		if cfg.localHealthEnabled() {
 			log.Printf("Running healthcheck endpoint at %s/healthz", cfg.LocalAddrPort)
-			healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, log.Printf)
+			healthCheck = healthz.RegisterHealthHandlers(mux, cfg.PodIPv4, cfg.PodIPv6, log.Printf)
 		}
 
 		if cfg.egressSvcsTerminateEPEnabled() {
@@ -948,6 +949,7 @@ runLoop:
 						stateSecret:  cfg.KubeSecret,
 						netmapChan:   egressSvcsNotify,
 						podIPv4:      cfg.PodIPv4,
+						podIPv6:      cfg.PodIPv6,
 						tailnetAddrs: addrs,
 					}
 					go func() {

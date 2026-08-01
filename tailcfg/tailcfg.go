@@ -188,7 +188,10 @@ type CapabilityVersion int
 //   - 139: 2026-05-22: Client understands [NodeAttrEmitRuntimeMetrics]
 //   - 140: 2026-05-27: Client understands [NodeAttrDisableUDPGRO], [NodeAttrDisableUDPGSO], [NodeAttrDisableTUNUDPGRO], [NodeAttrDisableTUNTCPGRO]
 //   - 141: 2026-05-28: Client understands [NodeAttrNeverGSOEqualTail]
-const CurrentCapabilityVersion CapabilityVersion = 141
+//   - 142: 2026-07-06: Client understands c2n /remoteapi/localapi/* proxy
+//   - 143: 2026-07-22: Client correctly ignores conn25 node attributes when not enabled by environment variable
+//   - 144: 2026-07-31: Client sends [packet.TSMPDiscoKeyAdvertisement] around WireGuard handshakes
+const CurrentCapabilityVersion CapabilityVersion = 144
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -593,6 +596,18 @@ func (n *Node) DisplayNames(forOwner bool) (name, hostIfDifferent string) {
 	return n.ComputedName, ""
 }
 
+// IsRouter reports whether n is a router: it routes addresses besides its own.
+// Examples: an exit node, a subnet router, an app connector, etc.
+func (n *Node) IsRouter() bool {
+	// TODO(sfllaw): Keep this aligned with dbx.Node.IsSubnetRouter.
+	for _, r := range n.AllowedIPs {
+		if !slices.Contains(n.Addresses, r) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsTagged reports whether the node has any tags.
 func (n *Node) IsTagged() bool {
 	return len(n.Tags) > 0
@@ -602,6 +617,10 @@ func (n *Node) IsTagged() bool {
 func (n *Node) SharerOrUser() UserID {
 	return cmp.Or(n.Sharer, n.User)
 }
+
+// IsRouter reports whether n is a router: it routes addresses besides its own.
+// Examples: an exit node, a subnet router, an app connector, etc.
+func (n NodeView) IsRouter() bool { return n.ж.IsRouter() }
 
 // IsTagged reports whether the node has any tags.
 func (n NodeView) IsTagged() bool { return n.ж.IsTagged() }
@@ -880,6 +899,15 @@ type Hostinfo struct {
 	ShieldsUp       bool     `json:",omitzero"` // indicates whether the host is blocking incoming connections
 	ShareeNode      bool     `json:",omitzero"` // indicates this node exists in netmap because it's owned by a shared-to user
 	NoLogsNoSupport bool     `json:",omitzero"` // indicates that the user has opted out of sending logs and support
+
+	// RemoteConfig is whether the node has both linked
+	// feature/remoteconfig into its binary and enabled
+	// Prefs.RemoteConfig: it has delegated full remote management of
+	// its prefs and LocalAPI to the tailnet admin via the
+	// /remoteapi/localapi/* c2n endpoint. See feature/remoteconfig for
+	// the trust model.
+	RemoteConfig bool `json:",omitzero"`
+
 	// WireIngress indicates that the node would like to be wired up server-side
 	// (DNS, etc) to be able to use Tailscale Funnel, even if it's not currently
 	// enabled. For example, the user might only use it for intermittent
@@ -887,9 +915,15 @@ type Hostinfo struct {
 	// away, even if it's disabled most of the time. As an optimization, this is
 	// only sent if IngressEnabled is false, as IngressEnabled implies that this
 	// option is true.
-	WireIngress     bool           `json:",omitzero"`
-	IngressEnabled  bool           `json:",omitzero"`  // if the node has any funnel endpoint enabled
-	AllowsUpdate    bool           `json:",omitzero"`  // indicates that the node has opted-in to admin-console-drive remote updates
+	WireIngress    bool `json:",omitzero"`
+	IngressEnabled bool `json:",omitzero"` // if the node has any funnel endpoint enabled
+
+	// AllowsUpdate reports that the node has opted in to
+	// admin-console-driven remote updates and that the running binary
+	// includes client update support (the feature/clientupdate package,
+	// which tsnet apps don't include).
+	AllowsUpdate bool `json:",omitzero"`
+
 	Machine         string         `json:",omitzero"`  // the current host's machine type (uname -m)
 	GoArch          string         `json:",omitzero"`  // GOARCH value (of the built binary)
 	GoArchVar       string         `json:",omitzero"`  // GOARM, GOAMD64, etc (of the built binary)
@@ -1070,7 +1104,7 @@ type NetInfo struct {
 
 	// PreferredDERP is this node's preferred (home) DERP region ID.
 	// This is where the node expects to be contacted to begin a
-	// peer-to-peer connection. The node might be be temporarily
+	// peer-to-peer connection. The node might be temporarily
 	// connected to multiple DERP servers (to speak to other nodes
 	// that are located elsewhere) but PreferredDERP is the region ID
 	// that the node subscribes to traffic at.
@@ -2101,7 +2135,7 @@ type MapResponse struct {
 	PacketFilters map[string][]FilterRule `json:",omitempty"`
 
 	// UserProfiles are the user profiles of nodes in the network.
-	// As as of 1.1.541 (mapver 5), this contains new or updated
+	// As of 1.1.541 (mapver 5), this contains new or updated
 	// user profiles only.
 	UserProfiles []UserProfile `json:",omitempty"`
 
@@ -2437,7 +2471,7 @@ type Oauth2Token struct {
 	// If zero, TokenSource implementations will reuse the same
 	// token forever and RefreshToken or equivalent
 	// mechanisms for that TokenSource will not be used.
-	Expiry time.Time `json:"expiry,omitempty"`
+	Expiry time.Time `json:"expiry,omitzero"`
 }
 
 // NodeCapability represents a capability granted to the self node as listed in
@@ -3056,7 +3090,12 @@ type SSHAction struct {
 
 	// SessionDuration, if non-zero, is how long the session can stay open
 	// before being forcefully terminated.
-	SessionDuration time.Duration `json:"sessionDuration,omitempty,format:nano"`
+	// It is encoded as an int64 of nanoseconds (Go's time.Duration
+	// wire format for encoding/json v1). It must not use a jsonv2
+	// format tag; the mere presence of one makes Go 1.27's
+	// encoding/json fail to decode the struct. See
+	// https://github.com/tailscale/tailscale/issues/20528.
+	SessionDuration time.Duration `json:"sessionDuration,omitempty"`
 
 	// AllowAgentForwarding, if true, allows accepted connections to forward
 	// the ssh agent if requested.

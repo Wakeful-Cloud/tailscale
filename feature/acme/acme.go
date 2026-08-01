@@ -28,9 +28,11 @@ import (
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/syncs"
+	xacme "tailscale.com/tempfork/acme"
 	"tailscale.com/tsconst"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 )
 
@@ -67,13 +69,22 @@ var errNoExt = errors.New("acme extension not registered on this LocalBackend")
 type extension struct {
 	logf logger.Logf
 
-	// acmeMu serializes ACME operations so concurrent requests for
-	// certs don't slam ACME. The first goroutine through populates the
-	// on-disk cache and the rest reuse it.
-	acmeMu syncs.Mutex
+	// domainsMu guards domainLocks.
+	domainsMu syncs.Mutex
+	// domainLocks holds a per-domain mutex serialising ACME operations
+	// for that domain. Different domains run concurrently; the same
+	// domain still queues so the first goroutine fills the on-disk
+	// cache and the rest reuse it. Entries are never removed; a node
+	// only ever has a handful of domains so the map stays small.
+	domainLocks map[string]*syncs.Mutex
+
+	// accountMu serialises ACME account setup (key generation, LE
+	// registration) so two first-time issuances don't create separate
+	// accounts.
+	accountMu syncs.Mutex
 
 	// renewMu guards renewCertAt.
-	// Lock order: acmeMu before renewMu.
+	// Lock order: per-domain lock before renewMu.
 	renewMu     syncs.Mutex
 	renewCertAt map[string]time.Time // lazily initialized under renewMu
 
@@ -111,6 +122,18 @@ type extension struct {
 	// that periodically pokes [LocalBackend.GetCertPEM] so renewals
 	// happen on idle nodes. Non-nil while the loop is running.
 	certRefreshCancel context.CancelFunc
+}
+
+// lockDomain returns the mutex for domain, creating it on first use.
+func (e *extension) lockDomain(domain string) *syncs.Mutex {
+	e.domainsMu.Lock()
+	defer e.domainsMu.Unlock()
+	if m, ok := e.domainLocks[domain]; ok {
+		return m
+	}
+	m := new(syncs.Mutex)
+	mak.Set(&e.domainLocks, domain, m)
+	return m
 }
 
 // Go runs f in a new goroutine tracked by e.wg. [extension.Shutdown]
@@ -171,7 +194,16 @@ func getCertPEMHook(ctx context.Context, b *ipnlocal.LocalBackend, domain string
 	if err != nil {
 		return nil, err
 	}
-	return e.getCertPEMWithValidity(ctx, b, domain, minValidity)
+	pair, err := e.getCertPEMWithValidity(ctx, b, domain, minValidity)
+	if err != nil {
+		if ae, ok := errors.AsType[*xacme.Error](err); ok {
+			if d, ok := xacme.RateLimit(ae); ok {
+				return nil, certRateLimitedError{retryAfter: d, underlying: err}
+			}
+		}
+		return nil, err
+	}
+	return pair, nil
 }
 
 func getACMETLSALPNCertHook(b *ipnlocal.LocalBackend, hi *tls.ClientHelloInfo) (*tls.Certificate, bool) {

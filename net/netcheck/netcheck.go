@@ -39,6 +39,7 @@ import (
 	"tailscale.com/net/stun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/bools"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/nettype"
 	"tailscale.com/types/opt"
@@ -111,10 +112,10 @@ type Report struct {
 	// Empty means not checked.
 	PCP opt.Bool
 
-	PreferredDERP   int                   // or 0 for unknown
-	RegionLatency   map[int]time.Duration // keyed by DERP Region ID
-	RegionV4Latency map[int]time.Duration // keyed by DERP Region ID
-	RegionV6Latency map[int]time.Duration // keyed by DERP Region ID
+	PreferredDERP   int           // or 0 for unknown
+	RegionLatency   RegionLatency // keyed by DERP Region ID
+	RegionV4Latency RegionLatency // keyed by DERP Region ID
+	RegionV6Latency RegionLatency // keyed by DERP Region ID
 
 	GlobalV4Counters map[netip.AddrPort]int // number of times the endpoint was observed
 	GlobalV6Counters map[netip.AddrPort]int // number of times the endpoint was observed
@@ -184,6 +185,34 @@ func (r *Report) Clone() *Report {
 	return &r2
 }
 
+// RegionLatency is a map of DERP region IDs associated with their measured latencies.
+type RegionLatency map[int]time.Duration
+
+// Compare compares the latency of the regions i and j. It returns
+//
+//	-1 if region i is contained in lat, but region j is missing
+//	+1 if region j is contained in lat, but region i is missing
+//
+// Otherwise, it returns
+//
+//	-1 if the latency of region i is less than the latency of region j
+//	+1 if the latency of region i is greater than the latency of region j
+//
+// If both latency values are equal, then it breaks ties by region ID and returns
+//
+//	-1 if i is less than j
+//	 0 if i equals j
+//	+1 if i is greater than j
+func (lat RegionLatency) Compare(i, j int) int {
+	iLat, iOK := lat[i]
+	jLat, jOK := lat[j]
+	return cmp.Or(
+		bools.Compare(!iOK, !jOK), // defined things sort first
+		cmp.Compare(iLat, jLat),   // sort by latency
+		cmp.Compare(i, j),         // break ties by region ID
+	)
+}
+
 // Client generates Reports describing the result of both passive and active
 // network configuration probing. It provides two different modes of report, a
 // full report (see MakeNextReportFull) and a more lightweight incremental
@@ -233,8 +262,7 @@ type Client struct {
 	ForcePreferredDERP int
 
 	// For tests
-	testEnoughRegions      int
-	testCaptivePortalDelay time.Duration
+	testEnoughRegions int
 
 	mu       syncs.Mutex           // guards following
 	nextFull bool                  // do a full region scan, even if last != nil
@@ -255,14 +283,6 @@ func (c *Client) enoughRegions() int {
 		return 100
 	}
 	return 3
-}
-
-func (c *Client) captivePortalDelay() time.Duration {
-	if c.testCaptivePortalDelay > 0 {
-		return c.testCaptivePortalDelay
-	}
-	// Chosen semi-arbitrarily
-	return 200 * time.Millisecond
 }
 
 func (c *Client) logf(format string, a ...any) {
@@ -788,7 +808,15 @@ func (c *Client) SetForcePreferredDERP(region int) {
 	c.ForcePreferredDERP = region
 }
 
-var hookStartCaptivePortalDetection feature.Hook[func(ctx context.Context, rs *reportState, dm *tailcfg.DERPMap, preferredDERP int) (<-chan struct{}, func())]
+// HookStartCaptivePortalDetection, if set, is called by GetReport to
+// asynchronously start captive portal detection during a full (non-incremental)
+// netcheck. It is set at init time by the optional
+// tailscale.com/feature/captiveportal/netcheckhook package.
+//
+// The returned done channel is closed when detection has finished (and
+// setCaptivePortal has been called with the result, if it ran); the returned
+// stop function cancels a detection that has not yet started.
+var HookStartCaptivePortalDetection feature.Hook[func(ctx context.Context, c *Client, dm *tailcfg.DERPMap, preferredDERP int, setCaptivePortal func(bool)) (done <-chan struct{}, stop func())]
 
 // GetReport gets a report. The 'opts' argument is optional and can be nil.
 // Callers are discouraged from passing a ctx with an arbitrary deadline as this
@@ -915,8 +943,11 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	captivePortalDone := syncs.ClosedChan()
 	captivePortalStop := func() {}
 	if buildfeatures.HasCaptivePortal && !rs.incremental && !onlySTUN {
-		start := hookStartCaptivePortalDetection.Get()
-		captivePortalDone, captivePortalStop = start(ctx, rs, dm, preferredDERP)
+		if start, ok := HookStartCaptivePortalDetection.GetOk(); ok {
+			captivePortalDone, captivePortalStop = start(ctx, c, dm, preferredDERP, func(found bool) {
+				rs.report.CaptivePortal.Set(found)
+			})
+		}
 	}
 
 	wg := syncs.NewWaitGroupChan()
@@ -1026,7 +1057,7 @@ func (c *Client) finishAndStoreReport(rs *reportState, dm *tailcfg.DERPMap) *Rep
 	report := rs.report.Clone()
 	rs.mu.Unlock()
 
-	c.addReportHistoryAndSetPreferredDERP(rs, report, dm.View())
+	c.addReportHistoryAndSetPreferredDERP(rs, report, dm.View(), c.timeNow())
 	c.logConciseReport(report, dm)
 
 	return report
@@ -1381,7 +1412,7 @@ func (c *Client) addReportAndPruneExpired(now time.Time, r *Report) {
 
 // addReportHistoryAndSetPreferredDERP adds r to the set of recent Reports
 // and mutates r.PreferredDERP to contain the best recent one.
-func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report, dm tailcfg.DERPMapView) {
+func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report, dm tailcfg.DERPMapView, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -1392,7 +1423,6 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 
 	// Add report to history, enforce retention window, then take the best (lowest)
 	// latency seen per region across what remains.
-	now := c.timeNow()
 	c.addReportAndPruneExpired(now, r)
 	bestRecent := c.bestRecentLatencyLocked()
 
@@ -1517,10 +1547,8 @@ func (c *Client) RecentRegionLatency() map[int]time.Duration {
 // r.PreferredDERP from that history.
 func (c *Client) AddReportHistoryForTest(dm *tailcfg.DERPMap, r *Report, now time.Time) {
 	testenv.AssertInTest()
-	defer func(prev func() time.Time) { c.TimeNow = prev }(c.TimeNow)
-	c.TimeNow = func() time.Time { return now }
 	rs := &reportState{c: c, start: now}
-	c.addReportHistoryAndSetPreferredDERP(rs, r, dm.View())
+	c.addReportHistoryAndSetPreferredDERP(rs, r, dm.View(), now)
 }
 
 func updateLatency(m map[int]time.Duration, regionID int, d time.Duration) {

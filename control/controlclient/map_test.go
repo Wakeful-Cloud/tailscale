@@ -34,9 +34,7 @@ import (
 	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
-	"tailscale.com/util/usermetric"
 	"tailscale.com/util/zstdframe"
-	"tailscale.com/wgengine"
 )
 
 func eps(s ...string) []netip.AddrPort {
@@ -631,7 +629,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 		name            string
 		initialOnline   bool
 		initialLastSeen time.Time
-		updateDiscoKey  bool
+		updateDiscoKey  func() key.DiscoPublic
 		updateOnline    bool
 		updateLastSeen  time.Time
 		wantUpdate      bool
@@ -641,7 +639,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 			name:            "newer_key_not_online",
 			initialOnline:   true,
 			initialLastSeen: time.Unix(1, 0),
-			updateDiscoKey:  true,
+			updateDiscoKey:  key.NewDisco().Public,
 			updateOnline:    false,
 			updateLastSeen:  time.Now(),
 			wantUpdate:      true,
@@ -651,7 +649,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 			name:            "newer_key_online",
 			initialOnline:   true,
 			initialLastSeen: time.Unix(1, 0),
-			updateDiscoKey:  true,
+			updateDiscoKey:  key.NewDisco().Public,
 			updateOnline:    true,
 			updateLastSeen:  time.Now(),
 			wantUpdate:      true,
@@ -661,7 +659,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 			name:            "older_key_not_online",
 			initialOnline:   false,
 			initialLastSeen: time.Now(),
-			updateDiscoKey:  true,
+			updateDiscoKey:  key.NewDisco().Public,
 			updateOnline:    false,
 			updateLastSeen:  time.Unix(1, 0),
 			wantUpdate:      false,
@@ -671,7 +669,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 			name:            "older_key_online",
 			initialOnline:   false,
 			initialLastSeen: time.Now(),
-			updateDiscoKey:  true,
+			updateDiscoKey:  key.NewDisco().Public,
 			updateOnline:    true,
 			updateLastSeen:  time.Unix(1, 0),
 			wantUpdate:      true,
@@ -681,7 +679,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 			name:            "same_newer_key_not_online",
 			initialOnline:   true,
 			initialLastSeen: time.Unix(1, 0),
-			updateDiscoKey:  false,
+			updateDiscoKey:  nil,
 			updateOnline:    false,
 			updateLastSeen:  time.Now(),
 			wantUpdate:      false,
@@ -691,7 +689,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 			name:            "same_newer_key_online",
 			initialOnline:   true,
 			initialLastSeen: time.Unix(1, 0),
-			updateDiscoKey:  false,
+			updateDiscoKey:  nil,
 			updateOnline:    true,
 			updateLastSeen:  time.Now(),
 			wantUpdate:      false,
@@ -701,7 +699,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 			name:            "same_older_key_not_online",
 			initialOnline:   false,
 			initialLastSeen: time.Now(),
-			updateDiscoKey:  false,
+			updateDiscoKey:  nil,
 			updateOnline:    false,
 			updateLastSeen:  time.Unix(1, 0),
 			wantUpdate:      false,
@@ -711,7 +709,7 @@ func TestUpdateDiscoForNode(t *testing.T) {
 			name:            "same_older_key_online",
 			initialOnline:   false,
 			initialLastSeen: time.Now(),
-			updateDiscoKey:  false,
+			updateDiscoKey:  nil,
 			updateOnline:    true,
 			updateLastSeen:  time.Unix(1, 0),
 			wantUpdate:      true,
@@ -720,11 +718,22 @@ func TestUpdateDiscoForNode(t *testing.T) {
 		{
 			name:           "no_initial_last_seen",
 			initialOnline:  false,
-			updateDiscoKey: true,
+			updateDiscoKey: key.NewDisco().Public,
 			updateOnline:   false,
 			updateLastSeen: time.Now(),
 			wantUpdate:     true,
 			wantKeyChanged: true,
+		},
+		{
+			name:          "zero_key",
+			initialOnline: false,
+			updateDiscoKey: func() key.DiscoPublic {
+				return key.DiscoPublic{}
+			},
+			updateOnline:   false,
+			updateLastSeen: time.Now(),
+			wantUpdate:     false,
+			wantKeyChanged: false,
 		},
 	}
 
@@ -757,8 +766,8 @@ func TestUpdateDiscoForNode(t *testing.T) {
 				}
 
 				newKey := oldKey.Public()
-				if tt.updateDiscoKey {
-					newKey = key.NewDisco().Public()
+				if tt.updateDiscoKey != nil {
+					newKey = tt.updateDiscoKey()
 				}
 				ms.updateDiscoForNode(node.ID, node.Key, newKey, tt.updateLastSeen, tt.updateOnline)
 
@@ -1538,6 +1547,24 @@ func TestUpgradeNode(t *testing.T) {
 			in:   &tailcfg.Node{Addresses: []netip.Prefix{a1, a2}, AllowedIPs: []netip.Prefix{}},
 			want: &tailcfg.Node{Addresses: []netip.Prefix{a1, a2}, AllowedIPs: []netip.Prefix{}},
 		},
+		{
+			// An unsigned peer is not covered by tailnet lock and must not carry advertised routes
+			name: "unsigned-peer-strips-extra-allowed-ips",
+			in:   &tailcfg.Node{Addresses: []netip.Prefix{a1, a2}, AllowedIPs: []netip.Prefix{a1, a2, a3, a4}, UnsignedPeerAPIOnly: true},
+			want: &tailcfg.Node{Addresses: []netip.Prefix{a1, a2}, AllowedIPs: []netip.Prefix{a1, a2}, UnsignedPeerAPIOnly: true},
+		},
+		{
+			// An unsigned peer whose AllowedIPs already equal its Addresses is left untouched
+			name: "unsigned-peer-allowed-ips-equal-addresses",
+			in:   &tailcfg.Node{Addresses: []netip.Prefix{a1, a2}, AllowedIPs: []netip.Prefix{a1, a2}, UnsignedPeerAPIOnly: true},
+			want: &tailcfg.Node{Addresses: []netip.Prefix{a1, a2}, AllowedIPs: []netip.Prefix{a1, a2}, UnsignedPeerAPIOnly: true},
+		},
+		{
+			// A signed peer keeps its advertised routes: the strip only applies to unsigned peers
+			name: "signed-peer-keeps-extra-allowed-ips",
+			in:   &tailcfg.Node{Addresses: []netip.Prefix{a1, a2}, AllowedIPs: []netip.Prefix{a1, a2, a3, a4}},
+			want: &tailcfg.Node{Addresses: []netip.Prefix{a1, a2}, AllowedIPs: []netip.Prefix{a1, a2, a3, a4}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1946,20 +1973,6 @@ func TestLearnZstdOfKeepAlive(t *testing.T) {
 	}
 	if got, want := sess.ztdDecodesForTest, 1; got != want {
 		t.Fatalf("got %d zstd decodes; want %d", got, want)
-	}
-}
-
-func TestPathDiscokeyerImplementations(t *testing.T) {
-	bus := eventbustest.NewBus(t)
-	ht := health.NewTracker(bus)
-	reg := new(usermetric.Registry)
-	e, err := wgengine.NewFakeUserspaceEngine(t.Logf, 0, ht, reg, bus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(e.Close)
-	if _, ok := e.(patchDiscoKeyer); !ok {
-		t.Error("wgengine.userspaceEngine must implement patchDiscoKeyer")
 	}
 }
 

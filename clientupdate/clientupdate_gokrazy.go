@@ -13,12 +13,13 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"tailscale.com/clientupdate/distsign"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/progresstracking"
 )
 
 const (
@@ -51,12 +52,13 @@ func gokrazyUpdateFromURL(ctx context.Context, args GokrazyUpdateArgs) error {
 	tmp.Close()
 	defer os.Remove(tmpName)
 
+	logf("downloading %s", args.URL)
 	if args.AllowUnsigned {
-		if err := downloadGAFUnverified(ctx, args.URL, tmpName); err != nil {
+		if err := downloadUnverified(ctx, logf, args.URL, tmpName); err != nil {
 			return err
 		}
 	} else {
-		if err := downloadGAFVerified(ctx, logf, args.URL, tmpName); err != nil {
+		if err := distsign.DownloadVerified(ctx, logf, args.URL, tmpName); err != nil {
 			return err
 		}
 	}
@@ -67,6 +69,8 @@ func gokrazyUpdateFromURL(ctx context.Context, args GokrazyUpdateArgs) error {
 	}
 	defer zr.Close()
 
+	logf("download complete")
+
 	gokClient := gokrazyHTTPClient()
 	for _, part := range []struct {
 		name string
@@ -76,6 +80,7 @@ func gokrazyUpdateFromURL(ctx context.Context, args GokrazyUpdateArgs) error {
 		{"boot.img", "/update/boot"},
 		{"mbr.img", "/update/mbr"},
 	} {
+		logf("writing %s...", part.name)
 		if err := putGokrazyGAFMember(ctx, gokClient, zr.File, part.name, part.path); err != nil {
 			return err
 		}
@@ -92,10 +97,15 @@ func gokrazyUpdateFromURL(ctx context.Context, args GokrazyUpdateArgs) error {
 	return nil
 }
 
-// downloadGAFUnverified saves the GAF at srcURL to dstPath without verifying a
-// signature. It is used only when args.AllowUnsigned is set, for tests that
-// serve the GAF from a fileserver that does not publish distsign.pub.
-func downloadGAFUnverified(ctx context.Context, srcURL, dstPath string) error {
+// downloadUnverified saves the GAF at srcURL to dstPath without verifying
+// a signature. It is used only when args.AllowUnsigned is set, for tests
+// that serve the GAF from a fileserver that does not publish distsign.pub
+// and for the gafpush "sftp the GAF onto the appliance and update from a
+// local path" flow, which uses a "file://" URL.
+func downloadUnverified(ctx context.Context, logf logger.Logf, srcURL, dstPath string) error {
+	if after, ok := strings.CutPrefix(srcURL, "file://"); ok {
+		return copyLocalFile(after, dstPath, logf)
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", srcURL, nil)
 	if err != nil {
 		return err
@@ -112,37 +122,49 @@ func downloadGAFUnverified(ctx context.Context, srcURL, dstPath string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, res.Body); err != nil {
+	total := res.ContentLength
+	pw := progresstracking.NewWriter(io.Discard, total, time.Second, func(done int64) {
+		if total > 0 {
+			logf("downloading: %d / %d MB (%.0f%%)", done>>20, total>>20, float64(done)/float64(total)*100)
+		}
+	})
+	if _, err := io.Copy(f, io.TeeReader(res.Body, pw)); err != nil {
 		f.Close()
 		return err
 	}
 	return f.Close()
 }
 
-// downloadGAFVerified saves the GAF at srcURL to dstPath, verifying the
-// detached ed25519 signature at "<srcURL>.sig" against the root signing keys
-// embedded in this binary via the distsign package.
-//
-// The signing-key bundle distsign.pub and its signature distsign.pub.sig are
-// fetched from the root of the server hosting srcURL.
-func downloadGAFVerified(ctx context.Context, logf logger.Logf, srcURL, dstPath string) error {
-	u, err := url.Parse(srcURL)
-	if err != nil {
-		return fmt.Errorf("parsing GAF URL %q: %w", srcURL, err)
-	}
-	if u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("GAF URL %q is missing scheme or host", srcURL)
-	}
-	base := &url.URL{Scheme: u.Scheme, User: u.User, Host: u.Host}
-	path := strings.TrimPrefix(u.Path, "/")
-	if path == "" {
-		return fmt.Errorf("GAF URL %q has no path component", srcURL)
-	}
-	c, err := distsign.NewClient(logf, base.String())
+// copyLocalFile copies the GAF at src to dst. Used by the "file://" branch
+// of downloadUnverified. The source file is left in place; callers that
+// staged it (e.g. gafpush) clean up after the update completes.
+func copyLocalFile(src, dst string, logf logger.Logf) error {
+	sf, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	return c.Download(ctx, path, dstPath)
+	defer sf.Close()
+	df, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	fi, err := sf.Stat()
+	if err != nil {
+		df.Close()
+		return err
+	}
+	total := fi.Size()
+	logf("copying local GAF %s (%d MB)", src, total>>20)
+	pw := progresstracking.NewWriter(io.Discard, total, time.Second, func(done int64) {
+		if total > 0 {
+			logf("copying: %d / %d MB (%.0f%%)", done>>20, total>>20, float64(done)/float64(total)*100)
+		}
+	})
+	if _, err := io.Copy(df, io.TeeReader(sf, pw)); err != nil {
+		df.Close()
+		return err
+	}
+	return df.Close()
 }
 
 func gokrazyHTTPClient() *http.Client {

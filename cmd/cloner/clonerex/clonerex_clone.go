@@ -209,9 +209,31 @@ var _MapSlicePointerContainerCloneNeedsRegeneration = MapSlicePointerContainer(s
 	Routes map[string][]*SliceContainer
 }{})
 
+// Clone makes a deep copy of MapWithNamedSliceValues.
+// The result aliases no memory with the original.
+func (src *MapWithNamedSliceValues) Clone() *MapWithNamedSliceValues {
+	if src == nil {
+		return nil
+	}
+	dst := new(MapWithNamedSliceValues)
+	*dst = *src
+	if dst.M != nil {
+		dst.M = map[string]NamedSlice{}
+		for k := range src.M {
+			dst.M[k] = append([]string{}, src.M[k]...)
+		}
+	}
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _MapWithNamedSliceValuesCloneNeedsRegeneration = MapWithNamedSliceValues(struct {
+	M map[string]NamedSlice
+}{})
+
 // Clone duplicates src into dst and reports whether it succeeded.
 // To succeed, <src, dst> must be of types <*T, *T> or <*T, **T>,
-// where T is one of SliceContainer,InterfaceContainer,MapWithPointers,DeeplyNestedMap,NamedMapContainer,MapSlicePointerContainer.
+// where T is one of SliceContainer,InterfaceContainer,MapWithPointers,DeeplyNestedMap,NamedMapContainer,MapSlicePointerContainer,MapWithNamedSliceValues.
 func Clone(dst, src any) bool {
 	switch src := src.(type) {
 	case *SliceContainer:
@@ -265,6 +287,15 @@ func Clone(dst, src any) bool {
 			*dst = *src.Clone()
 			return true
 		case **MapSlicePointerContainer:
+			*dst = src.Clone()
+			return true
+		}
+	case *MapWithNamedSliceValues:
+		switch dst := dst.(type) {
+		case *MapWithNamedSliceValues:
+			*dst = *src.Clone()
+			return true
+		case **MapWithNamedSliceValues:
 			*dst = src.Clone()
 			return true
 		}

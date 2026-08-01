@@ -1746,7 +1746,7 @@ func TestFallbackTCPHandler(t *testing.T) {
 // Before aa5da2e5f22a, every peer change rebuilt a full netmap on
 // the engine, so [wgengine.Engine.SetNetworkMap] kept the engine's
 // cached netmap fresh and [wgengine.Engine.Reconfig] kept wgdev and
-// e.lastCfgFull fresh. After that refactor, peer adds and removes
+// e.lastCfg fresh. After that refactor, peer adds and removes
 // ride the delta path and only mutate [nodeBackend]; the engine's
 // cached netmap and wireguard config stayed stale, and
 // [wgengine.Engine.PeerForIP] / [wgengine.Engine.Ping] / wgdev's
@@ -1925,7 +1925,7 @@ func TestPingSubnetRouteOfDeltaPeer(t *testing.T) {
 	// outbound wgdev encryption, magicsock transport. The receiving
 	// side (s2's tstun.Wrapper) intercepts TSMP regardless of dst
 	// IP and replies with a pong. So this catches both halves of
-	// the bug: a stale BART / lastCfgFull (PeerForIP / lookupPeerByIP
+	// the bug: a stale BART / lastCfg (PeerForIP / lookupPeerByIP
 	// miss) AND a stale wgdev PeerLookupFunc closure (peer's noise
 	// key not yet registered for outbound encryption).
 	pingCtx, cancelPing := pingTimeout(ctx)
@@ -2560,6 +2560,10 @@ type chanTUN struct {
 	Outbound chan []byte // packets to read from TUN
 	closed   chan struct{}
 	events   chan tun.Event
+
+	// wmu serializes Write and Close so a Write can't send on
+	// Inbound while Close is closing it.
+	wmu sync.Mutex
 }
 
 func newChanTUN() *chanTUN {
@@ -2576,6 +2580,8 @@ func newChanTUN() *chanTUN {
 func (t *chanTUN) File() *os.File { panic("not implemented") }
 
 func (t *chanTUN) Close() error {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
 	select {
 	case <-t.closed:
 	default:
@@ -2596,14 +2602,19 @@ func (t *chanTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 }
 
 func (t *chanTUN) Write(bufs [][]byte, offset int) (int, error) {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	select {
+	case <-t.closed:
+		return 0, errors.New("closed")
+	default:
+	}
 	for _, buf := range bufs {
 		pkt := buf[offset:]
 		if len(pkt) == 0 {
 			continue
 		}
 		select {
-		case <-t.closed:
-			return 0, errors.New("closed")
 		case t.Inbound <- slices.Clone(pkt):
 		default:
 			// Drop the packet if the channel is full, like a real
@@ -3409,6 +3420,11 @@ func TestDeps(t *testing.T) {
 		BadDeps: map[string]string{
 			"golang.org/x/crypto/ssh":                       "tsnet should not depend on SSH",
 			"golang.org/x/crypto/ssh/internal/bcrypt_pbkdf": "tsnet should not depend on SSH",
+			"tailscale.com/chirp":                           "tsnet should not depend on BIRD integration",
+			"tailscale.com/feature/bird":                    "tsnet should not depend on BIRD integration",
+			"tailscale.com/feature/captiveportal":           "tsnet apps don't need captive portal detection; import it explicitly if desired",
+			"tailscale.com/feature/clientupdate":            "tsnet should not depend on feature/clientupdate",
+			"tailscale.com/feature/remoteconfig":            "tsnet should not depend on feature/remoteconfig",
 			"tailscale.com/feature/syspolicy":               "tsnet should not depend on syspolicy",
 			"tailscale.com/ipn/store/awsstore":              "tsnet callers wanting AWS state storage should import awsstore themselves",
 			"tailscale.com/ipn/store/kubestore":             "tsnet callers wanting Kubernetes state storage should import kubestore themselves",
@@ -3434,8 +3450,8 @@ func TestResolveAuthKey(t *testing.T) {
 		audience        string
 		oauthAvailable  bool
 		wifAvailable    bool
-		resolveViaOAuth func(ctx context.Context, clientSecret string, tags []string) (string, error)
-		resolveViaWIF   func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error)
+		resolveViaOAuth func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error)
+		resolveViaWIF   func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error)
 		wantAuthKey     string
 		wantErr         bool
 		wantErrContains string
@@ -3444,9 +3460,9 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "success-oauth-client-secret",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
-				if clientSecret != "tskey-client-secret-123" {
-					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
+				if args.AuthKey != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", args.AuthKey)
 				}
 				return "tskey-auth-via-oauth", nil
 			},
@@ -3457,7 +3473,7 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "fail-oauth-client-secret",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
 				return "", fmt.Errorf("resolution failed")
 			},
 			wantErrContains: "resolution failed",
@@ -3467,12 +3483,12 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "client-id-123",
 			idToken:      "id-token-456",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
-				if clientID != "client-id-123" {
-					return "", fmt.Errorf("unexpected client ID: %s", clientID)
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
+				if args.ClientID != "client-id-123" {
+					return "", fmt.Errorf("unexpected client ID: %s", args.ClientID)
 				}
-				if idToken != "id-token-456" {
-					return "", fmt.Errorf("unexpected ID token: %s", idToken)
+				if args.IDToken != "id-token-456" {
+					return "", fmt.Errorf("unexpected ID token: %s", args.IDToken)
 				}
 				return "tskey-auth-via-wif", nil
 			},
@@ -3484,12 +3500,12 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "client-id-123",
 			audience:     "api.tailscale.com",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
-				if clientID != "client-id-123" {
-					return "", fmt.Errorf("unexpected client ID: %s", clientID)
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
+				if args.ClientID != "client-id-123" {
+					return "", fmt.Errorf("unexpected client ID: %s", args.ClientID)
 				}
-				if audience != "api.tailscale.com" {
-					return "", fmt.Errorf("unexpected ID token: %s", idToken)
+				if args.Audience != "api.tailscale.com" {
+					return "", fmt.Errorf("unexpected audience: %s", args.Audience)
 				}
 				return "tskey-auth-via-wif", nil
 			},
@@ -3501,7 +3517,7 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "client-id-123",
 			idToken:      "id-token-456",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("resolution failed")
 			},
 			wantErrContains: "resolution failed",
@@ -3511,7 +3527,7 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "",
 			idToken:      "id-token-456",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "empty",
@@ -3521,7 +3537,7 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "",
 			audience:     "api.tailscale.com",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "empty",
@@ -3531,7 +3547,7 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:     "client-id-123",
 			idToken:      "",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "empty",
@@ -3542,7 +3558,7 @@ func TestResolveAuthKey(t *testing.T) {
 			idToken:      "id-token-456",
 			audience:     "api.tailscale.com",
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "only one of ID token and audience",
@@ -3551,14 +3567,14 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "wif-skipped-oauth-succeeds",
 			clientSecret:   "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
-				if clientSecret != "tskey-client-secret-123" {
-					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
+				if args.AuthKey != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", args.AuthKey)
 				}
 				return "tskey-auth-via-oauth", nil
 			},
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantAuthKey:     "tskey-auth-via-oauth",
@@ -3569,11 +3585,11 @@ func TestResolveAuthKey(t *testing.T) {
 			clientID:       "tskey-client-id-123",
 			idToken:        "",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
 				return "", fmt.Errorf("resolution failed")
 			},
 			wifAvailable: true,
-			resolveViaWIF: func(ctx context.Context, baseURL, clientID, idToken, audience string, tags []string) (string, error) {
+			resolveViaWIF: func(ctx context.Context, args tailscale.ResolveAuthKeyWIFArgs) (string, error) {
 				return "", fmt.Errorf("should not be called")
 			},
 			wantErrContains: "failed",
@@ -3597,9 +3613,9 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "authkey-client-secret-oauth-succeeds",
 			authKey:        "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
-				if clientSecret != "tskey-client-secret-123" {
-					return "", fmt.Errorf("unexpected client secret: %s", clientSecret)
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
+				if args.AuthKey != "tskey-client-secret-123" {
+					return "", fmt.Errorf("unexpected client secret: %s", args.AuthKey)
 				}
 				return "tskey-auth-via-oauth", nil
 			},
@@ -3610,7 +3626,7 @@ func TestResolveAuthKey(t *testing.T) {
 			name:           "authkey-client-secret-oauth-fails",
 			authKey:        "tskey-client-secret-123",
 			oauthAvailable: true,
-			resolveViaOAuth: func(ctx context.Context, clientSecret string, tags []string) (string, error) {
+			resolveViaOAuth: func(ctx context.Context, args tailscale.ResolveAuthKeyArgs) (string, error) {
 				return "", fmt.Errorf("resolution failed")
 			},
 			wantErrContains: "resolution failed",

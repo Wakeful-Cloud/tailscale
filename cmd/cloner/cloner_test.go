@@ -283,3 +283,13 @@ func TestDeeplyNestedMap(t *testing.T) {
 		t.Errorf("Clone() aliased FourLevels map: new nested key appeared in original")
 	}
 }
+
+func TestMapWithNamedSliceValues(t *testing.T) {
+	orig := &clonerex.MapWithNamedSliceValues{
+		M: map[string]clonerex.NamedSlice{"k": {"foo", "bar"}},
+	}
+	cloned := orig.Clone()
+	if diff := cmp.Diff(orig, cloned); diff != "" {
+		t.Errorf("Clone() mismatch (-orig +cloned):\n%s", diff)
+	}
+}

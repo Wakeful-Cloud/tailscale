@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gaissmai/bart"
 	"go4.org/mem"
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
@@ -57,11 +58,13 @@ import (
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/ipset"
+	"tailscale.com/net/netcheck"
 	"tailscale.com/net/netkernelconf"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/routemanager"
 	"tailscale.com/net/traffic"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
@@ -103,10 +106,8 @@ import (
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
-	"tailscale.com/wgengine/netlog"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
-	"tailscale.com/wgengine/wgcfg/nmcfg"
 )
 
 var controlDebugFlags = getControlDebugFlags()
@@ -229,6 +230,7 @@ type LocalBackend struct {
 	keyLogf     logger.Logf             // for printing list of peers on change
 	statsLogf   logger.Logf             // for printing peers stats on change
 	sys         *tsd.System
+	goos        string // runtime.GOOS usually, except in tests
 	eventClient *eventbus.Client
 	appcTask    execqueue.ExecQueue // handles updates from appc
 
@@ -431,21 +433,6 @@ type LocalBackend struct {
 	// refreshAutoExitNode indicates if the exit node should be recomputed when the next netcheck report is available.
 	refreshAutoExitNode bool // guarded by mu
 
-	// captiveCtx and captiveCancel are used to control captive portal
-	// detection. They are protected by 'mu' and can be changed during the
-	// lifetime of a LocalBackend.
-	//
-	// captiveCtx will always be non-nil, though it might be a canceled
-	// context. captiveCancel is non-nil if checkCaptivePortalLoop is
-	// running, and is set to nil after being canceled.
-	captiveCtx    context.Context
-	captiveCancel context.CancelFunc
-	// needsCaptiveDetection is a channel that is used to signal either
-	// that captive portal detection is required (sending true) or that the
-	// backend is healthy and captive portal detection is not required
-	// (sending false).
-	needsCaptiveDetection chan bool
-
 	// overrideAlwaysOn is whether [pkey.AlwaysOn] is overridden by the user
 	// and should have no impact on the WantRunning state until the policy changes,
 	// or the user re-connects manually, switches to a different profile, etc.
@@ -500,6 +487,10 @@ func (b *LocalBackend) HealthTracker() *health.Tracker { return b.health }
 
 // Logger returns the logger for the backend.
 func (b *LocalBackend) Logger() logger.Logf { return b.logf }
+
+// BackendLogID returns the backend's log ID, or the zero value if logging is
+// not in use.
+func (b *LocalBackend) BackendLogID() logid.PublicID { return b.backendLogID }
 
 // UserMetricsRegistry returns the usermetrics registry for the backend
 func (b *LocalBackend) UserMetricsRegistry() *usermetric.Registry {
@@ -577,11 +568,6 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	ctx, cancel := context.WithCancelCause(context.Background())
 	clock := tstime.StdClock{}
 
-	// Until we transition to a Running state, use a canceled context for
-	// our captive portal detection.
-	captiveCtx, captiveCancel := context.WithCancel(ctx)
-	captiveCancel()
-
 	m := metrics{
 		advertisedRoutes: sys.UserMetricsRegistry().NewGauge(
 			"tailscaled_advertised_routes", "Number of advertised network routes (e.g. by a subnet router)"),
@@ -600,27 +586,24 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	}
 
 	b := &LocalBackend{
-		ctx:                   ctx,
-		ctxCancel:             cancel,
-		logf:                  logf,
-		keyLogf:               logger.LogOnChange(logf, 5*time.Minute, clock.Now),
-		statsLogf:             logger.LogOnChange(logf, 5*time.Minute, clock.Now),
-		sys:                   sys,
-		polc:                  sys.PolicyClientOrDefault(),
-		health:                sys.HealthTracker.Get(),
-		metrics:               m,
-		e:                     e,
-		dialer:                dialer,
-		store:                 store,
-		pm:                    pm,
-		backendLogID:          logID,
-		state:                 ipn.NoState,
-		em:                    newExpiryManager(logf, sys.Bus.Get()),
-		loginFlags:            loginFlags,
-		clock:                 clock,
-		captiveCtx:            captiveCtx,
-		captiveCancel:         nil, // so that we start checkCaptivePortalLoop when Running
-		needsCaptiveDetection: make(chan bool),
+		ctx:          ctx,
+		ctxCancel:    cancel,
+		logf:         logf,
+		keyLogf:      logger.LogOnChange(logf, 5*time.Minute, clock.Now),
+		statsLogf:    logger.LogOnChange(logf, 5*time.Minute, clock.Now),
+		sys:          sys,
+		polc:         sys.PolicyClientOrDefault(),
+		health:       sys.HealthTracker.Get(),
+		metrics:      m,
+		e:            e,
+		dialer:       dialer,
+		store:        store,
+		pm:           pm,
+		backendLogID: logID,
+		state:        ipn.NoState,
+		em:           newExpiryManager(logf, sys.Bus.Get()),
+		loginFlags:   loginFlags,
+		clock:        clock,
 	}
 
 	sys.NoiseRoundTripper.Set(noiseRoundTripper{b})
@@ -630,11 +613,18 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	nb.ready()
 
 	e.SetPeerByIPPacketFunc(b.lookupPeerByIP)
-	e.SetPeerForIPFunc(b.peerForIP)
+	e.SetPeerConfigFunc(b.peerAllowedIPs)
+	e.SetPeerForIPFunc(b.PeerForIP)
 	e.SetPeerSessionStateFunc(b.onPeerWireGuardState)
-	e.SetNetLogNodeSource(netLogNodeSource{b})
+	e.SetNetLogSource(netLogNodeSource{b})
+	e.SetPeerPriorityMessageOnEstablishmentFunc(b.MagicConn().PriorityMessageForPeer)
 	e.SetWGPeerLookup(b.lookupPeerWireGuardString)
 	b.dialer.SetResolveMagicDNS(b.resolveMagicDNS)
+	if buildfeatures.HasDNS {
+		if dm, ok := sys.DNSManager.GetOK(); ok {
+			dm.Resolver().SetMagicDNSHosts(magicDNSHosts{b})
+		}
+	}
 
 	if sys.InitialConfig != nil {
 		if err := b.initPrefsFromConfig(sys.InitialConfig); err != nil {
@@ -784,7 +774,7 @@ func (b *LocalBackend) onHomeDERPUpdate(du magicsock.HomeDERPChanged) {
 // In practice, it is possible that one profile with a homeDERP of 0 (no-derp)
 // got switched before setting any home DERP or that DERP IDs match across
 // DERP maps. Since the risk of this happening is small and the consequences
-// of this is is just a possible less optimal DERP until the next reSTUN,
+// of this is just a possible less optimal DERP until the next reSTUN,
 // accept this possibility.
 func (b *LocalBackend) onHomeDERPUpdateLocked(du magicsock.HomeDERPChanged) {
 	cn := b.currentNode()
@@ -1147,14 +1137,28 @@ func (b *LocalBackend) shouldPauseControlClientLocked(prefs ipn.PrefsView) bool 
 	return false
 }
 
-// DisconnectControl shuts down control client. This can be run before node shutdown to force control to consider this ndoe
-// inactive. This can be used to ensure that nodes that are HA subnet router or app connector replicas are shutting
-// down, clients switch over to other replicas whilst the existing connections are kept alive for some period of time.
+// DisconnectControl shuts down the control client. This can be run before
+// node shutdown to force control to consider this node inactive. This can
+// be used to ensure that nodes that are HA subnet router or app connector
+// replicas are shutting down, clients switch over to other replicas whilst
+// the existing connections are kept alive for some period of time.
+//
+// Shutdown of the detached client is synchronous: it cancels the client's
+// in-flight requests and waits for its goroutines to exit, but it does not
+// wait for pending updates to be delivered.
 func (b *LocalBackend) DisconnectControl() {
 	b.mu.Lock()
 	cc := b.resetControlClientLocked()
 	b.mu.Unlock()
 
+	// The Shutdown call must not run while b.mu is held, per the deadlock
+	// history in tailscale/tailscale#18052: controlclient.Auto's
+	// goroutines deliver callbacks into LocalBackend through an execqueue
+	// whose RunSync holds the queue mutex while the callback acquires
+	// b.mu, and Auto.Shutdown acquires that same queue mutex, so calling
+	// it with b.mu held inverts the lock order. A previous attempt to
+	// shut the client down synchronously inside resetControlClientLocked
+	// with b.mu held (#18127) deadlocked and was reverted (#18149).
 	if cc != nil {
 		cc.Shutdown()
 	}
@@ -1215,12 +1219,6 @@ func (b *LocalBackend) linkChange(delta *netmon.ChangeDelta) {
 	}
 }
 
-// Captive portal detection hooks.
-var (
-	hookCaptivePortalHealthChange feature.Hook[func(*LocalBackend, *health.State)]
-	hookCheckCaptivePortalLoop    feature.Hook[func(*LocalBackend, context.Context)]
-)
-
 func (b *LocalBackend) onHealthChange(change health.Change) {
 	if !buildfeatures.HasHealth {
 		return
@@ -1248,10 +1246,6 @@ func (b *LocalBackend) onHealthChange(change health.Change) {
 		b.cc.SetIPForwardingBroken(broken)
 	}
 	b.mu.Unlock()
-
-	if f, ok := hookCaptivePortalHealthChange.GetOk(); ok {
-		f(b, state)
-	}
 }
 
 // GetOrSetCaptureSink returns the current packet capture sink, creating it
@@ -1316,11 +1310,6 @@ func (b *LocalBackend) Shutdown() {
 		return
 	}
 	b.shutdownCalled = true
-
-	if buildfeatures.HasCaptivePortal && b.captiveCancel != nil {
-		b.logf("canceling captive portal context")
-		b.captiveCancel()
-	}
 
 	b.shutdownCertRefreshLoopLocked()
 
@@ -2126,16 +2115,11 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 	b.authReconfigLocked()
 }
 
+// PatchDiscoKey records that a peer's new disco key was learned via TSMP,
+// so the netmap update carrying the same change need not reset the peer's
+// WireGuard session. It implements [controlclient.DiscoKeyUpdater].
 func (b *LocalBackend) PatchDiscoKey(pub key.NodePublic, disco key.DiscoPublic) {
-	// PatchDiscoKey mirrors the implementation of [controlclient.patchDiscoKeyer].
-	// It is implemented here to avoid the dependency edge to controlclient, but must be kept
-	// in sync with the original implementation.
-	type patchDiscoKeyer interface {
-		PatchDiscoKey(key.NodePublic, key.DiscoPublic)
-	}
-	if e, ok := b.e.(patchDiscoKeyer); ok {
-		e.PatchDiscoKey(pub, disco)
-	}
+	b.currentNode().recordTSMPLearnedDisco(pub, disco)
 }
 
 type preferencePolicyInfo struct {
@@ -2418,6 +2402,7 @@ var (
 	_ controlclient.NetmapDeltaUpdater  = (*LocalBackend)(nil)
 	_ controlclient.PacketFilterUpdater = (*LocalBackend)(nil)
 	_ controlclient.UserProfileUpdater  = (*LocalBackend)(nil)
+	_ controlclient.DiscoKeyUpdater     = (*LocalBackend)(nil)
 )
 
 // UpdateNetmapDelta implements controlclient.NetmapDeltaUpdater.
@@ -2445,7 +2430,8 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	// the full-netmap behavior of [tkaFilterNetmapLocked].
 	muts = b.tkaFilterDeltaMutsLocked(muts)
 	needsAuthReconfig := netmapDeltaNeedsAuthReconfig(cn, muts)
-	cn.UpdateNetmapDelta(muts)
+
+	deltaRes, _ := cn.UpdateNetmapDelta(muts)
 	if buildfeatures.HasDrive {
 		// Drive's lazy remotes-source caches its rebuild keyed by this
 		// generation, so any delta — peer add/remove, address change,
@@ -2487,25 +2473,38 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	}
 	ms.UpdateNetmapDelta(muts)
 
+	// Sync the WireGuard device for exactly the peers whose allowed
+	// source prefixes changed, as computed by the route manager when
+	// the delta was applied above. Removed peers appear with a nil
+	// value and are removed from the device; SyncDevicePeer reads
+	// the live per-peer config, so only the keys matter here.
+	for k := range deltaRes.ChangedAllowedIPs {
+		b.e.SyncDevicePeer(k)
+	}
+	b.setDataPlanePeerRoutes()
+
+	// Reset the WireGuard session for peers whose disco key changed in
+	// a way that indicates a restart, flushing their dead session keys;
+	// each such peer is lazily re-created on demand with current state.
+	for k := range deltaRes.DiscoChanged {
+		b.e.ResetDevicePeer(k)
+	}
+
 	// Force a full authReconfig + SetSelfNode on any peer add or
-	// remove. netmapDeltaNeedsAuthReconfig only considered
-	// NodeMutationUpsert of already-known NodeIDs whose
-	// peerRouteConfigChanged, so brand-new peers and removes left
-	// e.lastCfgFull and wgdev's PeerLookupFunc closure stale, and
-	// outbound wgdev encryption missed those peers. authReconfig
-	// fixes the wireguard side; SetSelfNode refreshes the engine's
-	// cached self node. PeerForIP / lookupPeerByIP staleness was
-	// addressed separately in d4f2917c1b, which routes those lookups
-	// through nodeBackend's live data, and as part of the broader
-	// netmap.NetworkMap removal effort the engine no longer caches
-	// the netmap at all (see tailscale/corp#43394). As of 2026-06-24
-	// the only remaining staleness this guards against is
-	// e.lastCfgFull and the wgdev peer set.
+	// remove. The WireGuard device itself no longer depends on this:
+	// the SyncDevicePeer calls above keep its peer set delta-correct,
+	// and its lazy peer creation reads live state via
+	// [wgengine.Engine.SetPeerConfigFunc]. What still rides
+	// authReconfig is everything else derived from the full peer set:
+	// OS routes (router.Config) and the quad-100 resolver's MagicDNS
+	// hosts map (dnsConfigForNetmap). Once those become delta-aware
+	// too, this can be gated on the route manager's OS-routes changes
+	// instead of firing on every peer change.
 	needsAuthReconfig = needsAuthReconfig || peersUpsertedOrRemoved
 	if needsAuthReconfig {
 		if peersUpsertedOrRemoved {
-			if nm := cn.netMapWithPeers(); nm != nil {
-				b.e.SetSelfNode(nm.SelfNode)
+			if self := cn.Self(); self.Valid() {
+				b.e.SetSelfNode(self)
 			}
 		}
 		b.authReconfigLocked()
@@ -2530,6 +2529,9 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 		}
 	}
 
+	// TODO(sfllaw): If [buildfeatures.HasRouteCheck] is enabled,
+	// a probe may be triggered for an updated routecheck reachability report,
+	// which should influence which exit nodes are considered valid to suggest.
 	if cn.NetMap() != nil && mutationsAreWorthyOfRecalculatingSuggestedExitNode(muts, cn, b.lastSuggestedExitNode) {
 		// Recompute the suggested exit node
 		b.suggestExitNodeLocked()
@@ -2997,6 +2999,23 @@ func (b *LocalBackend) controlDebugFlags() []string {
 // from the following whether or not that is a safe transition).
 func (b *LocalBackend) Start(opts ipn.Options) error {
 	defer b.CheckDeadlocks()()
+
+	// Shut down the previous control client, if any, before starting a
+	// new one, so the old client can't race with the new one. Without
+	// this, an in-flight lite map update carrying stale Hostinfo (notably
+	// RequestTags) could be processed by the control plane after the new
+	// client's requests, which made retagging with "tailscale up
+	// --advertise-tags" intermittently look like an invalid tag
+	// transition and log the node out (tailscale/tailscale#20365).
+	//
+	// TODO(bradfitz,nickkhyl): this is still racy if Start is called
+	// concurrently: whichever call loses the race to reacquire b.mu
+	// below then detaches the winner's new control client in startLocked
+	// and shuts it down in a goroutine, without the ordering guarantee
+	// that this call provides. This is a workaround until #18052 is
+	// properly fixed and a control client can be shut down synchronously
+	// with b.mu held.
+	b.DisconnectControl()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -4693,19 +4712,18 @@ func (b *LocalBackend) pingPeerAPI(ctx context.Context, ip netip.Addr) (peer tai
 	var zero tailcfg.NodeView
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	// PeerByTailscaleIP needs an up-to-date Peers slice.
-	nm := b.NetMapWithPeers()
-	if nm == nil {
-		return zero, "", errors.New("no netmap")
+	cn := b.currentNode()
+	var ok bool
+	if nid, addrOK := cn.NodeByAddr(ip); addrOK {
+		peer, ok = cn.PeerByID(nid)
 	}
-	peer, ok := nm.PeerByTailscaleIP(ip)
 	if !ok {
 		return zero, "", fmt.Errorf("no peer found with Tailscale IP %v", ip)
 	}
 	if peer.Expired() {
 		return zero, "", errors.New("peer's node key has expired")
 	}
-	base := peerAPIBase(nm, peer)
+	base := peerAPIBase(cn.NetMap(), peer)
 	if base == "" {
 		return zero, "", fmt.Errorf("no PeerAPI base found for peer %v (%v)", peer.ID(), ip)
 	}
@@ -5893,9 +5911,9 @@ func (b *LocalBackend) blockEngineUpdatesLocked(block bool) {
 }
 
 // reconfigAppConnectorLocked updates the app connector state based on the
-// current network map and preferences.
+// self node and preferences.
 // b.mu must be held.
-func (b *LocalBackend) reconfigAppConnectorLocked(nm *netmap.NetworkMap, prefs ipn.PrefsView) {
+func (b *LocalBackend) reconfigAppConnectorLocked(selfNode tailcfg.NodeView, prefs ipn.PrefsView) {
 	if !buildfeatures.HasAppConnectors {
 		return
 	}
@@ -5929,11 +5947,11 @@ func (b *LocalBackend) reconfigAppConnectorLocked(nm *netmap.NetworkMap, prefs i
 			HasStoredRoutes: shouldStoreRoutes,
 		})
 	}
-	if nm == nil {
+	if !selfNode.Valid() {
 		return
 	}
 
-	attrs, err := tailcfg.UnmarshalNodeCapViewJSON[appctype.AppConnectorAttr](nm.SelfNode.CapMap(), appConnectorCapName)
+	attrs, err := tailcfg.UnmarshalNodeCapViewJSON[appctype.AppConnectorAttr](selfNode.CapMap(), appConnectorCapName)
 	if err != nil {
 		b.logf("[unexpected] error parsing app connector mapcap: %v", err)
 		return
@@ -5941,7 +5959,7 @@ func (b *LocalBackend) reconfigAppConnectorLocked(nm *netmap.NetworkMap, prefs i
 
 	// Geometric cost, assumes that the number of advertised tags is small
 	selfHasTag := func(attrTags []string) bool {
-		return nm.SelfNode.Tags().ContainsFunc(func(tag string) bool {
+		return selfNode.Tags().ContainsFunc(func(tag string) bool {
 			return slices.Contains(attrTags, tag)
 		})
 	}
@@ -6036,7 +6054,10 @@ func (b *LocalBackend) authReconfigLocked() {
 
 	cn := b.currentNode()
 
-	nm := cn.netMapWithPeers()
+	// Note this netmap does not have its Peers populated. Nothing
+	// below needs them; per-peer work rides the incremental route
+	// manager and engine paths instead.
+	nm := cn.NetMap()
 	if nm == nil {
 		b.logf("[v1] authReconfig: netmap not yet valid. Skipping.")
 		return
@@ -6046,9 +6067,9 @@ func (b *LocalBackend) authReconfigLocked() {
 	hasPAC := b.interfaceState.HasPAC()
 	disableSubnetsIfPAC := cn.SelfHasCap(tailcfg.NodeAttrDisableSubnetsIfPAC)
 	dohURL, dohURLOK := cn.exitNodeCanProxyDNS(prefs.ExitNodeID())
-	dcfg := cn.dnsConfigForNetmap(prefs, b.keyExpired, version.OS())
+	dcfg := cn.dnsConfigForNetmap(prefs, b.keyExpired, cmp.Or(b.goos, runtime.GOOS))
 	// If the current node is an app connector, ensure the app connector machine is started
-	b.reconfigAppConnectorLocked(nm, prefs)
+	b.reconfigAppConnectorLocked(nm.SelfNode, prefs)
 
 	if !prefs.WantRunning() {
 		b.logf("[v1] authReconfig: skipping because !WantRunning.")
@@ -6082,26 +6103,55 @@ func (b *LocalBackend) authReconfigLocked() {
 		priv = key.NodePrivate{}
 	}
 
-	cfg, err := nmcfg.WGCfg(priv, nm, b.logf, flags, prefs.ExitNodeID())
-	if err != nil {
-		b.logf("wgcfg: %v", err)
-		return
+	// The config carries no peers; wireguard-go gets those from the
+	// live per-peer config source installed via
+	// [wgengine.Engine.SetPeerConfigFunc], fed by the route manager.
+	cfg := &wgcfg.Config{
+		PrivateKey: priv,
+		Addresses:  nm.GetAddresses().AsSlice(),
 	}
 
-	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.NetMon.Get(), b.sys.ControlKnobs(), version.OS())
-	rcfg := b.routerConfigLocked(cfg, prefs, nm, oneCGNATRoute)
+	// Note: b.goos (set only by tests) speaks runtime.GOOS while
+	// version.OS is Tailscale-style ("macOS", "iOS"); they agree for
+	// the values tests pin ("linux", "windows"), which is all the
+	// override needs.
+	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.NetMon.Get(), b.sys.ControlKnobs(), cmp.Or(b.goos, version.OS()))
+	// Sync the WireGuard device for any peers whose allowed source
+	// prefixes changed with the new prefs, such as the old and new
+	// exit node when the selection changes.
+	changedAllowedIPs := cn.updateRouteManagerPrefs(routePrefs{
+		ExitNodeID:       prefs.ExitNodeID(),
+		ExitNodeSelected: prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid(),
+		RouteAll:         flags&netmap.AllowSubnetRoutes != 0,
+		OneCGNAT:         oneCGNATRoute,
+	})
+	for k := range changedAllowedIPs {
+		b.e.SyncDevicePeer(k)
+	}
+	rcfg := b.routerConfigLocked(cfg, prefs, nm)
 
-	// Add these extra Allowed IPs after router configuration, because the expected
-	// extension (features/conn25), does not want these routes installed on the OS.
+	// Push each peer's extra WireGuard-only allowed IPs (the conn25
+	// extension's Transit IPs) into the route manager, which feeds
+	// them to WireGuard via the outbound peer lookup and the per-peer
+	// allowed source prefixes (including for lazily created peers)
+	// while keeping them out of the OS route set, because the
+	// expected extension (features/conn25) does not want these routes
+	// installed on the OS.
 	// See also [Hooks.ExtraWireGuardAllowedIPs].
 	if extraAllowedIPsFn, ok := b.extHost.hooks.ExtraWireGuardAllowedIPs.GetOk(); ok {
-		for i := range cfg.Peers {
-			extras := extraAllowedIPsFn(cfg.Peers[i].PublicKey)
-			cfg.Peers[i].AllowedIPs = extras.AppendTo(cfg.Peers[i].AllowedIPs)
+		for k := range cn.updateRouteManagerExtras(extraAllowedIPsFn) {
+			b.e.SyncDevicePeer(k)
 		}
 	}
+	// The prefs and extras commits above can both change the outbound
+	// table (such as installing the selected exit node's /0 routes),
+	// so refresh the data plane's view of it. This must stay after
+	// updateRouteManagerExtras, so the pushed snapshot includes its
+	// commit, and before the Reconfig below, so packets flowing under
+	// the new config never see a stale peer table.
+	b.setDataPlanePeerRoutes()
 
-	err = b.e.Reconfig(cfg, rcfg, dcfg)
+	err := b.e.Reconfig(cfg, rcfg, dcfg)
 	if err == wgengine.ErrNoChanges {
 		return
 	}
@@ -6111,6 +6161,29 @@ func (b *LocalBackend) authReconfigLocked() {
 	if buildfeatures.HasAppConnectors {
 		go b.goTracker.Go(b.readvertiseAppConnectorRoutes)
 	}
+}
+
+// setDataPlanePeerRoutes pushes the route manager's outbound table and
+// this node's native Tailscale addresses into the engine's tun-layer
+// data plane, which uses them for per-packet NAT rewrites and
+// jailed-filter selection. It must be called after every route manager
+// commit that can change the outbound table or the set of peers with
+// data-plane attributes: netmap updates (full or delta), prefs changes,
+// and extra-allowed-IP changes.
+//
+// When no current peer is jailed or masqueraded, it installs nil, which
+// keeps the data plane's per-packet fast path to a nil check.
+func (b *LocalBackend) setDataPlanePeerRoutes() {
+	nb := b.currentNode()
+	var native4, native6 netip.Addr
+	var routes *bart.Table[*routemanager.PeerRoute]
+	if nb.routeMgr.HasDataPlaneAttrs() {
+		routes = nb.routeMgr.Outbound()
+		if nm := nb.NetMap(); nm != nil {
+			native4, native6 = tsaddr.FirstTailscaleAddrs(nm.GetAddresses().All())
+		}
+	}
+	b.e.SetPeerRoutes(native4, native6, routes)
 }
 
 // shouldUseOneCGNATRoute reports whether we should prefer to make one big
@@ -6225,6 +6298,9 @@ func (b *LocalBackend) ProfileMkdirAll(id ipn.ProfileID, subs ...string) (string
 	return b.profileMkdirAllLocked(id, subs...)
 }
 
+// ProfileDataDir is the directory name, under the Tailscale var root, that holds per-profile data.
+const ProfileDataDir = "profile-data"
+
 // profileDataPathLocked returns a path of a profile-specific (sub)directory
 // inside the writable storage area for the given profile ID. It does not
 // create or verify the existence of the path in the filesystem.
@@ -6239,7 +6315,7 @@ func (b *LocalBackend) profileDataPathLocked(id ipn.ProfileID, subs ...string) s
 	if vr == "" {
 		return ""
 	}
-	return filepath.Join(append([]string{vr, "profile-data", string(id)}, subs...)...)
+	return filepath.Join(append([]string{vr, ProfileDataDir, string(id)}, subs...)...)
 }
 
 // profileMkdirAllLocked implements ProfileMkdirAll.
@@ -6426,64 +6502,10 @@ func magicDNSRootDomains(nm *netmap.NetworkMap) []dnsname.FQDN {
 	return nil
 }
 
-// peerRoutes returns the routerConfig.Routes to access peers.
-// If there are over cgnatThreshold CGNAT routes, one big CGNAT route
-// is used instead.
-func peerRoutes(logf logger.Logf, peers []wgcfg.Peer, cgnatThreshold int, routeAll bool) (routes []netip.Prefix) {
-	tsULA := tsaddr.TailscaleULARange()
-	cgNAT := tsaddr.CGNATRange()
-	var didULA bool
-	var cgNATIPs []netip.Prefix
-	for _, peer := range peers {
-		for _, aip := range peer.AllowedIPs {
-			aip = unmapIPPrefix(aip)
-
-			// Ensure that we're only accepting properly-masked
-			// prefixes; the control server should be masking
-			// these, so if we get them, skip.
-			if mm := aip.Masked(); aip != mm {
-				// To avoid a DoS where a peer could cause all
-				// reconfigs to fail by sending a bad prefix, we just
-				// skip, but don't error, on an unmasked route.
-				logf("advertised route %s from %s has non-address bits set; expected %s", aip, peer.PublicKey.ShortString(), mm)
-				continue
-			}
-
-			// Only add the Tailscale IPv6 ULA once, if we see anybody using part of it.
-			if aip.Addr().Is6() && aip.IsSingleIP() && tsULA.Contains(aip.Addr()) {
-				if !didULA {
-					didULA = true
-					routes = append(routes, tsULA)
-				}
-				continue
-			}
-			if aip.IsSingleIP() && cgNAT.Contains(aip.Addr()) {
-				cgNATIPs = append(cgNATIPs, aip)
-			} else if routeAll {
-				routes = append(routes, aip)
-			}
-		}
-	}
-	if len(cgNATIPs) > cgnatThreshold {
-		// Probably the hello server. Just append one big route.
-		routes = append(routes, cgNAT)
-	} else {
-		routes = append(routes, cgNATIPs...)
-	}
-
-	tsaddr.SortPrefixes(routes)
-	return routes
-}
-
 // routerConfig produces a router.Config from a wireguard config and IPN prefs.
 //
 // b.mu must be held.
-func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView, nm *netmap.NetworkMap, oneCGNATRoute bool) *router.Config {
-	singleRouteThreshold := 10_000
-	if oneCGNATRoute {
-		singleRouteThreshold = 1
-	}
-
+func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView, nm *netmap.NetworkMap) *router.Config {
 	netfilterKind := b.capForcedNetfilter // protected by b.mu (hence the Locked suffix)
 
 	if prefs.NetfilterKind() != "" {
@@ -6507,7 +6529,7 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 		SNATSubnetRoutes:    !prefs.NoSNAT(),
 		StatefulFiltering:   doStatefulFiltering,
 		NetfilterMode:       prefs.NetfilterMode(),
-		Routes:              peerRoutes(b.logf, cfg.Peers, singleRouteThreshold, prefs.RouteAll()),
+		Routes:              b.currentNode().osRoutes(),
 		NetfilterKind:       netfilterKind,
 		RemoveCGNATDropRule: nm.HasCap(tailcfg.NodeAttrDisableLinuxCGNATDropRule),
 	}
@@ -6612,7 +6634,17 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 	hi.RoutableIPs = prefs.AdvertiseRoutes().AsSlice()
 	hi.RequestTags = prefs.AdvertiseTags().AsSlice()
 	hi.ShieldsUp = prefs.ShieldsUp()
-	hi.AllowsUpdate = buildfeatures.HasClientUpdate && (envknob.AllowsRemoteUpdate() || prefs.AutoUpdate().Apply.EqualBool(true))
+	// Only advertise RemoteConfig to control when the feature is both
+	// compiled in (buildfeatures.HasRemoteConfig; a const so the whole
+	// expression dead-code eliminates when ts_omit_remoteconfig is set)
+	// and its init actually ran to wire up the c2n handler. tsnet
+	// builds are the interesting case: they do not import
+	// feature/remoteconfig even though ts_omit_remoteconfig is not
+	// set, so we must not claim RemoteConfig is active there.
+	hi.RemoteConfig = buildfeatures.HasRemoteConfig && prefs.RemoteConfig() && feature.IsRegistered("remoteconfig")
+	// Likewise for AllowsUpdate: require the clientupdate feature's init to
+	// have run, not just the build tag being enabled.
+	hi.AllowsUpdate = buildfeatures.HasClientUpdate && (envknob.AllowsRemoteUpdate() || prefs.AutoUpdate().Apply.EqualBool(true)) && feature.IsRegistered("clientupdate")
 
 	if buildfeatures.HasAdvertiseRoutes {
 		b.metrics.advertisedRoutes.Set(float64(tsaddr.WithoutExitRoute(prefs.AdvertiseRoutes()).Len()))
@@ -6717,17 +6749,6 @@ func (b *LocalBackend) enterStateLocked(newState ipn.State) {
 			b.resetAuthURLLocked()
 		}
 
-		// Start a captive portal detection loop if none has been
-		// started. Create a new context if none is present, since it
-		// can be shut down if we transition away from Running.
-		if buildfeatures.HasCaptivePortal {
-			if b.captiveCancel == nil {
-				captiveCtx, captiveCancel := context.WithCancel(b.ctx)
-				b.captiveCtx, b.captiveCancel = captiveCtx, captiveCancel
-				b.goTracker.Go(func() { hookCheckCaptivePortalLoop.Get()(b, captiveCtx) })
-			}
-		}
-
 		// (Re)evaluate the background TLS cert refresh loop. It runs
 		// only while we're Running and ServeConfig has at least one
 		// HTTPS Web entry, so idle nodes don't hold a timer open.
@@ -6735,16 +6756,6 @@ func (b *LocalBackend) enterStateLocked(newState ipn.State) {
 	} else if oldState == ipn.Running {
 		// Transitioning away from running.
 		b.closePeerAPIListenersLocked()
-
-		// Stop any existing captive portal detection loop.
-		if buildfeatures.HasCaptivePortal && b.captiveCancel != nil {
-			b.captiveCancel()
-			b.captiveCancel = nil
-
-			// NOTE: don't set captiveCtx to nil here, to ensure
-			// that we always have a (canceled) context to wait on
-			// in onHealthChange.
-		}
 
 		b.updateCertRefreshLoopLocked()
 	}
@@ -7272,7 +7283,8 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	if nm != nil {
 		login = cmp.Or(profileFromView(nm.UserProfiles[nm.User()]).LoginName, "<missing-profile>")
 	}
-	b.currentNode().SetNetMap(nm)
+	discoChanged, routeChanged := b.currentNode().SetNetMap(nm)
+	b.setDataPlanePeerRoutes()
 	if ms, ok := b.sys.MagicSock.GetOK(); ok {
 		if nm != nil {
 			if nm.Cached {
@@ -7283,6 +7295,18 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 		} else {
 			ms.SetNetworkMap(tailcfg.NodeView{}, nil)
 		}
+	}
+	// Reset the WireGuard session for peers whose disco key changed in
+	// a way that indicates a restart, flushing their dead session keys;
+	// each such peer is lazily re-created on demand with current state.
+	for _, k := range discoChanged {
+		b.e.ResetDevicePeer(k)
+	}
+	// Converge the wireguard-go device for peers whose routes changed
+	// (or that were removed) in the full-netmap resync above; peers not
+	// in routeChanged are already up to date.
+	for k := range routeChanged {
+		b.e.SyncDevicePeer(k)
 	}
 	if login != b.activeLogin {
 		b.logf("active login: %v", login)
@@ -7948,22 +7972,12 @@ func (b *LocalBackend) DebugPeerRelayServers() set.Set[netip.Addr] {
 }
 
 // DebugPeerDiscoKeys returns the disco public keys this node has learned for
-// each of its peers from the most recent network map. Intended for tests
+// each of its current peers. Intended for tests
 // (the production [ipnstate.PeerStatus] purposefully does not surface disco
 // keys; surfacing them via the [ipnstate.Status] API would also pollute
 // every PeerStatus consumer with a non-comparable struct field).
 func (b *LocalBackend) DebugPeerDiscoKeys() map[key.NodePublic]key.DiscoPublic {
-	nm := b.currentNode().NetMap()
-	if nm == nil {
-		return nil
-	}
-	m := make(map[key.NodePublic]key.DiscoPublic, len(nm.Peers))
-	for _, p := range nm.Peers {
-		if dk := p.DiscoKey(); !dk.IsZero() {
-			m[p.Key()] = dk
-		}
-	}
-	return m
+	return b.currentNode().peerDiscoKeys()
 }
 
 // ControlKnobs returns the node's control knobs.
@@ -8002,9 +8016,10 @@ func (n noiseRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return n.lb.DoNoiseRequest(req)
 }
 
-// netLogNodeSource adapts LocalBackend's nodeBackend to [netlog.NodeSource].
-// Each method consults [LocalBackend.currentNode] so that profile rotations
-// are picked up automatically without re-installing the source.
+// netLogNodeSource adapts LocalBackend to [wgengine.NetLogSource].
+// Each method consults [LocalBackend.currentNode] or the current netmap
+// so that profile rotations are picked up automatically without
+// re-installing the source.
 type netLogNodeSource struct {
 	b *LocalBackend
 }
@@ -8033,8 +8048,37 @@ func (s netLogNodeSource) NodeByAddr(addr netip.Addr) (_ tailcfg.NodeView, _ tai
 	return nv, up, true
 }
 
-// Compile-time assertion that netLogNodeSource implements [netlog.NodeSource].
-var _ netlog.NodeSource = netLogNodeSource{}
+// NetLogIDs implements [wgengine.NetLogSource], returning the network
+// flow logging identity from the current netmap. ok is false if the
+// netmap does not enable network flow logging for this node.
+func (s netLogNodeSource) NetLogIDs() (nodeID, domainID logid.PrivateID, logExitFlows bool, ok bool) {
+	nm := s.b.NetMap()
+	if nm == nil || !nm.SelfNode.Valid() {
+		return
+	}
+	if !nm.SelfNode.HasCap(tailcfg.CapabilityDataPlaneAuditLogs) {
+		return
+	}
+	if nm.SelfNode.DataPlaneAuditLogID() == "" || nm.DomainAuditLogID == "" {
+		return
+	}
+	nodeID, errNode := logid.ParsePrivateID(nm.SelfNode.DataPlaneAuditLogID())
+	if errNode != nil {
+		s.b.logf("[v1] netlog: unable to parse node audit log ID: %v", errNode)
+	}
+	domainID, errDomain := logid.ParsePrivateID(nm.DomainAuditLogID)
+	if errDomain != nil {
+		s.b.logf("[v1] netlog: unable to parse domain audit log ID: %v", errDomain)
+	}
+	if errNode != nil || errDomain != nil {
+		return logid.PrivateID{}, logid.PrivateID{}, false, false
+	}
+	return nodeID, domainID, nm.SelfNode.HasCap(tailcfg.NodeAttrLogExitFlows), true
+}
+
+// Compile-time assertion that netLogNodeSource implements
+// [wgengine.NetLogSource].
+var _ wgengine.NetLogSource = netLogNodeSource{}
 
 // lookupPeerWireGuardString returns the Tailscale-conventional short string
 // (e.g. "[IMTBr]") for the peer whose wireguard-go-formatted public key
@@ -8391,7 +8435,7 @@ func (b *LocalBackend) ResetAuth() error {
 }
 
 func (b *LocalBackend) GetPeerEndpointChanges(ctx context.Context, ip netip.Addr) ([]magicsock.EndpointChange, error) {
-	pip, ok := b.e.PeerForIP(ip)
+	pip, ok := b.PeerForIP(ip)
 	if !ok {
 		return nil, fmt.Errorf("no matching peer")
 	}
@@ -8604,18 +8648,25 @@ func allowedAutoRoute(ipp netip.Prefix) bool {
 	return true
 }
 
+// HookRouteCheckReport is the hook that returns the latest routecheck Report for this LocalBackend.
+var HookRouteCheckReport feature.Hook[func(*LocalBackend) RouteCheckReport]
+
 var ErrNoPreferredDERP = errors.New("no preferred DERP, try again later")
 
 // suggestExitNodeLocked computes a suggestion based on the current netmap and
 // other optional factors. If there are multiple equally good options, one may
 // be selected at random, so the result is not stable. To be eligible for
-// consideration, the peer must have NodeAttrSuggestExitNode in its CapMap.
+// consideration, the peer must have [tailcfg.NodeAttrSuggestExitNode] in its CapMap.
+//
+// When the client has [tailcfg.NodeAttrClientSideReachabilityRouteCheck] in its CapMap,
+// it will use [HookRouteCheckReport] to get the latest cached routecheck report.
 //
 // b.mu must be held.
 func (b *LocalBackend) suggestExitNodeLocked() (response apitype.ExitNodeSuggestionResponse, err error) {
 	if !buildfeatures.HasUseExitNode {
 		return response, feature.ErrUnavailable
 	}
+
 	mc := b.MagicConn()
 	var preferredDERP int
 	if lastReport := mc.GetLastNetcheckReport(b.ctx); lastReport != nil {
@@ -8628,7 +8679,12 @@ func (b *LocalBackend) suggestExitNodeLocked() (response apitype.ExitNodeSuggest
 	regionLatency := mc.GetDERPRegionLatency()
 	prevSuggestion := b.lastSuggestedExitNode
 
-	res, err := suggestExitNode(preferredDERP, regionLatency, b.currentNode(), prevSuggestion, randomRegion, randomNode, b.getAllowedSuggestions())
+	var rp RouteCheckReport
+	if hook := HookRouteCheckReport.GetOrNil(); hook != nil {
+		rp = hook(b)
+	}
+
+	res, err := suggestExitNode(preferredDERP, regionLatency, rp, b.currentNode(), prevSuggestion, randomRegion, randomNode, b.getAllowedSuggestions())
 	if err != nil {
 		return res, err
 	}
@@ -8641,6 +8697,10 @@ func (b *LocalBackend) suggestExitNodeLocked() (response apitype.ExitNodeSuggest
 	return res, err
 }
 
+// SuggestExitNode computes an exit-node suggestion based on the current netmap and
+// other optional factors. If there are multiple equally good options, one may
+// be selected at random, so the result is not stable. To be eligible for
+// consideration, the peer must have [tailcfg.NodeAttrSuggestExitNode] in its CapMap.
 func (b *LocalBackend) SuggestExitNode() (response apitype.ExitNodeSuggestionResponse, err error) {
 	if !buildfeatures.HasUseExitNode {
 		return response, feature.ErrUnavailable
@@ -8706,11 +8766,11 @@ func fillAllowedSuggestions(polc policyclient.Client) (set.Set[tailcfg.StableNod
 // netcheck and are only used by the DERP-based algorithm.
 //
 // Errors are always logged. Suggestions are logged if they defer from prevSuggestion.
-func suggestExitNode(preferredDERP int, regionLatency map[int]time.Duration, nb *nodeBackend, prevSuggestion tailcfg.StableNodeID, selectRegion selectRegionFunc, selectNode selectNodeFunc, allowList set.Set[tailcfg.StableNodeID]) (res apitype.ExitNodeSuggestionResponse, err error) {
+func suggestExitNode(preferredDERP int, regionLatency map[int]time.Duration, rp RouteCheckReport, nb *nodeBackend, prevSuggestion tailcfg.StableNodeID, selectRegion selectRegionFunc, selectNode selectNodeFunc, allowList set.Set[tailcfg.StableNodeID]) (res apitype.ExitNodeSuggestionResponse, err error) {
 	switch {
 	case nb.SelfHasCap(tailcfg.NodeAttrTrafficSteering):
 		// The traffic-steering feature flag is enabled on this tailnet.
-		res, err = suggestExitNodeUsingTrafficSteering(nb, allowList)
+		res, err = suggestExitNodeUsingTrafficSteering(rp, nb, allowList)
 	default:
 		// The control plane will always strip the `traffic-steering`
 		// node attribute if it isn’t enabled for this tailnet, even if
@@ -8743,10 +8803,6 @@ func suggestExitNode(preferredDERP int, regionLatency map[int]time.Duration, nb 
 // the lowest latency to this device. For peers without a DERP home, we look for
 // geographic proximity to this device's DERP home.
 func suggestExitNodeUsingDERP(preferredRegionID int, regionLatency map[int]time.Duration, nb *nodeBackend, prevSuggestion tailcfg.StableNodeID, selectRegion selectRegionFunc, selectNode selectNodeFunc, allowList set.Set[tailcfg.StableNodeID]) (res apitype.ExitNodeSuggestionResponse, err error) {
-	// TODO(sfllaw): Context needs to be plumbed down here to support
-	// reachability testing.
-	ctx := context.TODO()
-
 	netMap := nb.NetMap()
 	if preferredRegionID == 0 || netMap == nil || netMap.DERPMap == nil {
 		return res, ErrNoPreferredDERP
@@ -8755,7 +8811,7 @@ func suggestExitNodeUsingDERP(preferredRegionID int, regionLatency map[int]time.
 	// since the netmap doesn't include delta updates (e.g., home DERP or Online
 	// status changes) from the control plane since the last full update.
 	candidates := nb.AppendMatchingPeers(nil, func(peer tailcfg.NodeView) bool {
-		if !peer.Valid() || !nb.PeerIsReachable(ctx, peer) {
+		if !peer.Valid() || !nb.PeerIsReachable(nil, peer) {
 			return false
 		}
 		if allowList != nil && !allowList.Contains(peer.StableID()) {
@@ -8883,11 +8939,7 @@ var ErrNoNetMap = errors.New("no network map, try again later")
 // pick one of the best exit nodes. These priorities are provided by Control in
 // the node’s [tailcfg.Location]. To be eligible for consideration, the node
 // must have NodeAttrSuggestExitNode in its CapMap.
-func suggestExitNodeUsingTrafficSteering(nb *nodeBackend, allowed set.Set[tailcfg.StableNodeID]) (apitype.ExitNodeSuggestionResponse, error) {
-	// TODO(sfllaw): Context needs to be plumbed down here to support
-	// reachability testing.
-	ctx := context.TODO()
-
+func suggestExitNodeUsingTrafficSteering(rp RouteCheckReport, nb *nodeBackend, allowed set.Set[tailcfg.StableNodeID]) (apitype.ExitNodeSuggestionResponse, error) {
 	nm := nb.NetMap()
 	if nm == nil {
 		return apitype.ExitNodeSuggestionResponse{}, ErrNoNetMap
@@ -8906,7 +8958,7 @@ func suggestExitNodeUsingTrafficSteering(nb *nodeBackend, allowed set.Set[tailcf
 		if !p.Valid() {
 			return false
 		}
-		if !nb.PeerIsReachable(ctx, p) {
+		if !nb.PeerIsReachable(rp, p) {
 			return false
 		}
 		if allowed != nil && !allowed.Contains(p.StableID()) {
@@ -9009,22 +9061,8 @@ func randomNode(nodes views.Slice[tailcfg.NodeView], prefer tailcfg.StableNodeID
 
 // minLatencyDERPRegion returns the region with the lowest latency value given
 // the per-region latency map. If there are no latency values, it returns 0.
-func minLatencyDERPRegion(regions []int, regionLatency map[int]time.Duration) int {
-	min := slices.MinFunc(regions, func(i, j int) int {
-		const largeDuration time.Duration = math.MaxInt64
-		iLatency, ok := regionLatency[i]
-		if !ok {
-			iLatency = largeDuration
-		}
-		jLatency, ok := regionLatency[j]
-		if !ok {
-			jLatency = largeDuration
-		}
-		if c := cmp.Compare(iLatency, jLatency); c != 0 {
-			return c
-		}
-		return cmp.Compare(i, j)
-	})
+func minLatencyDERPRegion(regions []int, regionLatency netcheck.RegionLatency) int {
+	min := slices.MinFunc(regions, regionLatency.Compare)
 	latency, ok := regionLatency[min]
 	if !ok || latency == 0 {
 		return 0
@@ -9089,7 +9127,7 @@ func (b *LocalBackend) srcIPHasCapForFilter(srcIP netip.Addr, cap tailcfg.NodeCa
 	if !ok {
 		return false
 	}
-	return n.HasCap(cap)
+	return !n.UnsignedPeerAPIOnly() && n.HasCap(cap)
 }
 
 // maybeUsernameOf returns the actor's username if the actor
@@ -9119,6 +9157,11 @@ var (
 	metricNetmapDeltaPeerPatched  = clientmetric.NewCounter("localbackend_netmap_delta_peer_patched")
 	metricUpdatePacketFilter      = clientmetric.NewCounter("localbackend_update_packet_filter")
 	metricUpdateUserProfiles      = clientmetric.NewCounter("localbackend_update_user_profiles")
+
+	// metricTSMPLearnedKeyMismatch counts netmap updates carrying a peer
+	// disco key that doesn't match the one previously learned via TSMP
+	// for the same peer. See [nodeBackend.discoChangedLocked].
+	metricTSMPLearnedKeyMismatch = clientmetric.NewCounter("magicsock_tsmp_learned_key_mismatch")
 )
 
 func (b *LocalBackend) stateEncrypted() opt.Bool {

@@ -476,6 +476,111 @@ func TestResolveLocalSubdomain(t *testing.T) {
 	}
 }
 
+// fakeMagicDNSHosts is a MagicDNSHosts for tests, serving from fixed maps.
+type fakeMagicDNSHosts struct {
+	hosts     map[dnsname.FQDN][]netip.Addr
+	subdomain set.Set[dnsname.FQDN]
+	ptr       map[netip.Addr]dnsname.FQDN
+}
+
+func (f fakeMagicDNSHosts) LookupHost(fqdn dnsname.FQDN) (ips []netip.Addr, ok bool) {
+	ips, ok = f.hosts[fqdn]
+	return ips, ok
+}
+
+func (f fakeMagicDNSHosts) LookupPTR(ip netip.Addr) (_ dnsname.FQDN, ok bool) {
+	name, ok := f.ptr[ip]
+	return name, ok
+}
+
+func (f fakeMagicDNSHosts) SubdomainHost(fqdn dnsname.FQDN) bool {
+	return f.subdomain.Contains(fqdn)
+}
+
+// Tests forward, subdomain, and reverse resolution served on demand
+// via the MagicDNSHosts hook, and that entries pushed via Config.Hosts
+// take precedence over the hook.
+func TestResolveLocalMagicDNSHosts(t *testing.T) {
+	r := newResolver(t)
+	defer r.Close()
+
+	r.SetConfig(Config{
+		Hosts: map[dnsname.FQDN][]netip.Addr{
+			"extra.ipn.dev.": {netip.MustParseAddr("100.100.1.1")},
+			"both.ipn.dev.":  {netip.MustParseAddr("100.100.2.2")},
+		},
+		LocalDomains: []dnsname.FQDN{"ipn.dev.", "64.100.in-addr.arpa."},
+	})
+	node4 := netip.MustParseAddr("100.64.0.7")
+	node6 := netip.MustParseAddr("fd7a:115c:a1e0::7")
+	r.SetMagicDNSHosts(fakeMagicDNSHosts{
+		hosts: map[dnsname.FQDN][]netip.Addr{
+			"node.ipn.dev.":   {node4, node6},
+			"v4only.ipn.dev.": {node4},
+			"subber.ipn.dev.": {node4},
+			"both.ipn.dev.":   {netip.MustParseAddr("100.100.9.9")}, // masked by Config.Hosts
+		},
+		subdomain: set.Of[dnsname.FQDN]("subber.ipn.dev."),
+		ptr:       map[netip.Addr]dnsname.FQDN{node4: "node.ipn.dev."},
+	})
+
+	tests := []struct {
+		name  string
+		qname dnsname.FQDN
+		qtype dns.Type
+		ip    netip.Addr
+		code  dns.RCode
+	}{
+		{"hook-ipv4", "node.ipn.dev.", dns.TypeA, node4, dns.RCodeSuccess},
+		{"hook-ipv6", "node.ipn.dev.", dns.TypeAAAA, node6, dns.RCodeSuccess},
+		// A known name with no records of the queried family is
+		// "name exists, no records", not NXDOMAIN.
+		{"hook-no-ipv6", "v4only.ipn.dev.", dns.TypeAAAA, netip.Addr{}, dns.RCodeSuccess},
+		{"hook-nxdomain", "gone.ipn.dev.", dns.TypeA, netip.Addr{}, dns.RCodeNameError},
+		{"hook-foreign", "google.com.", dns.TypeA, netip.Addr{}, dns.RCodeRefused},
+		{"hook-subdomain", "foo.subber.ipn.dev.", dns.TypeA, node4, dns.RCodeSuccess},
+		{"hook-subdomain-deep", "bar.foo.subber.ipn.dev.", dns.TypeA, node4, dns.RCodeSuccess},
+		{"hook-subdomain-no-cap", "foo.node.ipn.dev.", dns.TypeA, netip.Addr{}, dns.RCodeNameError},
+		// Config.Hosts entries (control's ExtraRecords) are
+		// consulted before the hook.
+		{"config-hosts", "extra.ipn.dev.", dns.TypeA, netip.MustParseAddr("100.100.1.1"), dns.RCodeSuccess},
+		{"config-hosts-precedence", "both.ipn.dev.", dns.TypeA, netip.MustParseAddr("100.100.2.2"), dns.RCodeSuccess},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ip, code := r.resolveLocal(tt.qname, tt.qtype)
+			if code != tt.code {
+				t.Errorf("code = %v; want %v", code, tt.code)
+			}
+			if ip != tt.ip {
+				t.Errorf("ip = %v; want %v", ip, tt.ip)
+			}
+		})
+	}
+
+	revTests := []struct {
+		name string
+		q    dnsname.FQDN
+		want dnsname.FQDN
+		code dns.RCode
+	}{
+		{"hook-ptr", "7.0.64.100.in-addr.arpa.", "node.ipn.dev.", dns.RCodeSuccess},
+		{"hook-ptr-nxdomain", "8.0.64.100.in-addr.arpa.", "", dns.RCodeNameError},
+		{"hook-ptr-foreign", "5.4.3.2.in-addr.arpa.", "", dns.RCodeRefused},
+	}
+	for _, tt := range revTests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, code := r.resolveLocalReverse(tt.q)
+			if code != tt.code {
+				t.Errorf("code = %v; want %v", code, tt.code)
+			}
+			if name != tt.want {
+				t.Errorf("name = %v; want %v", name, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveLocalReverse(t *testing.T) {
 	r := newResolver(t)
 	defer r.Close()
@@ -829,7 +934,7 @@ var allResponse = []byte{
 	// Answer:
 	0x05, 0x74, 0x65, 0x73, 0x74, 0x31, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // name
 	0x00, 0x01, 0x00, 0x01, // type A, class IN
-	0x00, 0x00, 0x02, 0x58, // TTL: 600
+	0x00, 0x00, 0x00, 0x05, // TTL: 5
 	0x00, 0x04, // length: 4 bytes
 	0x01, 0x02, 0x03, 0x04, // A: 1.2.3.4
 }
@@ -846,7 +951,7 @@ var ipv4Response = []byte{
 	// Answer:
 	0x05, 0x74, 0x65, 0x73, 0x74, 0x31, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // name
 	0x00, 0x01, 0x00, 0x01, // type A, class IN
-	0x00, 0x00, 0x02, 0x58, // TTL: 600
+	0x00, 0x00, 0x00, 0x05, // TTL: 5
 	0x00, 0x04, // length: 4 bytes
 	0x01, 0x02, 0x03, 0x04, // A: 1.2.3.4
 }
@@ -863,7 +968,7 @@ var ipv6Response = []byte{
 	// Answer:
 	0x05, 0x74, 0x65, 0x73, 0x74, 0x32, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // name
 	0x00, 0x1c, 0x00, 0x01, // type AAAA, class IN
-	0x00, 0x00, 0x02, 0x58, // TTL: 600
+	0x00, 0x00, 0x00, 0x05, // TTL: 5
 	0x00, 0x10, // length: 16 bytes
 	// AAAA: 0001:0203:0405:0607:0809:0A0B:0C0D:0E0F
 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0xb, 0xc, 0xd, 0xe, 0xf,
@@ -881,7 +986,7 @@ var ipv4UppercaseResponse = []byte{
 	// Answer:
 	0x05, 0x54, 0x45, 0x53, 0x54, 0x31, 0x03, 0x49, 0x50, 0x4e, 0x03, 0x44, 0x45, 0x56, 0x00, // name
 	0x00, 0x01, 0x00, 0x01, // type A, class IN
-	0x00, 0x00, 0x02, 0x58, // TTL: 600
+	0x00, 0x00, 0x00, 0x05, // TTL: 5
 	0x00, 0x04, // length: 4 bytes
 	0x01, 0x02, 0x03, 0x04, // A: 1.2.3.4
 }
@@ -900,7 +1005,7 @@ var ptrResponse = []byte{
 	0x01, 0x34, 0x01, 0x33, 0x01, 0x32, 0x01, 0x31, 0x07,
 	0x69, 0x6e, 0x2d, 0x61, 0x64, 0x64, 0x72, 0x04, 0x61, 0x72, 0x70, 0x61, 0x00,
 	0x00, 0x0c, 0x00, 0x01, // type PTR, class IN
-	0x00, 0x00, 0x02, 0x58, // TTL: 600
+	0x00, 0x00, 0x00, 0x05, // TTL: 5
 	0x00, 0x0f, // length: 15 bytes
 	// PTR: test1.ipn.dev
 	0x05, 0x74, 0x65, 0x73, 0x74, 0x31, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00,
@@ -936,35 +1041,58 @@ var ptrResponse6 = []byte{
 	0x03, 0x69, 0x70, 0x36,
 	0x04, 0x61, 0x72, 0x70, 0x61, 0x00,
 	0x00, 0x0c, 0x00, 0x01, // type PTR, class IN
-	0x00, 0x00, 0x02, 0x58, // TTL: 600
+	0x00, 0x00, 0x00, 0x05, // TTL: 5
 	0x00, 0x0f, // length: 15 bytes
 	// PTR: test2.ipn.dev
 	0x05, 0x74, 0x65, 0x73, 0x74, 0x32, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00,
 }
 
-var nxdomainResponse = []byte{
+// soaTestTime is what tests pin timeNow to when comparing golden
+// packets containing an SOA, whose serial is the response time in
+// unix seconds.
+var soaTestTime = time.Unix(0x12345678, 0)
+
+// soaAuthority is the authority section attached to negative
+// responses (NXDOMAIN and no-data) for the ipn.dev zone, communicating
+// the negative-caching TTL per RFC 2308.
+var soaAuthority = []byte{
+	0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // zone: ipn.dev.
+	0x00, 0x06, 0x00, 0x01, // type SOA, class IN
+	0x00, 0x00, 0x00, 0x0a, // TTL: 10
+	0x00, 0x26, // rdlength: 38
+	0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // mname: ipn.dev.
+	0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // rname: ipn.dev.
+	0x12, 0x34, 0x56, 0x78, // serial: soaTestTime as unix seconds
+	0x00, 0x00, 0x00, 0x0a, // refresh: 10
+	0x00, 0x00, 0x00, 0x0a, // retry: 10
+	0x00, 0x00, 0x00, 0x0a, // expire: 10
+	0x00, 0x00, 0x00, 0x0a, // minimum (negative-caching TTL): 10
+}
+
+var nxdomainResponse = append([]byte{
 	0x00, 0x00, // transaction id: 0
 	0x84, 0x03, // flags: response, authoritative, error: nxdomain
 	0x00, 0x01, // one question
 	0x00, 0x00, // no answers
-	0x00, 0x00, 0x00, 0x00, // no authority or additional RRs
+	0x00, 0x01, 0x00, 0x00, // one authority RR (the SOA), no additional RRs
 	// Question:
 	0x05, 0x74, 0x65, 0x73, 0x74, 0x33, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // name
 	0x00, 0x01, 0x00, 0x01, // type A, class IN
-}
+}, soaAuthority...)
 
-var emptyResponse = []byte{
+var emptyResponse = append([]byte{
 	0x00, 0x00, // transaction id: 0
 	0x84, 0x00, // flags: response, authoritative, no error
 	0x00, 0x01, // one question
 	0x00, 0x00, // no answers
-	0x00, 0x00, 0x00, 0x00, // no authority or additional RRs
+	0x00, 0x01, 0x00, 0x00, // one authority RR (the SOA), no additional RRs
 	// Question:
 	0x05, 0x74, 0x65, 0x73, 0x74, 0x31, 0x03, 0x69, 0x70, 0x6e, 0x03, 0x64, 0x65, 0x76, 0x00, // name
 	0x00, 0x1c, 0x00, 0x01, // type AAAA, class IN
-}
+}, soaAuthority...)
 
 func TestFull(t *testing.T) {
+	tstest.Replace(t, &timeNow, func() time.Time { return soaTestTime })
 	r := newResolver(t)
 	defer r.Close()
 
@@ -995,6 +1123,74 @@ func TestFull(t *testing.T) {
 			}
 			if !bytes.Equal(response, tt.response) {
 				t.Errorf("response = %x; want %x", response, tt.response)
+			}
+		})
+	}
+}
+
+// TestNegativeCachingSOA verifies that negative responses (NXDOMAIN
+// and no-data) for zones we're authoritative for carry an SOA record
+// in the authority section, bounding downstream resolvers' negative
+// caching to negativeTTL per RFC 2308. Without it, some resolvers
+// (notably macOS's mDNSResponder) seem to cache the nonexistence of
+// a name for a really long time, so nodes renamed in the admin
+// console don't start resolving under their new name for a while
+// (tailscale/corp#45631).
+func TestNegativeCachingSOA(t *testing.T) {
+	r := newResolver(t)
+	defer r.Close()
+	r.SetConfig(dnsCfg)
+
+	tests := []struct {
+		name     string
+		request  []byte
+		zone     string
+		wantCode dns.RCode
+	}{
+		{"nxdomain", dnspacket("test3.ipn.dev.", dns.TypeA, noEdns), "ipn.dev.", dns.RCodeNameError},
+		{"nodata-aaaa", dnspacket("test1.ipn.dev.", dns.TypeAAAA, noEdns), "ipn.dev.", dns.RCodeSuccess},
+		{"nxdomain-ptr", dnspacket("9.3.2.1.in-addr.arpa.", dns.TypePTR, noEdns), "3.2.1.in-addr.arpa.", dns.RCodeNameError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response, err := syncRespond(r, tt.request)
+			if err != nil {
+				t.Fatalf("err = %v; want nil", err)
+			}
+			var p dns.Parser
+			hdr, err := p.Start(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hdr.RCode != tt.wantCode {
+				t.Errorf("RCode = %v; want %v", hdr.RCode, tt.wantCode)
+			}
+			if err := p.SkipAllQuestions(); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.SkipAllAnswers(); err != nil {
+				t.Fatal(err)
+			}
+			ah, err := p.AuthorityHeader()
+			if err != nil {
+				t.Fatalf("AuthorityHeader: %v (no authority section?)", err)
+			}
+			if got := ah.Name.String(); got != tt.zone {
+				t.Errorf("authority name = %q; want %q", got, tt.zone)
+			}
+			if ah.Type != dns.TypeSOA {
+				t.Errorf("authority type = %v; want SOA", ah.Type)
+			}
+			wantTTL := uint32(negativeTTL / time.Second)
+			if ah.TTL != wantTTL {
+				t.Errorf("authority TTL = %v; want %v", ah.TTL, wantTTL)
+			}
+			soa, err := p.SOAResource()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if soa.MinTTL != wantTTL {
+				t.Errorf("SOA minimum = %v; want %v", soa.MinTTL, wantTTL)
 			}
 		})
 	}
@@ -1265,32 +1461,32 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 		{
 			Type:  dns.TypeA,
 			Name:  "one-a.test.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05one-a\x04test\x00\x00\x01\x00\x01\x05one-a\x04test\x00\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x01\x02\x03\x04"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05one-a\x04test\x00\x00\x01\x00\x01\x05one-a\x04test\x00\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04\x01\x02\x03\x04"),
 		},
 		{
 			Type:  dns.TypeA,
 			Name:  "two-a.test.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x05two-a\x04test\x00\x00\x01\x00\x01\xc0\f\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x01\x02\x03\x04\xc0\f\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x05\x06\a\b"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x05two-a\x04test\x00\x00\x01\x00\x01\xc0\f\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04\x01\x02\x03\x04\xc0\f\x00\x01\x00\x01\x00\x00\x00\x05\x00\x04\x05\x06\a\b"),
 		},
 		{
 			Type:  dns.TypeAAAA,
 			Name:  "one-aaaa.test.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\bone-aaaa\x04test\x00\x00\x1c\x00\x01\bone-aaaa\x04test\x00\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\bone-aaaa\x04test\x00\x00\x1c\x00\x01\bone-aaaa\x04test\x00\x00\x1c\x00\x01\x00\x00\x00\x05\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"),
 		},
 		{
 			Type:  dns.TypeAAAA,
 			Name:  "two-aaaa.test.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\btwo-aaaa\x04test\x00\x00\x1c\x00\x01\xc0\f\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\xc0\f\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\btwo-aaaa\x04test\x00\x00\x1c\x00\x01\xc0\f\x00\x1c\x00\x01\x00\x00\x00\x05\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\xc0\f\x00\x1c\x00\x01\x00\x00\x00\x05\x00\x10\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04"),
 		},
 		{
 			Type:  dns.TypePTR,
 			Name:  "4.3.2.1.in-addr.arpa.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x00\x00\x02X\x00\t\x03foo\x03com\x00"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x00\x00\x00\x05\x00\t\x03foo\x03com\x00"),
 		},
 		{
 			Type:  dns.TypeCNAME,
 			Name:  "cname.test.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05cname\x04test\x00\x00\x05\x00\x01\x05cname\x04test\x00\x00\x05\x00\x01\x00\x00\x02X\x00\x10\nthe-target\x03foo\x00"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05cname\x04test\x00\x00\x05\x00\x01\x05cname\x04test\x00\x00\x05\x00\x01\x00\x00\x00\x05\x00\x10\nthe-target\x03foo\x00"),
 		},
 
 		// No records of various types
@@ -1317,17 +1513,17 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 		{
 			Type:  dns.TypeTXT,
 			Name:  "txt.test.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x03\x00\x00\x00\x00\x03txt\x04test\x00\x00\x10\x00\x01\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\t\btxt1=one\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\t\btxt2=two\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\v\ntxt3=three"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x03\x00\x00\x00\x00\x03txt\x04test\x00\x00\x10\x00\x01\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x00\x05\x00\t\btxt1=one\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x00\x05\x00\t\btxt2=two\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x00\x05\x00\v\ntxt3=three"),
 		},
 		{
 			Type:  dns.TypeSRV,
 			Name:  "srv.test.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x03srv\x04test\x00\x00!\x00\x01\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x02X\x00\x0f\x00\x01\x00\x02\x00\x03\x03foo\x03com\x00\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x02X\x00\x0f\x00\x04\x00\x05\x00\x06\x03bar\x03com\x00"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x03srv\x04test\x00\x00!\x00\x01\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x00\x05\x00\x0f\x00\x01\x00\x02\x00\x03\x03foo\x03com\x00\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x00\x05\x00\x0f\x00\x04\x00\x05\x00\x06\x03bar\x03com\x00"),
 		},
 		{
 			Type:  dns.TypeNS,
 			Name:  "ns.test.",
-			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x02ns\x04test\x00\x00\x02\x00\x01\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x02X\x00\t\x03ns1\x03foo\x00\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x02X\x00\t\x03ns2\x03bar\x00"),
+			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x02ns\x04test\x00\x00\x02\x00\x01\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x00\x05\x00\t\x03ns1\x03foo\x00\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x00\x05\x00\t\x03ns2\x03bar\x00"),
 		},
 	}
 

@@ -21,6 +21,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,8 +54,10 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/ping"
+	"tailscale.com/net/routemanager"
 	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
@@ -69,6 +72,7 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/eventbus/eventbustest"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/util/set"
@@ -77,7 +81,6 @@ import (
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/filter/filtertype"
 	"tailscale.com/wgengine/wgcfg"
-	"tailscale.com/wgengine/wgcfg/nmcfg"
 	"tailscale.com/wgengine/wglog"
 )
 
@@ -242,28 +245,82 @@ func newMagicStackWithKey(t testing.TB, logf logger.Logf, ln nettype.PacketListe
 	}
 }
 
-func (s *magicStack) Reconfig(cfg *wgcfg.Config) error {
+// wgCfgOf builds a test node's wgcfg.Config from its netmap the same
+// way ipnlocal.authReconfigLocked does in production: just the private
+// key and self addresses. Peers ride the per-peer config source
+// instead; see [magicStack.Reconfig].
+func wgCfgOf(pk key.NodePrivate, nm *netmap.NetworkMap) *wgcfg.Config {
+	return &wgcfg.Config{
+		PrivateKey: pk,
+		Addresses:  nm.GetAddresses().AsSlice(),
+	}
+}
+
+// Reconfig applies cfg and peers to the stack's WireGuard device and
+// tun-layer data plane. In production these flow from LocalBackend
+// (via [tailscale.com/wgengine.Engine.Reconfig] and the live per-peer
+// config source installed with Engine.SetPeerConfigFunc); tests that
+// bypass LocalBackend replicate that wiring here, deriving everything
+// from a real [routemanager.RouteManager] fed the given peers,
+// exactly as LocalBackend does in production, so this helper cannot
+// drift from the production derivation.
+func (s *magicStack) Reconfig(cfg *wgcfg.Config, peers []tailcfg.NodeView) error {
 	s.tsTun.SetWGConfig(cfg)
 
-	// In production, LocalBackend installs a PeerByIPPacketFunc via
-	// Engine.SetPeerByIPPacketFunc. Tests that bypass LocalBackend need
-	// to install one here for outbound packet routing.
-	ipToPeer := make(map[netip.Addr]device.NoisePublicKey, len(cfg.Peers))
-	for _, p := range cfg.Peers {
-		pk := p.PublicKey.Raw32()
-		for _, pfx := range p.AllowedIPs {
-			if pfx.IsSingleIP() {
-				ipToPeer[pfx.Addr()] = pk
+	rm := routemanager.New(nil)
+	mut := rm.Begin()
+	// Tests want subnet routes accepted, matching what production
+	// gets from Prefs.RouteAll.
+	mut.SetPrefs(routemanager.Prefs{RouteAll: true})
+	// idByKey stands in for nodeBackend's public-key-to-node-ID
+	// index, which LocalBackend uses to serve the engine's per-peer
+	// config source.
+	idByKey := make(map[key.NodePublic]tailcfg.NodeID, len(peers))
+	for _, n := range peers {
+		idByKey[n.Key()] = n.ID()
+		mut.UpsertPeer(n)
+	}
+	mut.Commit()
+	peerAllowedIPs := func(k key.NodePublic) ([]netip.Prefix, bool) {
+		id, ok := idByKey[k]
+		if !ok {
+			return nil, false
+		}
+		return rm.PeerAllowedIPs(id)
+	}
+
+	// The tun-layer per-peer route attributes (masquerade, jailed).
+	native4, native6 := tsaddr.FirstTailscaleAddrs(slices.All(cfg.Addresses))
+	s.tsTun.SetPeerRoutes(native4, native6, rm.Outbound())
+
+	// Outbound packet routing, as LocalBackend's lookupPeerByIP does
+	// via the outbound table.
+	s.dev.SetPeerByIPPacketFunc(func(_, dst netip.Addr, _ []byte) (device.NoisePublicKey, bool) {
+		if pr, ok := rm.Outbound().Lookup(dst); ok {
+			return pr.Key.Raw32(), true
+		}
+		return device.NoisePublicKey{}, false
+	})
+
+	// The live per-peer config source backing lazy peer creation, as
+	// LocalBackend's peerAllowedIPs does via PeerAllowedIPs, and the
+	// per-peer device convergence that Engine.SyncDevicePeer does.
+	s.dev.SetPeerLookupFunc(wgcfg.NewPeerLookupFunc(s.conn.Bind(), s.conn.logf, func(pubk device.NoisePublicKey) ([]netip.Prefix, bool) {
+		return peerAllowedIPs(key.NodePublicFromRaw32(mem.B(pubk[:])))
+	}))
+	s.dev.SetPrivateKey(key.NodePrivateAs[device.NoisePrivateKey](cfg.PrivateKey))
+	s.dev.RemoveMatchingPeers(func(pk device.NoisePublicKey) bool {
+		_, ok := peerAllowedIPs(key.NodePublicFromRaw32(mem.B(pk[:])))
+		return !ok
+	})
+	for _, n := range peers {
+		if peer, ok := s.dev.LookupActivePeer(n.Key().Raw32()); ok {
+			if ips, ok := peerAllowedIPs(n.Key()); ok {
+				peer.SetAllowedIPs(ips)
 			}
 		}
 	}
-	s.dev.SetPeerByIPPacketFunc(func(_, dst netip.Addr, _ []byte) (device.NoisePublicKey, bool) {
-		pk, ok := ipToPeer[dst]
-		return pk, ok
-	})
-
-	s.dev.SetPrivateKey(key.NodePrivateAs[device.NoisePrivateKey](cfg.PrivateKey))
-	return wgcfg.ReconfigDevice(s.dev, cfg, s.conn.logf)
+	return nil
 }
 
 func (s *magicStack) String() string {
@@ -365,18 +422,8 @@ func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkM
 		for i, m := range ms {
 			nm := buildNetmapLocked(i)
 			m.conn.SetNetworkMap(nm.SelfNode, nm.Peers)
-			peerSet := make(set.Set[key.NodePublic], len(nm.Peers))
-			for _, peer := range nm.Peers {
-				peerSet.Add(peer.Key())
-			}
-			m.conn.UpdatePeers(peerSet)
-			wg, err := nmcfg.WGCfg(ms[i].privateKey, nm, logf, 0, "")
-			if err != nil {
-				// We're too far from the *testing.T to be graceful,
-				// blow up. Shouldn't happen anyway.
-				panic(fmt.Sprintf("failed to construct wgcfg from netmap: %v", err))
-			}
-			if err := m.Reconfig(wg); err != nil {
+			wg := wgCfgOf(ms[i].privateKey, nm)
+			if err := m.Reconfig(wg, nm.Peers); err != nil {
 				if ctx.Err() != nil || errors.Is(err, errConnClosed) {
 					// shutdown race, don't care.
 					return
@@ -579,7 +626,7 @@ func TestPickDERPFallback(t *testing.T) {
 		}
 	}
 
-	// Test that that the pointer value of c is blended in and
+	// Test that the pointer value of c is blended in and
 	// distribution over nodes works.
 	got := map[int]int{}
 	for range 50 {
@@ -1182,30 +1229,32 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	m1cfg := &wgcfg.Config{
 		PrivateKey: m1.privateKey,
 		Addresses:  []netip.Prefix{netip.MustParsePrefix("1.0.0.1/32")},
-		Peers: []wgcfg.Peer{
-			{
-				PublicKey:  m2.privateKey.Public(),
-				DiscoKey:   m2.conn.DiscoPublicKey(),
-				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("1.0.0.2/32")},
-			},
-		},
 	}
+	m1peers := nodeViews([]*tailcfg.Node{{
+		ID:         2,
+		Key:        m2.privateKey.Public(),
+		DiscoKey:   m2.conn.DiscoPublicKey(),
+		HomeDERP:   1,
+		Addresses:  []netip.Prefix{netip.MustParsePrefix("1.0.0.2/32")},
+		AllowedIPs: []netip.Prefix{netip.MustParsePrefix("1.0.0.2/32")},
+	}})
 	m2cfg := &wgcfg.Config{
 		PrivateKey: m2.privateKey,
 		Addresses:  []netip.Prefix{netip.MustParsePrefix("1.0.0.2/32")},
-		Peers: []wgcfg.Peer{
-			{
-				PublicKey:  m1.privateKey.Public(),
-				DiscoKey:   m1.conn.DiscoPublicKey(),
-				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("1.0.0.1/32")},
-			},
-		},
 	}
+	m2peers := nodeViews([]*tailcfg.Node{{
+		ID:         1,
+		Key:        m1.privateKey.Public(),
+		DiscoKey:   m1.conn.DiscoPublicKey(),
+		HomeDERP:   1,
+		Addresses:  []netip.Prefix{netip.MustParsePrefix("1.0.0.1/32")},
+		AllowedIPs: []netip.Prefix{netip.MustParsePrefix("1.0.0.1/32")},
+	}})
 
-	if err := m1.Reconfig(m1cfg); err != nil {
+	if err := m1.Reconfig(m1cfg, m1peers); err != nil {
 		t.Fatal(err)
 	}
-	if err := m2.Reconfig(m2cfg); err != nil {
+	if err := m2.Reconfig(m2cfg, m2peers); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1329,7 +1378,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	t.Run("no-op-dev1-reconfig", func(t *testing.T) {
 		setT(t)
 		defer setT(outerT)
-		if err := m1.Reconfig(m1cfg); err != nil {
+		if err := m1.Reconfig(m1cfg, m1peers); err != nil {
 			t.Fatal(err)
 		}
 		ping1(t)
@@ -1520,7 +1569,7 @@ func TestDiscoStringLogRace(t *testing.T) {
 	wg.Wait()
 }
 
-// Test32bitAlignment verifies that that the 64-bit atomic mono.Time fields are
+// Test32bitAlignment verifies that the 64-bit atomic mono.Time fields are
 // 64-bit aligned, so that StoreAtomic and LoadAtomic won't panic on 32-bit
 // platforms.
 //
@@ -2328,6 +2377,116 @@ func TestSetNetworkMapWithNoPeers(t *testing.T) {
 	}
 }
 
+// Tests that the full-set peer update path (SetNetworkMap) and the
+// incremental per-peer paths (UpsertPeer, RemovePeer) maintain the
+// node-key-keyed DERP state (derpRoute and peerLastDerp) identically
+// when peers are removed or rotate their node keys. LocalBackend uses
+// either path depending on whether it received a full netmap or a
+// delta, so a change to the cleanup in one path must be made to both.
+func TestPeerDERPStateCleanup(t *testing.T) {
+	peerA := &tailcfg.Node{ID: 1, Key: randNodeKey(), DiscoKey: randDiscoKey(), Endpoints: eps("192.168.1.2:1")}
+	peerB := &tailcfg.Node{ID: 2, Key: randNodeKey(), DiscoKey: randDiscoKey(), Endpoints: eps("192.168.1.2:2")}
+	peerARotated := peerA.Clone()
+	peerARotated.Key = randNodeKey()
+
+	steps := []struct {
+		name  string
+		peers []*tailcfg.Node // the desired peer set after the step
+	}{
+		{"initial", []*tailcfg.Node{peerA, peerB}},
+		{"rotate-A-key", []*tailcfg.Node{peerARotated, peerB}},
+		{"remove-B", []*tailcfg.Node{peerARotated}},
+		{"remove-all", nil},
+	}
+
+	// seedDERPState populates the node-key-keyed DERP maps for each
+	// current peer, as receiving DERP traffic from them would.
+	seedDERPState := func(c *Conn) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, n := range c.peersByID {
+			mak.Set(&c.derpRoute, n.Key(), derpRoute{regionID: 1})
+			mak.Set(&c.peerLastDerp, n.Key(), 1)
+		}
+	}
+
+	// derpKeys returns a canonical dump of the node-key-keyed DERP
+	// state that peer removals and key rotations must clean up.
+	derpKeys := func(c *Conn) []string {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		var got []string
+		for k := range c.derpRoute {
+			got = append(got, "derpRoute "+k.String())
+		}
+		for k := range c.peerLastDerp {
+			got = append(got, "peerLastDerp "+k.String())
+		}
+		slices.Sort(got)
+		return got
+	}
+
+	// stateString returns a canonical dump of all the per-peer state
+	// that the two update paths must maintain identically.
+	stateString := func(c *Conn) string {
+		c.mu.Lock()
+		lines := []string{fmt.Sprintf("peerMap %d", c.peerMap.nodeCount())}
+		for id, n := range c.peersByID {
+			lines = append(lines, fmt.Sprintf("peer %d %s", id, n.Key()))
+		}
+		c.mu.Unlock()
+		lines = append(lines, derpKeys(c)...)
+		slices.Sort(lines)
+		return strings.Join(lines, "\n")
+	}
+
+	connFull := newTestConn(t) // updated via SetNetworkMap
+	defer connFull.Close()
+	connInc := newTestConn(t) // updated via UpsertPeer/RemovePeer
+	defer connInc.Close()
+
+	prevKeyByID := map[tailcfg.NodeID]key.NodePublic{}
+	for _, step := range steps {
+		connFull.SetNetworkMap(tailcfg.NodeView{}, nodeViews(step.peers))
+
+		curIDs := set.Set[tailcfg.NodeID]{}
+		for _, n := range step.peers {
+			curIDs.Add(n.ID)
+			connInc.UpsertPeer(n.View())
+		}
+		for id := range prevKeyByID {
+			if !curIDs.Contains(id) {
+				connInc.RemovePeer(id)
+			}
+		}
+
+		// The DERP state seeded before this step must survive only for
+		// peers still present with an unchanged node key.
+		var want []string
+		for _, n := range step.peers {
+			if k, ok := prevKeyByID[n.ID]; ok && k == n.Key {
+				want = append(want, "derpRoute "+n.Key.String(), "peerLastDerp "+n.Key.String())
+			}
+		}
+		slices.Sort(want)
+		if got := derpKeys(connFull); !slices.Equal(got, want) {
+			t.Errorf("step %q: SetNetworkMap path DERP state = %q; want %q", step.name, got, want)
+		}
+
+		// Both update paths must have produced identical state.
+		if full, inc := stateString(connFull), stateString(connInc); full != inc {
+			t.Errorf("step %q: state mismatch between update paths\nSetNetworkMap path:\n%s\nUpsertPeer/RemovePeer path:\n%s", step.name, full, inc)
+		}
+
+		clear(prevKeyByID)
+		for _, n := range step.peers {
+			prevKeyByID[n.ID] = n.Key
+		}
+		seedDERPState(connFull)
+		seedDERPState(connInc)
+	}
+}
+
 // newWireguard starts up a new wireguard-go device attached to a test tun, and
 // returns the device, tun and endpoint port. To add peers call device.IpcSet
 // with UAPI instructions.
@@ -2414,11 +2573,8 @@ func TestIsWireGuardOnlyPeer(t *testing.T) {
 	}
 	m.conn.SetNetworkMap(nm.SelfNode, nm.Peers)
 
-	cfg, err := nmcfg.WGCfg(m.privateKey, nm, t.Logf, netmap.AllowSubnetRoutes, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.Reconfig(cfg)
+	cfg := wgCfgOf(m.privateKey, nm)
+	m.Reconfig(cfg, nm.Peers)
 
 	pbuf := tuntest.Ping(wgaip.Addr(), tsaip.Addr())
 	m.tun.Outbound <- pbuf
@@ -2475,11 +2631,8 @@ func TestIsWireGuardOnlyPeerWithMasquerade(t *testing.T) {
 	}
 	m.conn.SetNetworkMap(nm.SelfNode, nm.Peers)
 
-	cfg, err := nmcfg.WGCfg(m.privateKey, nm, t.Logf, netmap.AllowSubnetRoutes, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.Reconfig(cfg)
+	cfg := wgCfgOf(m.privateKey, nm)
+	m.Reconfig(cfg, nm.Peers)
 
 	pbuf := tuntest.Ping(wgaip.Addr(), tsaip.Addr())
 	m.tun.Outbound <- pbuf
@@ -2515,12 +2668,9 @@ func applyNetworkMap(t *testing.T, m *magicStack, nm *netmap.NetworkMap) {
 	m.conn.noV6.Store(true)
 
 	// Turn the network map into a wireguard config (for the tailscale internal wireguard device).
-	cfg, err := nmcfg.WGCfg(m.privateKey, nm, t.Logf, netmap.AllowSubnetRoutes, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := wgCfgOf(m.privateKey, nm)
 	// Apply the wireguard config to the tailscale internal wireguard device.
-	if err := m.Reconfig(cfg); err != nil {
+	if err := m.Reconfig(cfg, nm.Peers); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -3671,6 +3821,9 @@ func Test_nodeHasCap(t *testing.T) {
 	nodeDOnlyIPv6 := nodeCOnlyIPv4.Clone()
 	nodeDOnlyIPv6.Addresses[0] = netip.MustParsePrefix("::2/128")
 
+	nodeCUnsigned := nodeCOnlyIPv4.Clone()
+	nodeCUnsigned.UnsignedPeerAPIOnly = true
+
 	tests := []struct {
 		name string
 		filt *filter.Filter
@@ -3784,6 +3937,24 @@ func Test_nodeHasCap(t *testing.T) {
 			}, nil, nil, nil, nil, nil),
 			src:  nodeCOnlyIPv4.View(),
 			dst:  tailcfg.NodeView{},
+			cap:  tailcfg.PeerCapabilityRelayTarget,
+			want: false,
+		},
+		{
+			name: "unsigned-src",
+			filt: filter.New([]filtertype.Match{
+				{
+					Srcs: []netip.Prefix{netip.MustParsePrefix("2.2.2.2/32")},
+					Caps: []filtertype.CapMatch{
+						{
+							Dst: netip.MustParsePrefix("1.1.1.1/32"),
+							Cap: tailcfg.PeerCapabilityRelayTarget,
+						},
+					},
+				},
+			}, nil, nil, nil, nil, nil),
+			src:  nodeCUnsigned.View(),
+			dst:  nodeAOnlyIPv4.View(),
 			cap:  tailcfg.PeerCapabilityRelayTarget,
 			want: false,
 		},
@@ -4468,215 +4639,233 @@ func TestRotateDiscoKeyMultipleTimes(t *testing.T) {
 }
 
 func TestReceiveTSMPDiscoKeyAdvertisement(t *testing.T) {
-	conn := newTestConn(t)
-	t.Cleanup(func() { conn.Close() })
-
-	peerKey := key.NewNode().Public()
-	ep := &endpoint{
-		nodeID:    1,
-		publicKey: peerKey,
-		nodeAddr:  netip.MustParseAddr("100.64.0.1"),
-	}
-	discoKey := key.NewDisco().Public()
-	ep.disco.Store(&endpointDisco{
-		key:   discoKey,
-		short: discoKey.ShortString(),
-	})
-	ep.c = conn
-	conn.mu.Lock()
-	nodeView := (&tailcfg.Node{
-		Key: ep.publicKey,
-		Addresses: []netip.Prefix{
-			netip.MustParsePrefix("100.64.0.1/32"),
-		},
-	}).View()
-	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
-	conn.mu.Unlock()
-
-	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
-
-	if ep.discoShort() != discoKey.ShortString() {
-		t.Errorf("Original disco key %s, does not match %s", discoKey.ShortString(), ep.discoShort())
-	}
-
-	newDiscoKey := key.NewDisco().Public()
-	tka := packet.TSMPDiscoKeyAdvertisement{
-		Src: netip.MustParseAddr("100.64.0.1"),
-		Key: newDiscoKey,
-	}
-	conn.HandleDiscoKeyAdvertisement(nodeView, tka)
-
-	if ep.disco.Load().short != newDiscoKey.ShortString() {
-		t.Errorf("New disco key %s, does not match %s", newDiscoKey.ShortString(), ep.disco.Load().short)
-	}
-}
-
-func TestSendingTSMPDiscoTimer(t *testing.T) {
-	conn := newTestConn(t)
-	tw := eventbustest.NewWatcher(t, conn.eventBus)
-	t.Cleanup(func() { conn.Close() })
-
-	// maybeSendTSMPDiscoAdvert only advertises when netmap caching is enabled.
-	conn.controlKnobs = new(controlknobs.Knobs)
-	conn.controlKnobs.CacheNetworkMaps.Store(true)
-
-	peerKey := key.NewNode().Public()
-	ep := &endpoint{
-		nodeID:    1,
-		publicKey: peerKey,
-		nodeAddr:  netip.MustParseAddr("100.64.0.1"),
-	}
-	discoKey := key.NewDisco().Public()
-	ep.disco.Store(&endpointDisco{
-		key:   discoKey,
-		short: discoKey.ShortString(),
-	})
-	ep.c = conn
-	conn.mu.Lock()
-	nodeView := (&tailcfg.Node{
-		Key: ep.publicKey,
-		Addresses: []netip.Prefix{
-			netip.MustParsePrefix("100.64.0.1/32"),
-		},
-	}).View()
-	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
-	conn.mu.Unlock()
-
-	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
-
-	if ep.discoShort() != discoKey.ShortString() {
-		t.Errorf("Original disco key %s, does not match %s", discoKey.ShortString(), ep.discoShort())
-	}
-
-	// Only one gets through, second is rate limited.
-	conn.maybeSendTSMPDiscoAdvert(ep)
-	conn.maybeSendTSMPDiscoAdvert(ep)
-	if err := eventbustest.ExpectExactly(tw, eventbustest.Type[NewDiscoKeyAvailable]()); err != nil {
-		t.Errorf("expected only one event, got: %s", err)
-	}
-
-	// Reset to get the event firing again.
-	ep.mu.Lock()
-	ep.lastDiscoKeyAdvertisement = 0
-	ep.mu.Unlock()
-	conn.maybeSendTSMPDiscoAdvert(ep)
-	if err := eventbustest.Expect(tw, eventbustest.Type[NewDiscoKeyAvailable]()); err != nil {
-		t.Errorf("expected only one event, got: %s", err)
-	}
-
-	// With a direct bestAddr and a non-zero lastDiscoKeyAdvertisement past the
-	// rate-limit interval. No advert should be sent due to the active bestAddr.
-	ep.mu.Lock()
-	ep.lastDiscoKeyAdvertisement = mono.Now().Add(-discoKeyAdvertisementInterval - time.Second)
-	ep.bestAddr = addrQuality{epAddr: epAddr{ap: netip.MustParseAddrPort("1.2.3.4:567")}}
-	ep.mu.Unlock()
-	conn.maybeSendTSMPDiscoAdvert(ep)
-
-	// Simulating restart should send an advert.
-	ep.mu.Lock()
-	ep.lastDiscoKeyAdvertisement = 0
-	ep.mu.Unlock()
-	conn.maybeSendTSMPDiscoAdvert(ep)
-	if err := eventbustest.ExpectExactly(tw, eventbustest.Type[NewDiscoKeyAvailable]()); err != nil {
-		t.Errorf("expected only one event, got: %s", err)
-	}
-}
-
-// TestSendingTSMPDiscoCachingDisabled verifies that maybeSendTSMPDiscoAdvert
-// early-returns (sends no advert) when netmap caching is not enabled via the
-// CacheNetworkMaps control knob, including when no knobs are present at all.
-func TestSendingTSMPDiscoCachingDisabled(t *testing.T) {
 	tests := []struct {
-		name  string
-		knobs *controlknobs.Knobs
+		name       string
+		newKeyFunc func() key.DiscoPublic
+		wantUpdate bool
 	}{
-		{name: "no-knobs", knobs: nil},
-		// Knobs present but CacheNetworkMaps left at its false default.
-		{name: "caching-disabled", knobs: new(controlknobs.Knobs)},
+		{
+			name:       "normal_key_change",
+			newKeyFunc: key.NewDisco().Public,
+			wantUpdate: true,
+		},
+		{
+			name: "zero_key_change",
+			newKeyFunc: func() key.DiscoPublic {
+				return key.DiscoPublic{}
+			},
+			wantUpdate: false,
+		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			conn := newTestConn(t)
 			t.Cleanup(func() { conn.Close() })
-			conn.controlKnobs = tt.knobs
 
+			peerKey := key.NewNode().Public()
 			ep := &endpoint{
 				nodeID:    1,
-				publicKey: key.NewNode().Public(),
+				publicKey: peerKey,
 				nodeAddr:  netip.MustParseAddr("100.64.0.1"),
 			}
+			discoKey := key.NewDisco().Public()
+			ep.disco.Store(&endpointDisco{
+				key:   discoKey,
+				short: discoKey.ShortString(),
+			})
 			ep.c = conn
+			conn.mu.Lock()
+			nodeView := (&tailcfg.Node{
+				Key: ep.publicKey,
+				Addresses: []netip.Prefix{
+					netip.MustParsePrefix("100.64.0.1/32"),
+				},
+			}).View()
+			conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
+			conn.mu.Unlock()
 
-			// A fresh endpoint with a zero lastDiscoKeyAdvertisement and no
-			// direct bestAddr would otherwise advertise; the only thing
-			// suppressing it here is the disabled caching knob. On early
-			// return the timestamp is left untouched (zero).
-			conn.maybeSendTSMPDiscoAdvert(ep)
+			conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
 
-			ep.mu.Lock()
-			defer ep.mu.Unlock()
-			if !ep.lastDiscoKeyAdvertisement.IsZero() {
-				t.Errorf("lastDiscoKeyAdvertisement = %v; want zero (advert should have been suppressed)", ep.lastDiscoKeyAdvertisement)
+			if ep.discoShort() != discoKey.ShortString() {
+				t.Errorf("Original disco key %s, does not match %s", discoKey.ShortString(), ep.discoShort())
+			}
+
+			newDiscoKey := tt.newKeyFunc()
+			tka := packet.TSMPDiscoKeyAdvertisement{
+				Src: netip.MustParseAddr("100.64.0.1"),
+				Key: newDiscoKey,
+			}
+			conn.HandleDiscoKeyAdvertisement(nodeView, tka)
+			wantDiscoKey := discoKey
+			if tt.wantUpdate {
+				wantDiscoKey = newDiscoKey
+			}
+
+			if ep.disco.Load().short != wantDiscoKey.ShortString() {
+				t.Errorf("New disco key %s, does not match %s", newDiscoKey.ShortString(), ep.disco.Load().short)
 			}
 		})
 	}
 }
 
-// TestSendingTSMPDiscoPeerRelaySuppressed verifies that maybeSendTSMPDiscoAdvert
-// suppresses the advert when the bestAddr is a peer relay path (a non-zero
-// addrQuality whose epAddr has a VNI set), even though such a path is not
-// direct. Suppression is observed via lastDiscoKeyAdvertisement remaining
-// unchanged, since a fired advert would overwrite it with the current time.
-func TestSendingTSMPDiscoPeerRelaySuppressed(t *testing.T) {
-	conn := newTestConn(t)
-	t.Cleanup(func() { conn.Close() })
+func TestPriorityMessageForPeer(t *testing.T) {
+	conn := &Conn{}
+	conn.discoAtomic.pair.Store(&discoKeyPair{})
 
-	// maybeSendTSMPDiscoAdvert only advertises when netmap caching is enabled.
-	conn.controlKnobs = new(controlknobs.Knobs)
-	conn.controlKnobs.CacheNetworkMaps.Store(true)
-
-	peerKey := key.NewNode().Public()
-	ep := &endpoint{
-		nodeID:    1,
-		publicKey: peerKey,
-		nodeAddr:  netip.MustParseAddr("100.64.0.1"),
+	// Test early return when self key is zero.
+	if res := conn.PriorityMessageForPeer(key.NewNode().Public()); res != nil {
+		t.Errorf("expected nil, got %v", res)
 	}
+
+	conn = newTestConn(t)
+	conn.SetPrivateKey(key.NewNode())
+
+	selfNode := (&tailcfg.Node{
+		ID: 0,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("fd7a:115c:a1e0::/128"),
+		},
+	}).View()
+	conn.mu.Lock()
+	conn.self = selfNode
+	conn.mu.Unlock()
+
+	nodeID := tailcfg.NodeID(1)
+
+	ip4 := netip.MustParseAddr("100.64.0.1")
+	ep := &endpoint{
+		nodeID:    nodeID,
+		publicKey: key.NewNode().Public(),
+		nodeAddr:  ip4,
+	}
+
 	discoKey := key.NewDisco().Public()
 	ep.disco.Store(&endpointDisco{
 		key:   discoKey,
 		short: discoKey.ShortString(),
 	})
+
 	ep.c = conn
+
+	// Test the EP missing from the peerMap.
+	if res := conn.PriorityMessageForPeer(ep.publicKey); res != nil {
+		t.Errorf("expected nil, got %v", res)
+	}
+
 	conn.mu.Lock()
-	nodeView := (&tailcfg.Node{
-		Key: ep.publicKey,
-		Addresses: []netip.Prefix{
-			netip.MustParsePrefix("100.64.0.1/32"),
-		},
-	}).View()
-	conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
+	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
 	conn.mu.Unlock()
 
-	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+	// Test isWireguardOnly.
+	// It is OK for us to modify the endpoint unsynchronized here, because
+	// the callback is not running concurrently.
+	ep.isWireguardOnly = true
+	if res := conn.PriorityMessageForPeer(ep.publicKey); res != nil {
+		t.Errorf("expected nil, got %v", res)
+	}
+	ep.isWireguardOnly = false
 
-	// A peer relay bestAddr: an epAddr with a VNI set. It is past the
-	// rate-limit interval with a non-zero lastDiscoKeyAdvertisement, so the
-	// only thing suppressing the advert is the active (non-zero) bestAddr.
-	var vni packet.VirtualNetworkID
-	vni.Set(7)
-	lastAdvert := mono.Now().Add(-discoKeyAdvertisementInterval - time.Second)
-	ep.mu.Lock()
-	ep.lastDiscoKeyAdvertisement = lastAdvert
-	ep.bestAddr = addrQuality{epAddr: epAddr{ap: netip.MustParseAddrPort("1.2.3.4:567"), vni: vni}}
-	ep.mu.Unlock()
+	// Test address family mismatch.
+	if res := conn.PriorityMessageForPeer(ep.publicKey); res != nil {
+		t.Errorf("expected nil, got %v", res)
+	}
 
-	conn.maybeSendTSMPDiscoAdvert(ep)
+	selfNode = (&tailcfg.Node{
+		ID: 0,
+		Addresses: []netip.Prefix{
+			netip.MustParsePrefix("100.64.0.0/32"),
+			netip.MustParsePrefix("fd7a:115c:a1e0::/128"),
+		},
+	}).View()
+	conn.mu.Lock()
+	conn.self = selfNode
+	conn.mu.Unlock()
 
-	// A fired advert would have overwritten lastDiscoKeyAdvertisement with the
-	// current time; confirm it was left untouched, indicating suppression.
-	ep.mu.Lock()
-	defer ep.mu.Unlock()
-	if ep.lastDiscoKeyAdvertisement != lastAdvert {
-		t.Errorf("lastDiscoKeyAdvertisement = %v; want unchanged %v (advert should have been suppressed)", ep.lastDiscoKeyAdvertisement, lastAdvert)
+	// Test successful message.
+	expected, err := (&packet.TSMPDiscoKeyAdvertisement{
+		Src: netip.MustParseAddr("100.64.0.0"),
+		Dst: netip.MustParseAddr("100.64.0.1"),
+		Key: conn.DiscoPublicKey(),
+	}).Marshal()
+	if err != nil {
+		t.Fatalf("Failed to marshal expected packet: %v", err)
+	}
+	res := conn.PriorityMessageForPeer(ep.publicKey)
+	if !slices.Equal(res, expected) {
+		t.Errorf("expected \n%v, got \n%v", expected, res)
+	}
+}
+
+func BenchmarkPriorityMessageForPeer(b *testing.B) {
+	// Can test up to 2^16 nodes given the address generation.
+	nodeCount := []int{10, 10000}
+
+	for _, tt := range nodeCount {
+		b.Run(fmt.Sprintf("%d_nodes", tt), func(b *testing.B) {
+			conn := newTestConn(b)
+			conn.SetPrivateKey(key.NewNode())
+			peersByID := make(map[tailcfg.NodeID]tailcfg.NodeView, tt)
+			var targetKey key.NodePublic
+
+			selfNode := (&tailcfg.Node{
+				ID: 0,
+				Addresses: []netip.Prefix{
+					netip.MustParsePrefix("100.64.0.0/32"),
+					netip.MustParsePrefix("fd7a:115c:a1e0::/128"),
+				},
+			}).View()
+			conn.mu.Lock()
+			conn.self = selfNode
+			conn.mu.Unlock()
+
+			for i := range tt {
+				nodeID := tailcfg.NodeID(i + 1)
+				nodeKey := key.NewNode().Public()
+				if i == 0 {
+					targetKey = nodeKey
+				}
+
+				addrIdx := i + 1
+				ip4 := netip.AddrFrom4([4]byte{100, 64, byte(addrIdx >> 8), byte(addrIdx)})
+				ip6 := netip.AddrFrom16([16]byte{
+					0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0,
+					0, 0, 0, 0, 0, 0, 0, 0, byte(addrIdx >> 8), byte(addrIdx),
+				})
+				ep := &endpoint{
+					nodeID:    nodeID,
+					publicKey: nodeKey,
+					nodeAddr:  ip4,
+				}
+
+				discoKey := key.NewDisco().Public()
+				ep.disco.Store(&endpointDisco{
+					key:   discoKey,
+					short: discoKey.ShortString(),
+				})
+
+				ep.c = conn
+				nodeView := (&tailcfg.Node{
+					ID:  1,
+					Key: ep.publicKey,
+					Addresses: []netip.Prefix{
+						netip.PrefixFrom(ip4, 32),
+						netip.PrefixFrom(ip6, 128),
+					},
+				}).View()
+				peersByID[nodeID] = nodeView
+				conn.mu.Lock()
+				conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+				conn.mu.Unlock()
+			}
+
+			conn.mu.Lock()
+			conn.peersByID = peersByID
+			conn.mu.Unlock()
+
+			for b.Loop() {
+				conn.PriorityMessageForPeer(targetKey)
+			}
+		})
 	}
 }

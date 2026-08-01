@@ -254,7 +254,7 @@ func (cd *ChangeDelta) InterfaceIPDisappeared(ip netip.Addr) bool {
 	if cd.new == nil && cd.old.HasIP(ip) {
 		return true
 	}
-	return cd.new.HasIP(ip) && !cd.old.HasIP(ip)
+	return cd.old.HasIP(ip) && !cd.new.HasIP(ip)
 }
 
 // AnyInterfaceUp reports whether any interfaces are up in the new state.
@@ -267,7 +267,7 @@ func (cd *ChangeDelta) AnyInterfaceUp() bool {
 
 // isInterestingInterfaceChange reports whether any interfaces have changed in a meaningful way.
 // This excludes interfaces that are not interesting per IsInterestingInterface and
-// filters out changes to interface IPs that that are uninteresting (e.g. link-local addresses).
+// filters out changes to interface IPs that are uninteresting (e.g. link-local addresses).
 func (cd *ChangeDelta) isInterestingInterfaceChange() bool {
 	// If there is no old state, everything is considered changed.
 	if cd.old == nil {

@@ -291,7 +291,8 @@ func (v PrefsView) InternalExitNodePrior() tailcfg.StableNodeID { return v.ж.In
 func (v PrefsView) ExitNodeAllowLANAccess() bool { return v.ж.ExitNodeAllowLANAccess }
 
 // CorpDNS specifies whether to install the Tailscale network's
-// DNS configuration, if it exists.
+// DNS configuration, if it exists. It is the internal name for
+// the "tailscale set --accept-dns=" flag.
 func (v PrefsView) CorpDNS() bool { return v.ж.CorpDNS }
 
 // RunSSH bool is whether this node should run an SSH
@@ -440,6 +441,24 @@ func (v PrefsView) PostureChecking() bool { return v.ж.PostureChecking }
 // Linux-only.
 func (v PrefsView) NetfilterKind() string { return v.ж.NetfilterKind }
 
+// RemoteConfig, if true, delegates full remote control of this node's
+// prefs and LocalAPI to the tailnet admin via the control plane. When
+// enabled, the control server can read and edit any of this node's
+// prefs at any time, and invoke any LocalAPI endpoint on this node,
+// without any further local consent (no CLI or GUI confirmation).
+//
+// This is an alternative to Tailscale's default per-feature double
+// opt-in model, in which both the tailnet admin and the local machine
+// owner must agree to each individual setting change. RemoteConfig is
+// a single client-side "I trust the tailnet admin" switch that hands
+// over full remote management of this node.
+//
+// Only enable this when the tailnet admin owns the machine (e.g. a
+// corporate fleet device) or the local user has explicitly delegated
+// full control to the tailnet admin. Do NOT enable this on personal
+// or BYOD devices where the tailnet admin is not fully trusted.
+func (v PrefsView) RemoteConfig() bool { return v.ж.RemoteConfig }
+
 // DriveShares are the configured DriveShares, stored in increasing order
 // by name.
 func (v PrefsView) DriveShares() views.SliceView[*drive.Share, drive.ShareView] {
@@ -501,6 +520,7 @@ var _PrefsViewNeedsRegeneration = Prefs(struct {
 	AppConnector               AppConnectorPrefs
 	PostureChecking            bool
 	NetfilterKind              string
+	RemoteConfig               bool
 	DriveShares                []*drive.Share
 	RelayServerPort            *uint16
 	RelayServerStaticEndpoints []netip.AddrPort
@@ -804,7 +824,10 @@ func (v TCPPortHandlerView) HTTPS() bool { return v.ж.HTTPS }
 // It is mutually exclusive with TCPForward.
 func (v TCPPortHandlerView) HTTP() bool { return v.ж.HTTP }
 
-// TCPForward is the IP:port to forward TCP connections to.
+// TCPForward is the address to forward TCP connections to.
+// It is either a host:port (e.g. "127.0.0.1:3128", "localhost:5432")
+// or a Unix socket path prefixed with "unix:"
+// (e.g. "unix:/var/run/app.sock" or "unix:relative.sock").
 // Whether or not TLS is terminated by tailscaled depends on
 // TerminateTLS.
 //

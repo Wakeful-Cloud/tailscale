@@ -32,7 +32,7 @@ import (
 	"tailscale.com/ipn/store"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/bakedroots"
-	"tailscale.com/tempfork/acme"
+	xacme "tailscale.com/tempfork/acme"
 	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
@@ -187,6 +187,25 @@ type TLSCertKeyReader interface {
 	ReadTLSCertAndKey(domain string) ([]byte, []byte, error)
 }
 
+// ARIReplacesAllower is optionally implemented by state stores to opt
+// out of the ARI "replaces" hint on a per-domain basis at renewal time.
+// When implemented and returning false, the renewal path submits a plain
+// newOrder instead of claiming renewal exemption via "replaces".
+//
+// Used by the k8s cert-share store to prevent submitting a "replaces"
+// claim that Let's Encrypt would reject because the current ACME
+// account did not issue the previous cert (which can happen when a
+// shared per-tailnet account key is adopted after a cert was already
+// issued by a per-pod account). See #18251.
+type ARIReplacesAllower interface {
+	// ShouldUseARIReplacesForRenewal reports whether the renewal order
+	// for domain should carry the ARI "replaces" hint. It is advisory:
+	// a non-nil error means eligibility could not be determined, not
+	// that the hint should be skipped, and callers fail open (use the
+	// hint) in that case.
+	ShouldUseARIReplacesForRenewal(domain string) (bool, error)
+}
+
 func (s certStateStore) Read(domain string, now time.Time) (*ipnlocal.TLSCertKeyPair, error) {
 	// If we're using a store that supports atomic reads, use that
 	if kr, ok := s.StateStore.(TLSCertKeyReader); ok {
@@ -213,6 +232,16 @@ func (s certStateStore) Read(domain string, now time.Time) (*ipnlocal.TLSCertKey
 		return nil, errCertExpired
 	}
 	return &ipnlocal.TLSCertKeyPair{CertPEM: certPEM, KeyPEM: keyPEM, Cached: true}, nil
+}
+
+// ShouldUseARIReplacesForRenewal delegates to the underlying state store
+// if it implements [ARIReplacesAllower]. Stores that don't opt in default
+// to true (attempt "replaces"), preserving the pre-hook behaviour.
+func (s certStateStore) ShouldUseARIReplacesForRenewal(domain string) (bool, error) {
+	if a, ok := s.StateStore.(ARIReplacesAllower); ok {
+		return a.ShouldUseARIReplacesForRenewal(domain)
+	}
+	return true, nil
 }
 
 func (s certStateStore) WriteCert(domain string, cert []byte) error {
@@ -329,7 +358,12 @@ func parsePrivateKey(der []byte) (crypto.Signer, error) {
 	return nil, errors.New("acme/autocert: failed to parse private key")
 }
 
-func acmeKey(cs certStore) (crypto.Signer, error) {
+func (e *extension) acmeKey(cs certStore) (crypto.Signer, error) {
+	// Lock so two callers don't both generate a key and race on the
+	// write.
+	e.accountMu.Lock()
+	defer e.accountMu.Unlock()
+
 	if v, err := cs.ACMEKey(); err == nil {
 		priv, _ := pem.Decode(v)
 		if priv == nil || !strings.Contains(priv.Type, "PRIVATE") {
@@ -354,15 +388,15 @@ func acmeKey(cs certStore) (crypto.Signer, error) {
 	return privKey, nil
 }
 
-func acmeClient(cs certStore) (*acme.Client, error) {
-	key, err := acmeKey(cs)
+func (e *extension) acmeClient(cs certStore) (*xacme.Client, error) {
+	key, err := e.acmeKey(cs)
 	if err != nil {
 		return nil, fmt.Errorf("acmeKey: %w", err)
 	}
 	// Note: if we add support for additional ACME providers (other than
 	// LetsEncrypt), we should make sure that they support ARI extension (see
 	// shouldStartDomainRenewalARI).
-	return &acme.Client{
+	return &xacme.Client{
 		Key:          key,
 		UserAgent:    "tailscaled/" + version.Long(),
 		DirectoryURL: envknob.String("TS_DEBUG_ACME_DIRECTORY_URL"),
@@ -440,5 +474,5 @@ func validateLeaf(leaf *x509.Certificate, intermediates *x509.CertPool, domain s
 }
 
 func isDefaultDirectoryURL(u string) bool {
-	return u == "" || u == acme.LetsEncryptURL
+	return u == "" || u == xacme.LetsEncryptURL
 }

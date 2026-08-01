@@ -169,7 +169,7 @@ func gen(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named) {
 			writef("}")
 		case *types.Map:
 			elem := ft.Elem()
-			if sliceType, isSlice := elem.(*types.Slice); isSlice {
+			if sliceType, isSlice := elem.Underlying().(*types.Slice); isSlice {
 				n := it.QualifiedName(sliceType.Elem())
 				writef("if dst.%s != nil {", fname)
 				writef("\tdst.%s = map[%s]%s{}", fname, it.QualifiedName(ft.Key()), it.QualifiedName(elem))

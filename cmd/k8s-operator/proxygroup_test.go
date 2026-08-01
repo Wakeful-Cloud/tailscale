@@ -35,6 +35,7 @@ import (
 	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/reconciler/proxyclass"
 	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/k8s-proxy/conf"
 	"tailscale.com/kube/kubetypes"
@@ -610,8 +611,8 @@ func TestProxyGroupWithStaticEndpoints(t *testing.T) {
 					Conditions: []metav1.Condition{{
 						Type:               string(tsapi.ProxyClassReady),
 						Status:             metav1.ConditionTrue,
-						Reason:             reasonProxyClassValid,
-						Message:            reasonProxyClassValid,
+						Reason:             proxyclass.ReasonProxyClassValid,
+						Message:            proxyclass.ReasonProxyClassValid,
 						LastTransitionTime: metav1.Time{Time: cl.Now().Truncate(time.Second)},
 					}},
 				},
@@ -968,8 +969,8 @@ func TestProxyGroup(t *testing.T) {
 			Conditions: []metav1.Condition{{
 				Type:               string(tsapi.ProxyClassReady),
 				Status:             metav1.ConditionTrue,
-				Reason:             reasonProxyClassValid,
-				Message:            reasonProxyClassValid,
+				Reason:             proxyclass.ReasonProxyClassValid,
+				Message:            proxyclass.ReasonProxyClassValid,
 				LastTransitionTime: metav1.Time{Time: cl.Now().Truncate(time.Second)},
 			}},
 		}
@@ -1136,14 +1137,15 @@ func TestProxyGroupTypes(t *testing.T) {
 
 	zl, _ := zap.NewDevelopment()
 	reconciler := &ProxyGroupReconciler{
-		tsNamespace:       tsNamespace,
-		tsProxyImage:      testProxyImage,
-		Client:            fc,
-		log:               zl.Sugar(),
-		clients:           tsclient.NewProvider(&fakeTSClient{}),
-		clock:             tstest.NewClock(tstest.ClockOpts{}),
-		authKeyRateLimits: make(map[string]*rate.Limiter),
-		authKeyReissuing:  make(map[string]bool),
+		tsNamespace:          tsNamespace,
+		tsProxyImage:         testProxyImage,
+		Client:               fc,
+		log:                  zl.Sugar(),
+		clients:              tsclient.NewProvider(&fakeTSClient{}),
+		clock:                tstest.NewClock(tstest.ClockOpts{}),
+		authKeyRateLimits:    make(map[string]*rate.Limiter),
+		authKeyReissuing:     make(map[string]bool),
+		sharedACMEAccountKey: true,
 	}
 
 	t.Run("egress_type", func(t *testing.T) {
@@ -1263,6 +1265,9 @@ func TestProxyGroupTypes(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "test-ingress",
 				UID:  "test-ingress-uid",
+				Annotations: map[string]string{
+					AnnotationShareACMEAccount: "true",
+				},
 			},
 			Spec: tsapi.ProxyGroupSpec{
 				Type:     tsapi.ProxyGroupTypeIngress,
@@ -1283,6 +1288,44 @@ func TestProxyGroupTypes(t *testing.T) {
 		verifyEnvVar(t, sts, "TS_INTERNAL_APP", kubetypes.AppProxyGroupIngress)
 		verifyEnvVar(t, sts, "TS_SERVE_CONFIG", "/etc/proxies/serve-config.json")
 		verifyEnvVar(t, sts, "TS_EXPERIMENTAL_CERT_SHARE", "true")
+		verifyEnvVar(t, sts, "TS_ACME_ACCOUNT_SECRET_NAME", kubetypes.ACMEAccountsSecretName)
+		// pg.Spec.Tailnet is empty here so the default tailnet field is used.
+		verifyEnvVar(t, sts, "TS_ACME_ACCOUNT_FIELD", kubetypes.ACMEAccountDefaultKey+kubetypes.ACMEAccountKeySuffix)
+		// TS_DEBUG_ACME_FORCE_RENEWAL must NOT be set when the PG is
+		// opted in to the shared ACME account.
+		for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "TS_DEBUG_ACME_FORCE_RENEWAL" {
+				t.Errorf("TS_DEBUG_ACME_FORCE_RENEWAL must not be set on ingress ProxyGroup pods that share an ACME account")
+			}
+		}
+
+		// Verify the shared ACME accounts Secret exists and has the
+		// deletion finalizer (see tailscale/tailscale#18251).
+		acmeSecret := &corev1.Secret{}
+		if err := fc.Get(t.Context(), client.ObjectKey{Namespace: tsNamespace, Name: kubetypes.ACMEAccountsSecretName}, acmeSecret); err != nil {
+			t.Errorf("failed to get shared ACME accounts Secret: %v", err)
+		}
+		if !slices.Contains(acmeSecret.Finalizers, kubetypes.ACMEAccountsFinalizer) {
+			t.Errorf("shared ACME accounts Secret missing finalizer %q (got %v)", kubetypes.ACMEAccountsFinalizer, acmeSecret.Finalizers)
+		}
+
+		// Verify the per-ProxyGroup Role grants access to the shared
+		// ACME accounts Secret (write replicas need it to read/write the
+		// per-tailnet account key).
+		role := &rbacv1.Role{}
+		if err := fc.Get(t.Context(), client.ObjectKey{Namespace: tsNamespace, Name: pg.Name}, role); err != nil {
+			t.Fatalf("failed to get ProxyGroup Role: %v", err)
+		}
+		var sawACMEAccess bool
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.Verbs, "patch") && slices.Contains(rule.ResourceNames, kubetypes.ACMEAccountsSecretName) {
+				sawACMEAccess = true
+				break
+			}
+		}
+		if !sawACMEAccess {
+			t.Errorf("ProxyGroup Role does not grant patch access to %q", kubetypes.ACMEAccountsSecretName)
+		}
 
 		// Verify ConfigMap volume mount
 		cmName := fmt.Sprintf("%s-ingress-config", pg.Name)
@@ -1312,6 +1355,60 @@ func TestProxyGroupTypes(t *testing.T) {
 		}
 	})
 
+	t.Run("ingress_type_shared_acme_opt_out", func(t *testing.T) {
+		// The reconciler has sharedACMEAccountKey=true, so ingress PGs
+		// default to shared. Explicit tailscale.com/share-acme-account=false
+		// must opt this PG out: no shared-Secret env vars, no Role
+		// access to the shared Secret, and TS_DEBUG_ACME_FORCE_RENEWAL
+		// must still be set so ARI "replaces" doesn't silently fail.
+		pg := &tsapi.ProxyGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-ingress-optout",
+				UID:  "test-ingress-optout-uid",
+				Annotations: map[string]string{
+					AnnotationShareACMEAccount: "false",
+				},
+			},
+			Spec: tsapi.ProxyGroupSpec{
+				Type:     tsapi.ProxyGroupTypeIngress,
+				Replicas: new(int32(0)),
+			},
+		}
+		if err := fc.Create(t.Context(), pg); err != nil {
+			t.Fatal(err)
+		}
+		expectReconciled(t, reconciler, "", pg.Name)
+
+		sts := &appsv1.StatefulSet{}
+		if err := fc.Get(t.Context(), client.ObjectKey{Namespace: tsNamespace, Name: pg.Name}, sts); err != nil {
+			t.Fatalf("failed to get StatefulSet: %v", err)
+		}
+		for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+			switch e.Name {
+			case "TS_ACME_ACCOUNT_SECRET_NAME", "TS_ACME_ACCOUNT_FIELD":
+				t.Errorf("env %q unexpectedly present on opt-out PG", e.Name)
+			}
+		}
+		var sawForceRenewal bool
+		for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "TS_DEBUG_ACME_FORCE_RENEWAL" {
+				sawForceRenewal = true
+			}
+		}
+		if !sawForceRenewal {
+			t.Errorf("TS_DEBUG_ACME_FORCE_RENEWAL must be set on opt-out PG (avoids silent ARI \"replaces\" rejection)")
+		}
+		role := &rbacv1.Role{}
+		if err := fc.Get(t.Context(), client.ObjectKey{Namespace: tsNamespace, Name: pg.Name}, role); err != nil {
+			t.Fatalf("failed to get ProxyGroup Role: %v", err)
+		}
+		for _, rule := range role.Rules {
+			if slices.Contains(rule.ResourceNames, kubetypes.ACMEAccountsSecretName) {
+				t.Errorf("opt-out PG Role must not grant access to %q", kubetypes.ACMEAccountsSecretName)
+			}
+		}
+	})
+
 	t.Run("kubernetes_api_server_type", func(t *testing.T) {
 		pg := &tsapi.ProxyGroup{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1331,7 +1428,7 @@ func TestProxyGroupTypes(t *testing.T) {
 		}
 
 		expectReconciled(t, reconciler, "", pg.Name)
-		verifyProxyGroupCounts(t, reconciler, 1, 2, 1)
+		verifyProxyGroupCounts(t, reconciler, 2, 2, 1)
 
 		sts := &appsv1.StatefulSet{}
 		if err := fc.Get(t.Context(), client.ObjectKey{Namespace: tsNamespace, Name: pg.Name}, sts); err != nil {
@@ -1985,8 +2082,8 @@ func setProxyClassReady(t *testing.T, fc client.Client, cl *tstest.Clock, name s
 		Conditions: []metav1.Condition{{
 			Type:               string(tsapi.ProxyClassReady),
 			Status:             metav1.ConditionTrue,
-			Reason:             reasonProxyClassValid,
-			Message:            reasonProxyClassValid,
+			Reason:             proxyclass.ReasonProxyClassValid,
+			Message:            proxyclass.ReasonProxyClassValid,
 			LastTransitionTime: metav1.Time{Time: cl.Now().Truncate(time.Second)},
 			ObservedGeneration: pc.Generation,
 		}},
@@ -2036,10 +2133,11 @@ func verifyEnvVarNotPresent(t *testing.T, sts *appsv1.StatefulSet, name string) 
 func expectProxyGroupResources(t *testing.T, fc client.WithWatch, pg *tsapi.ProxyGroup, shouldExist bool, proxyClass *tsapi.ProxyClass) {
 	t.Helper()
 
-	role := pgRole(pg, tsNamespace)
+	shareACMEAccount := pg.Annotations[AnnotationShareACMEAccount] == "true"
+	role := pgRole(pg, tsNamespace, shareACMEAccount)
 	roleBinding := pgRoleBinding(pg, tsNamespace)
 	serviceAccount := pgServiceAccount(pg, tsNamespace)
-	statefulSet, err := pgStatefulSet(pg, tsNamespace, testProxyImage, "auto", nil, proxyClass)
+	statefulSet, err := pgStatefulSet(pg, tsNamespace, testProxyImage, "auto", nil, proxyClass, shareACMEAccount)
 	if err != nil {
 		t.Fatal(err)
 	}

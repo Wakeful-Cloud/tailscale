@@ -68,6 +68,12 @@ const (
 
 	AnnotationProxyGroup = "tailscale.com/proxy-group"
 
+	// AnnotationShareACMEAccount opts a single ProxyGroup into ("true")
+	// or out of ("false") using the shared per-tailnet ACME account key.
+	// When absent, OPERATOR_SHARED_ACME_ACCOUNT_KEY on the operator is
+	// the default. See tailscale/tailscale#18251.
+	AnnotationShareACMEAccount = "tailscale.com/share-acme-account"
+
 	// Annotations settable by users on ingresses.
 	AnnotationFunnel       = "tailscale.com/funnel"
 	AnnotationHTTPRedirect = "tailscale.com/http-redirect"
@@ -993,7 +999,7 @@ func enableEndpoints(ss *appsv1.StatefulSet, metrics, debug bool) {
 		if isMainContainer(&c) {
 			if debug {
 				ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env,
-					// Serve tailscaled's debug metrics on on
+					// Serve tailscaled's debug metrics on
 					// <pod-ip>:9001/debug/metrics. If we didn't specify Pod IP
 					// here, the proxy would, in some cases, also listen to its
 					// Tailscale IP- we don't want folks to start relying on this

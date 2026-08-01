@@ -97,6 +97,9 @@ type Env struct {
 	selfSignedDERPCertPinning bool // serve test DERP map with sha256-raw cert pins
 	fakeACME                  bool // point tailscaled at vnet's fake ACME server
 
+	controlDNSDomain string             // MagicDNS domain for the test control server (see ControlDNS)
+	controlDNS       *tailcfg.DNSConfig // DNS config for the test control server (see ControlDNS)
+
 	// Shared resource initialization (sync.Once for things multiple nodes share).
 	vnetOnce      sync.Once
 	gokrazyOnce   sync.Once
@@ -403,6 +406,16 @@ func FakeACME() EnvOption {
 	return envOptFunc(func(e *Env) { e.fakeACME = true })
 }
 
+// ControlDNS returns an [EnvOption] that makes the test control server send
+// the given DNS configuration in MapResponses, with node names placed under
+// the given MagicDNS domain (e.g. "tailnet.test").
+func ControlDNS(magicDNSDomain string, cfg *tailcfg.DNSConfig) EnvOption {
+	return envOptFunc(func(e *Env) {
+		e.controlDNSDomain = magicDNSDomain
+		e.controlDNS = cfg
+	})
+}
+
 // AddNetwork creates a new virtual network. Arguments follow the same pattern as
 // vnet.Config.AddNetwork (string IPs, NAT types, NetworkService values).
 func (e *Env) AddNetwork(opts ...any) *vnet.Network {
@@ -428,11 +441,14 @@ type Node struct {
 	vnetNode         *vnet.Node // primary vnet node (set during Start)
 	agent            *vnet.NodeAgentClient
 	joinTailnet      bool
+	runSSH           bool // true to enable the node's Tailscale SSH server
 	noAgent          bool // true to skip TTA agent setup (e.g. macOS VMs without TTA)
+	systemdUnit      bool // true to run tailscaled via the stock systemd unit (Linux cloud VMs only)
 	advertiseRoutes  string
 	snatSubnetRoutes *bool // nil means default (true)
 	webServerPort    int
-	sshPort          int // host port for SSH debug access (cloud VMs only)
+	sshPort          int     // host port for SSH debug access (cloud VMs only)
+	dnsMode          DNSMode // desired Linux DNS backend to provision; "" means the image default
 }
 
 // AddNode creates a new VM node. The name is used for identification and as the
@@ -458,8 +474,12 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 		case nodeOptNoTailscale:
 			n.joinTailnet = false
 			vnetOpts = append(vnetOpts, vnet.DontJoinTailnet)
+		case nodeOptTailscaleSSH:
+			n.runSSH = true
 		case nodeOptNoAgent:
 			n.noAgent = true
+		case nodeOptSystemdUnit:
+			n.systemdUnit = true
 		case nodeOptAdvertiseRoutes:
 			n.advertiseRoutes = string(o)
 		case nodeOptSNATSubnetRoutes:
@@ -467,6 +487,13 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 			n.snatSubnetRoutes = &v
 		case nodeOptWebServer:
 			n.webServerPort = int(o)
+		case nodeOptDNSMode:
+			switch DNSMode(o) {
+			case DNSDefault, DNSDirect:
+			default:
+				e.t.Fatalf("AddNode(%q): unsupported DNSMode %q", name, DNSMode(o))
+			}
+			n.dnsMode = DNSMode(o)
 		default:
 			// Pass through to vnet (TailscaledEnv, NodeOption, MAC, etc.)
 			vnetOpts = append(vnetOpts, o)
@@ -479,11 +506,21 @@ func (e *Env) AddNode(name string, opts ...any) *Node {
 		})
 	}
 
+	if n.systemdUnit && (n.os.IsGokrazy || n.os.GOOS() != "linux") {
+		e.t.Fatalf("SystemdUnit is only supported on Linux cloud VMs; node %s is %s", name, n.os.Name)
+	}
+
 	// macOS VMs require a macOS arm64 host (Apple Virtualization.framework via
 	// tailmac). Skip the test now rather than letting it proceed through the
 	// rest of the setup only to fail later.
 	if n.os.IsMacOS && (runtime.GOOS != "darwin" || runtime.GOARCH != "arm64") {
 		e.t.Skipf("macOS VM tests require a macOS arm64 host (got %s/%s)", runtime.GOOS, runtime.GOARCH)
+	}
+
+	// Linux cloud images must declare a family; it drives distro-specific
+	// cloud-init provisioning. gokrazy and non-Linux images don't use that path.
+	if n.os.isLinuxCloudImage() && n.os.Family == "" {
+		e.t.Fatalf("AddNode(%q): Linux cloud image %q has no LinuxFamily set", name, n.os.Name)
 	}
 
 	n.vnetNode = e.cfg.AddNode(vnetOpts...)
@@ -515,10 +552,34 @@ func (n *Node) DropControlTraffic() {
 
 type nodeOptOS OSImage
 type nodeOptNoTailscale struct{}
+type nodeOptTailscaleSSH struct{}
 type nodeOptNoAgent struct{}
+type nodeOptSystemdUnit struct{}
 type nodeOptAdvertiseRoutes string
 type nodeOptSNATSubnetRoutes bool
 type nodeOptWebServer int
+type nodeOptDNSMode DNSMode
+
+// DNSMode is a provisioning directive, not a DNS-backend name: it says what, if
+// anything, to do to the guest's DNS before tailscaled starts, letting one
+// distro image cover multiple backends. DNSDefault leaves DNS untouched (the
+// resulting backend is image-dependent); the other modes provision the guest to
+// force a specific backend, and are named to match the mode strings in
+// net/dns/manager_linux.go so the result can be checked with
+// [Env.AssertDNSBackend].
+type DNSMode string
+
+const (
+	// DNSDefault leaves the image's DNS configuration untouched, so the backend
+	// is whatever the image runs by default (typically systemd-resolved on
+	// modern distros). It has no [Env.AssertDNSBackend] counterpart because the
+	// result isn't forced.
+	DNSDefault DNSMode = ""
+
+	// DNSDirect masks systemd-resolved and installs a plain /etc/resolv.conf
+	// so tailscaled selects the "direct" manager (rewrites resolv.conf itself).
+	DNSDirect DNSMode = "direct"
+)
 
 // OS returns a NodeOption that sets the node's operating system image.
 func OS(img OSImage) nodeOptOS { return nodeOptOS(img) }
@@ -526,10 +587,25 @@ func OS(img OSImage) nodeOptOS { return nodeOptOS(img) }
 // DontJoinTailnet returns a NodeOption that prevents the node from running tailscale up.
 func DontJoinTailnet() nodeOptNoTailscale { return nodeOptNoTailscale{} }
 
+// TailscaleSSH returns a NodeOption that enables the node's Tailscale SSH
+// server by passing --ssh to tailscale up. If any node has this option, the
+// test control server is configured with a permissive SSH policy that lets
+// any tailnet node connect as any SSH user, mapped to the same-named local
+// user.
+func TailscaleSSH() nodeOptTailscaleSSH { return nodeOptTailscaleSSH{} }
+
 // NoAgent returns a NodeOption that skips TTA agent setup. The node will not
 // have a test agent, so agent-dependent operations (Status, ExecOnNode, etc.)
 // won't work. Useful for VMs that just need to boot and respond to ICMP.
 func NoAgent() nodeOptNoAgent { return nodeOptNoAgent{} }
+
+// SystemdUnit returns a NodeOption that makes the node run tailscaled via the
+// stock systemd unit that Linux packages ship (cmd/tailscaled/tailscaled.service
+// with cmd/tailscaled/tailscaled.defaults as its EnvironmentFile), instead of
+// launching tailscaled directly as a background process. This exercises the
+// unit's sandboxing directives and its Type=notify readiness handshake.
+// It is only supported on Linux cloud VMs (e.g. Ubuntu, Debian).
+func SystemdUnit() nodeOptSystemdUnit { return nodeOptSystemdUnit{} }
 
 // AdvertiseRoutes returns a NodeOption that configures the node to advertise
 // the given routes (comma-separated CIDRs) when joining the tailnet.
@@ -547,10 +623,22 @@ func SNATSubnetRoutes(v bool) nodeOptSNATSubnetRoutes { return nodeOptSNATSubnet
 // The webserver responds with "Hello world I am <nodename> from <sourceIP>" on all requests.
 func WebServer(port int) nodeOptWebServer { return nodeOptWebServer(port) }
 
+// WithDNSMode returns a NodeOption that provisions the (Linux) node so
+// tailscaled selects the given DNS backend. Only meaningful for Linux cloud
+// images; ignored for gokrazy/macOS. See [DNSMode].
+func WithDNSMode(m DNSMode) nodeOptDNSMode { return nodeOptDNSMode(m) }
+
 // Start initializes the virtual network, boots all VMs in parallel, and waits
 // for all TTA agents to connect. It should be called after all AddNetwork/AddNode calls.
 func (e *Env) Start() {
 	t := e.t
+
+	// Give bring-up (image build, boot, agent wait) a generous budget measured
+	// from now. We deliberately do NOT derive this from the test deadline: on
+	// CI, per-test timeouts can be tight (a few minutes), and reserving headroom
+	// under the deadline was observed to steal time bring-up legitimately needs,
+	// failing slow-but-healthy runs. If bring-up genuinely exceeds this, the
+	// `go test -timeout` panic is an acceptable (if blunt) backstop.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	t.Cleanup(cancel)
 	e.ctx = ctx
@@ -593,7 +681,14 @@ func (e *Env) Start() {
 	// Boot all nodes in parallel. Each platform handles its own
 	// dependencies (image prep, binary compilation, socket setup)
 	// via sync.Once, so independent work overlaps naturally.
+	//
+	// Under TCG, concurrent boots oversubscribe the host CPUs and a heavy
+	// guest can starve its siblings past the stuck-detector; serialize boots
+	// there so each clears that gate before the next starts. KVM stays parallel.
 	var bootEg errgroup.Group
+	if !hardwareAccelAvailable() {
+		bootEg.SetLimit(1)
+	}
 	for _, n := range e.nodes {
 		bootEg.Go(func() error {
 			return n.platform().boot(ctx, e, n)
@@ -708,6 +803,9 @@ func (e *Env) tailscaleUp(ctx context.Context, n *Node) error {
 	url := "http://unused/up?accept-routes=true"
 	if n.advertiseRoutes != "" {
 		url += "&advertise-routes=" + n.advertiseRoutes
+	}
+	if n.runSSH {
+		url += "&ssh=true"
 	}
 	if n.snatSubnetRoutes != nil {
 		if *n.snatSubnetRoutes {
@@ -872,7 +970,7 @@ func (e *Env) BringUpMullvadWGServer(n *Node, gw netip.Prefix, listenPort uint16
 		e.t.Fatalf("BringUpMullvadWGServer(%s): %s: %s", n.name, res.Status, body)
 	}
 	var pubB64 string
-	for _, line := range strings.Split(string(body), "\n") {
+	for line := range strings.SplitSeq(string(body), "\n") {
 		if s, ok := strings.CutPrefix(strings.TrimSpace(line), "PUBKEY="); ok {
 			pubB64 = s
 			break
@@ -954,6 +1052,41 @@ func (e *Env) ClientMetrics(n *Node) ClientMetrics {
 		}
 	}
 	return out
+}
+
+// dnsBackendMetricPrefix is the prefix of the clientmetric gauge that
+// tailscaled sets to 1 for the Linux DNS mode it selected. See
+// net/dns/manager_linux.go.
+const dnsBackendMetricPrefix = "dns_manager_linux_mode_"
+
+// DNSBackend returns the Linux DNS backend ("mode") the node's tailscaled
+// selected (e.g. "systemd-resolved", "direct"). tailscaled sets a single gauge
+// named dns_manager_linux_mode_<mode> to 1 for its selected mode (see
+// net/dns/manager_linux.go); this finds that gauge and returns <mode>. It fails
+// the test if none is set (non-Linux node, or DNS not yet configured).
+func (e *Env) DNSBackend(n *Node) string {
+	e.t.Helper()
+	for name, m := range e.ClientMetrics(n) {
+		mode, ok := strings.CutPrefix(name, dnsBackendMetricPrefix)
+		if !ok || m.Value != 1 {
+			continue
+		}
+		// tailscaled sanitizes "-" to "_" when forming the metric name;
+		// reverse it so we return net/dns's spelling ("systemd-resolved").
+		return strings.ReplaceAll(mode, "_", "-")
+	}
+	e.t.Fatalf("Node %q: no %s* gauge set (non-Linux node, or DNS not yet configured)", n.Name(), dnsBackendMetricPrefix)
+	return ""
+}
+
+// AssertDNSBackend fails the test unless the node's selected Linux DNS backend
+// matches want (see [Env.DNSBackend] for the mode strings). Use it in distro
+// tests to prove the node exercises the intended DNS manager.
+func (e *Env) AssertDNSBackend(n *Node, want string) {
+	e.t.Helper()
+	if got := e.DNSBackend(n); got != want {
+		e.t.Fatalf("Node %q: DNS backend = %q, want %q", n.Name(), got, want)
+	}
 }
 
 // ClientMetrics is a view of the client metrics exported by a node.
@@ -1628,6 +1761,11 @@ func (e *Env) initVnet() {
 		if e.selfSignedDERPCertPinning {
 			e.server.ControlServer().DERPMap = e.buildSelfSignedDERPMap()
 		}
+		if e.controlDNS != nil {
+			cs := e.server.ControlServer()
+			cs.MagicDNSDomain = e.controlDNSDomain
+			cs.DNSConfig = e.controlDNS.Clone()
+		}
 		if e.fakeACME {
 			cs := e.server.ControlServer()
 			cs.MagicDNSDomain = "tailnet.test"
@@ -1635,6 +1773,19 @@ func (e *Env) initVnet() {
 				cs.DNSConfig = new(tailcfg.DNSConfig)
 			}
 			cs.DNSConfig.Proxied = true
+		}
+		for _, n := range e.nodes {
+			if n.runSSH {
+				e.server.ControlServer().SSHPolicy = &tailcfg.SSHPolicy{
+					Rules: []*tailcfg.SSHRule{{
+						Principals: []*tailcfg.SSHPrincipal{{Any: true}},
+						// Allow permissive login + root login by default
+						SSHUsers: map[string]string{"*": "=", "root": "root"},
+						Action:   &tailcfg.SSHAction{Accept: true},
+					}},
+				}
+				break
+			}
 		}
 	})
 }
@@ -2045,17 +2196,17 @@ func findKernelPath(goMod string) (string, error) {
 	}
 	goModCache := strings.TrimSpace(string(goModCacheB))
 
-	// Parse go.mod to find gokrazy-kernel version.
-	for _, line := range strings.Split(string(b), "\n") {
+	// Parse go.mod to find kernel version.
+	for line := range strings.SplitSeq(string(b), "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "github.com/tailscale/gokrazy-kernel") {
+		if strings.HasPrefix(line, "github.com/gokrazy/kernel.amd64") {
 			parts := strings.Fields(line)
 			if len(parts) >= 2 {
 				return filepath.Join(goModCache, parts[0]+"@"+parts[1], "vmlinuz"), nil
 			}
 		}
 	}
-	return "", fmt.Errorf("gokrazy-kernel not found in %s", goMod)
+	return "", fmt.Errorf("kernel.amd64 not found in %s", goMod)
 }
 
 // PingRoute describes what connection type was used to transfer a Disco ping.

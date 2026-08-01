@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
+	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
@@ -144,9 +146,19 @@ func TestResolversWithDelays(t *testing.T) {
 			want: o("https://dns.nextdns.io/c3a884"),
 		},
 		{
-			name: "controld-ipv6-expand",
+			// ID-encoded Control D addresses are legacy port-53-only
+			// endpoints (see #20433); they must not be upgraded to DoH and
+			// instead pass through as ordinary port-53 resolvers.
+			name: "controld-ipv6-id-encoded-not-doh",
 			in:   q("2606:1a40:0:6:7b5b:5949:35ad:0"),
-			want: o("https://dns.controld.com/hyq3ipr2ct"),
+			want: o("2606:1a40:0:6:7b5b:5949:35ad:0"),
+		},
+		{
+			// The free anycast resolvers (freedns.controld.com/pN) do serve
+			// DoH and are upgraded.
+			name: "controld-free-anycast-doh",
+			in:   q("2606:1a40::1"),
+			want: o("https://freedns.controld.com/p1", "2606:1a40::1+0.5s"),
 		},
 		{
 			name: "controld-doh-input",
@@ -224,6 +236,84 @@ func TestGetKnownDoHClientForProvider(t *testing.T) {
 	}
 	defer res.Body.Close()
 	t.Logf("Got: %+v", res)
+}
+
+// TestControlDPremiumDoHLive exercises the real DoH dial path against Control D's
+// live infrastructure for a premium resolver, to confirm end-to-end that we use
+// reachable DoH endpoints (see ESC-30: we previously synthesized per-resolver
+// IPv6 addresses that only speak plaintext DNS on port 53 and refuse :443).
+//
+// It is disabled by default and only runs when TS_TEST_CONTROLD_RESOLVER_ID is
+// set to a Control D premium resolver ID (the path component of a
+// https://dns.controld.com/<id> DoH URL). For example:
+//
+//	TS_TEST_CONTROLD_RESOLVER_ID=abc123 go test ./net/dns/resolver/ \
+//	    -run TestControlDPremiumDoHLive -v
+//
+// To reproduce the pre-fix failure, temporarily revert DoHIPsOfBase to return
+// the controlDv6Gen-synthesized addresses: on an IPv6-only network this test
+// then fails with a connection error instead of a successful response.
+func TestControlDPremiumDoHLive(t *testing.T) {
+	id := os.Getenv("TS_TEST_CONTROLD_RESOLVER_ID")
+	if id == "" {
+		t.Skip("set TS_TEST_CONTROLD_RESOLVER_ID=<premium resolver id> to run")
+	}
+
+	logf := tstest.WhileTestRunningLogger(t)
+	bus := eventbustest.NewBus(t)
+	netMon, err := netmon.New(bus, logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialer tsdial.Dialer
+	dialer.SetNetMon(netMon)
+	dialer.SetBus(bus)
+	fwd := newForwarder(logf, netMon, nil, &dialer, health.NewTracker(bus), nil)
+
+	urlBase := "https://dns.controld.com/" + id
+	c, ok := fwd.getKnownDoHClientForProvider(urlBase)
+	if !ok {
+		t.Fatalf("no known DoH client for %q", urlBase)
+	}
+	t.Logf("dialing DoH IPs: %v", publicdns.DoHIPsOfBase(urlBase))
+
+	// Build an A query for example.com.
+	builder := dns.NewBuilder(nil, dns.Header{RecursionDesired: true})
+	builder.StartQuestions()
+	if err := builder.Question(dns.Question{
+		Name:  dns.MustNewName("example.com."),
+		Type:  dns.TypeA,
+		Class: dns.ClassINET,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query, err := builder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, err := fwd.sendDoH(ctx, urlBase, c, query)
+	if err != nil {
+		t.Fatalf("sendDoH: %v", err)
+	}
+	if rcode := getRCode(res); rcode != dns.RCodeSuccess {
+		t.Fatalf("got rcode %v, want success", rcode)
+	}
+
+	var p dns.Parser
+	if _, err := p.Start(res); err != nil {
+		t.Fatalf("parsing response: %v", err)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatalf("skipping questions: %v", err)
+	}
+	if _, err := p.AnswerHeader(); err != nil {
+		t.Fatalf("no answers returned: %v", err)
+	}
+	t.Logf("ControlD premium DoH query for example.com succeeded (%d bytes)", len(res))
 }
 
 func BenchmarkNameFromQuery(b *testing.B) {
@@ -671,10 +761,7 @@ func makeResponseOfSize(tb testing.TB, domain string, targetSize int, includeOPT
 	if includeOPT {
 		baseSize += 11 // OPT record adds ~11 bytes
 	}
-	estimatedRecords := (targetSize - baseSize) / bytesPerRecord
-	if estimatedRecords < 1 {
-		estimatedRecords = 1
-	}
+	estimatedRecords := max((targetSize-baseSize)/bytesPerRecord, 1)
 
 	// Start with estimated records and adjust
 	txtLen := 200
@@ -741,10 +828,7 @@ func makeResponseOfSize(tb testing.TB, domain string, targetSize int, includeOPT
 			// If we need too many records, increase TXT length instead
 			txtLen = 255         // Max single TXT string length
 			bytesPerRecord = 280 // Adjusted estimate
-			estimatedRecords = (targetSize - baseSize) / bytesPerRecord
-			if estimatedRecords < 1 {
-				estimatedRecords = 1
-			}
+			estimatedRecords = max((targetSize-baseSize)/bytesPerRecord, 1)
 		}
 	}
 

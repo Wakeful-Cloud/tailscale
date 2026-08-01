@@ -57,7 +57,8 @@ type egressProxy struct {
 
 	netmapChan chan netmapState // chan to receive netmap state updates on
 
-	podIPv4 string // never empty string, currently only IPv4 is supported
+	podIPv4 string // empty if Pod does not have IPv4 address
+	podIPv6 string // empty if Pod does not have IPv6 address
 
 	// tailnetFQDNs is the egress service FQDN to tailnet IP mappings that
 	// were last used to configure firewall rules for this proxy.
@@ -138,6 +139,7 @@ type egressProxyRunOpts struct {
 	stateSecret  string
 	netmapChan   chan netmapState
 	podIPv4      string
+	podIPv6      string
 	tailnetAddrs []netip.Prefix
 }
 
@@ -150,6 +152,7 @@ func (ep *egressProxy) configure(opts egressProxyRunOpts) {
 	ep.stateSecret = opts.stateSecret
 	ep.netmapChan = opts.netmapChan
 	ep.podIPv4 = opts.podIPv4
+	ep.podIPv6 = opts.podIPv6
 	ep.tailnetAddrs = opts.tailnetAddrs
 	ep.client = &http.Client{} // default HTTP client
 	sleepDuration := time.Second
@@ -418,7 +421,7 @@ func (ep *egressProxy) getStatus(ctx context.Context) (*egressservices.Status, e
 	if err := json.Unmarshal([]byte(raw), status); err != nil {
 		return nil, fmt.Errorf("error unmarshalling previous config: %w", err)
 	}
-	if reflect.DeepEqual(status.PodIPv4, ep.podIPv4) {
+	if status.PodIPv4 == ep.podIPv4 && status.PodIPv6 == ep.podIPv6 {
 		return status, nil
 	}
 	return nil, nil
@@ -432,6 +435,7 @@ func (ep *egressProxy) setStatus(ctx context.Context, status *egressservices.Sta
 		status = &egressservices.Status{}
 	}
 	status.PodIPv4 = ep.podIPv4
+	status.PodIPv6 = ep.podIPv6
 	secret, err := ep.kc.GetSecret(ctx, ep.stateSecret)
 	if err != nil {
 		return fmt.Errorf("error retrieving state Secret: %w", err)
@@ -622,6 +626,8 @@ func servicesStatusIsEqual(st, st1 *egressservices.Status) bool {
 	}
 	st.PodIPv4 = ""
 	st1.PodIPv4 = ""
+	st.PodIPv6 = ""
+	st1.PodIPv6 = ""
 	return reflect.DeepEqual(*st, *st1)
 }
 
@@ -673,24 +679,29 @@ func (ep *egressProxy) waitTillSafeToShutdown(ctx context.Context, cfgs egressse
 			continue
 		}
 		svc := s
+		// TODO(beckypauley): In dual-stack clusters, this is a best-effort check as we do not control which IP family is used.
+		// This confirms removal from routing on this node for one family only. The other IP family then relies on the longSleep below.
 		wg.Go(func() {
 			log.Printf("Ensuring that cluster traffic is no longer routed to %q via this Pod...", svc)
+			podIP, header := ep.podIPv4, kubetypes.PodIPv4Header
+			if podIP == "" {
+				podIP, header = ep.podIPv6, kubetypes.PodIPv6Header
+			}
+			if ep.podDrained(ctx, svc, hep, podIP, header, hp) {
+				return
+			}
+			ticker := time.NewTicker(ep.shortSleep)
+			defer ticker.Stop()
 			for {
-				if ctx.Err() != nil { // kubelet's HTTP request timeout
+				select {
+				case <-ctx.Done(): // kubelet's HTTP request timeout
 					log.Printf("Cluster traffic for %s did not stop being routed to this Pod.", svc)
 					return
+				case <-ticker.C:
+					if ep.podDrained(ctx, svc, hep, podIP, header, hp) {
+						return
+					}
 				}
-				found, err := lookupPodRoute(ctx, hep, ep.podIPv4, hp, ep.client)
-				if err != nil {
-					log.Printf("unable to reach endpoint %q, assuming the routing rules for this Pod have been deleted: %v", hep, err)
-					break
-				}
-				if !found {
-					log.Printf("service %q is no longer routed through this Pod", svc)
-					break
-				}
-				log.Printf("service %q is still routed through this Pod, waiting...", svc)
-				time.Sleep(ep.shortSleep)
 			}
 		})
 	}
@@ -704,9 +715,9 @@ func (ep *egressProxy) waitTillSafeToShutdown(ctx context.Context, cfgs egressse
 
 // lookupPodRoute calls the healthcheck endpoint repeat times and returns true if the endpoint returns with the podIP
 // header at least once.
-func lookupPodRoute(ctx context.Context, hep, podIP string, repeat int, client httpClient) (bool, error) {
+func lookupPodRoute(ctx context.Context, hep, podIP, podIPHeader string, repeat int, client httpClient) (bool, error) {
 	for range repeat {
-		f, err := lookup(ctx, hep, podIP, client)
+		f, err := lookup(ctx, hep, podIP, podIPHeader, client)
 		if err != nil {
 			return false, err
 		}
@@ -718,7 +729,7 @@ func lookupPodRoute(ctx context.Context, hep, podIP string, repeat int, client h
 }
 
 // lookup calls the healthcheck endpoint and returns true if the response contains the podIP header.
-func lookup(ctx context.Context, hep, podIP string, client httpClient) (bool, error) {
+func lookup(ctx context.Context, hep, podIP, podIPHeader string, client httpClient) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, httpm.GET, hep, nil)
 	if err != nil {
 		return false, fmt.Errorf("error creating new HTTP request: %v", err)
@@ -733,7 +744,7 @@ func lookup(ctx context.Context, hep, podIP string, client httpClient) (bool, er
 		return true, nil
 	}
 	defer resp.Body.Close()
-	gotIP := resp.Header.Get(kubetypes.PodIPv4Header)
+	gotIP := resp.Header.Get(podIPHeader)
 	return strings.EqualFold(podIP, gotIP), nil
 }
 
@@ -761,4 +772,18 @@ func (ep *egressProxy) getHEPPings() (int, error) {
 		return 0, nil
 	}
 	return hp, nil
+}
+
+func (ep *egressProxy) podDrained(ctx context.Context, svc, hep, podIP, header string, hp int) bool {
+	found, err := lookupPodRoute(ctx, hep, podIP, header, hp, ep.client)
+	if err != nil {
+		log.Printf("unable to reach endpoint %q, assuming the routing rules for this Pod have been deleted: %v", hep, err)
+		return true
+	}
+	if !found {
+		log.Printf("service %q is no longer routed through this Pod", svc)
+		return true
+	}
+	log.Printf("service %q is still routed through this Pod, waiting...", svc)
+	return false
 }

@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -726,6 +727,11 @@ func expectEqual[T any, O ptrObject[T]](t *testing.T, client client.Client, want
 	// so just remove it from both got and want.
 	got.SetResourceVersion("")
 	want.SetResourceVersion("")
+	// controller-runtime v0.20+ populates TypeMeta on objects returned by the
+	// fake client. Strip it so tests can continue to build expected objects
+	// without setting Kind/APIVersion explicitly.
+	got.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{})
+	want.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{})
 	for _, modifier := range modifiers {
 		modifier(want)
 		modifier(got)
@@ -982,6 +988,11 @@ func removeTargetPortsFromSvc(svc *corev1.Service) {
 		newPorts = append(newPorts, corev1.ServicePort{Protocol: p.Protocol, Port: p.Port, Name: p.Name})
 	}
 	svc.Spec.Ports = newPorts
+}
+
+func removeClusterIPsFromSvc(svc *corev1.Service) {
+	svc.Spec.ClusterIP = ""
+	svc.Spec.ClusterIPs = nil
 }
 
 func removeAuthKeyIfExistsModifier(t *testing.T) func(s *corev1.Secret) {

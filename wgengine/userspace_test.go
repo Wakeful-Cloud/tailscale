@@ -4,25 +4,34 @@
 package wgengine
 
 import (
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"math/rand"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"runtime"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tailscale/wireguard-go/device"
 	"go4.org/mem"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
+	"tailscale.com/derp"
+	"tailscale.com/derp/derpserver"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
@@ -89,7 +98,7 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 
 	routerCfg := &router.Config{}
 
-	for _, nodeHex := range []string{
+	for i, nodeHex := range []string{
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 	} {
@@ -101,18 +110,9 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 				},
 			}),
 		}
-		nk, err := key.ParseNodePublicUntyped(mem.S(nodeHex))
-		if err != nil {
-			t.Fatal(err)
-		}
 		cfg := &wgcfg.Config{
-			Peers: []wgcfg.Peer{
-				{
-					PublicKey: nk,
-					AllowedIPs: []netip.Prefix{
-						netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
-					},
-				},
+			Addresses: []netip.Prefix{
+				netip.PrefixFrom(netaddr.IPv4(100, 100, 99, byte(1+i)), 32),
 			},
 		}
 
@@ -124,80 +124,35 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 	}
 }
 
-func TestUserspaceEngineTSMPLearned(t *testing.T) {
-	bus := eventbustest.NewBus(t)
-
-	ht := health.NewTracker(bus)
-	reg := new(usermetric.Registry)
-	e, err := NewFakeUserspaceEngine(t.Logf, 0, ht, reg, bus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(e.Close)
-	ue := e.(*userspaceEngine)
-
-	discoChangedChan := make(chan map[key.NodePublic]bool, 1)
-	ue.testDiscoChangedHook = func(m map[key.NodePublic]bool) {
-		discoChangedChan <- m
-	}
-
-	routerCfg := &router.Config{}
-
-	keyChanges := []struct {
-		tsmp  bool
-		inMap bool
-	}{
-		{tsmp: false, inMap: false},
-		{tsmp: true, inMap: false},
-		{tsmp: false, inMap: true},
-	}
-
-	nkHex := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	for _, change := range keyChanges {
-		oldDisco := key.NewDisco()
-		nm := &netmap.NetworkMap{
-			Peers: nodeViews([]*tailcfg.Node{
-				{
-					ID:       1,
-					Key:      nkFromHex(nkHex),
-					DiscoKey: oldDisco.Public(),
-				},
-			}),
-		}
-		nk, err := key.ParseNodePublicUntyped(mem.S(nkHex))
-		if err != nil {
-			t.Fatal(err)
-		}
-		e.SetSelfNode(nm.SelfNode)
-
-		newDisco := key.NewDisco()
-		cfg := &wgcfg.Config{
-			Peers: []wgcfg.Peer{
-				{
-					PublicKey: nk,
-					DiscoKey:  newDisco.Public(),
-				},
-			},
-		}
-
-		if change.tsmp {
-			ue.PatchDiscoKey(nk, newDisco.Public())
-		}
-		err = e.Reconfig(cfg, routerCfg, &dns.Config{})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		changeMap := <-discoChangedChan
-
-		if _, ok := changeMap[nk]; ok != change.inMap {
-			t.Fatalf("expect key %v in map %v to be %t, got %t", nk, changeMap,
-				change.inMap, ok)
-		}
-	}
+// failingRouter is a router.Router whose Set always fails, used to verify that
+// DNS configuration is still attempted when router configuration fails.
+type failingRouter struct {
+	err error
 }
 
-func TestUserspaceEngineTSMPLearnedMismatch(t *testing.T) {
+func (failingRouter) Up() error                  { return nil }
+func (r failingRouter) Set(*router.Config) error { return r.err }
+func (failingRouter) Close() error               { return nil }
+
+// recordingOSConfigurator is a dns.OSConfigurator that records whether SetDNS
+// was called.
+type recordingOSConfigurator struct {
+	setDNSCalled bool
+}
+
+func (c *recordingOSConfigurator) SetDNS(dns.OSConfig) error { c.setDNSCalled = true; return nil }
+func (c *recordingOSConfigurator) SupportsSplitDNS() bool    { return false }
+func (c *recordingOSConfigurator) Close() error              { return nil }
+func (c *recordingOSConfigurator) GetBaseConfig() (dns.OSConfig, error) {
+	return dns.OSConfig{}, dns.ErrGetBaseConfigNotSupported
+}
+
+// TestUserspaceEngineReconfigDNSAfterRouterError verifies that a router.Set
+// failure does not prevent DNS from being configured. Historically Reconfig
+// returned on router error before dns.Set ran, so MagicDNS was never
+// configured on hosts where router config failed on every reconfig. See
+// tailscale/tailscale#20447.
+func TestUserspaceEngineReconfigDNSAfterRouterError(t *testing.T) {
 	bus := eventbustest.NewBus(t)
 
 	ht := health.NewTracker(bus)
@@ -209,79 +164,29 @@ func TestUserspaceEngineTSMPLearnedMismatch(t *testing.T) {
 	t.Cleanup(e.Close)
 	ue := e.(*userspaceEngine)
 
-	discoChangedChan := make(chan map[key.NodePublic]bool, 1)
-	ue.testDiscoChangedHook = func(m map[key.NodePublic]bool) {
-		discoChangedChan <- m
+	routerErr := fmt.Errorf("router boom")
+	ue.router = failingRouter{err: routerErr}
+
+	osCfg := &recordingOSConfigurator{}
+	ue.dns = dns.NewManager(t.Logf, osCfg, ht, ue.dialer, nil, nil, runtime.GOOS, bus)
+
+	nm := &netmap.NetworkMap{
+		Peers: nodeViews([]*tailcfg.Node{{ID: 1, Key: nkFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}}),
 	}
-
-	routerCfg := &router.Config{}
-	var metricValue int64 = 0
-
-	keyChanges := []struct {
-		tsmp     bool
-		inMap    bool
-		wrongKey bool
-	}{
-		{tsmp: false, inMap: false, wrongKey: false},
-		{tsmp: true, inMap: false, wrongKey: false},
-		{tsmp: true, inMap: true, wrongKey: true},
-		{tsmp: false, inMap: true, wrongKey: false},
+	cfg := &wgcfg.Config{
+		Addresses: []netip.Prefix{netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32)},
 	}
+	e.SetSelfNode(nm.SelfNode)
 
-	nkHex := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	for _, change := range keyChanges {
-		oldDisco := key.NewDisco()
-		nm := &netmap.NetworkMap{
-			Peers: nodeViews([]*tailcfg.Node{
-				{
-					ID:       1,
-					Key:      nkFromHex(nkHex),
-					DiscoKey: oldDisco.Public(),
-				},
-			}),
-		}
-		nk, err := key.ParseNodePublicUntyped(mem.S(nkHex))
-		if err != nil {
-			t.Fatal(err)
-		}
-		e.SetSelfNode(nm.SelfNode)
+	err = e.Reconfig(cfg, &router.Config{}, &dns.Config{})
 
-		newDisco := key.NewDisco()
-		cfg := &wgcfg.Config{
-			Peers: []wgcfg.Peer{
-				{
-					PublicKey: nk,
-					DiscoKey:  newDisco.Public(),
-				},
-			},
-		}
-
-		tsmpKey := newDisco.Public()
-		if change.tsmp {
-			if change.wrongKey {
-				tsmpKey = key.NewDisco().Public()
-			}
-			ue.PatchDiscoKey(nk, tsmpKey)
-		}
-		err = e.Reconfig(cfg, routerCfg, &dns.Config{})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		changeMap := <-discoChangedChan
-
-		if _, ok := changeMap[nk]; ok != change.inMap {
-			t.Fatalf("expect key %v in map %v to be %t, got %t", nk, changeMap,
-				change.inMap, ok)
-		}
-
-		metric := metricTSMPLearnedKeyMismatch.Value()
-		delta := metric - metricValue
-		metricValue = metric
-
-		if change.wrongKey && delta != 1 {
-			t.Fatalf("expected a delta of 1, got %d", delta)
-		}
+	if !osCfg.setDNSCalled {
+		t.Error("SetDNS was not called after router.Set failed; DNS config must be independent of router success")
+	}
+	if err == nil {
+		t.Error("Reconfig returned nil; want the router error to be surfaced")
+	} else if !errors.Is(err, routerErr) {
+		t.Errorf("Reconfig error = %v; want it to wrap the router error %v", err, routerErr)
 	}
 }
 
@@ -316,18 +221,9 @@ func TestUserspaceEnginePortReconfig(t *testing.T) {
 	t.Cleanup(ue.Close)
 
 	startingPort := ue.magicConn.LocalPort()
-	nodeKey, err := key.ParseNodePublicUntyped(mem.S("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	cfg := &wgcfg.Config{
-		Peers: []wgcfg.Peer{
-			{
-				PublicKey: nodeKey,
-				AllowedIPs: []netip.Prefix{
-					netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
-				},
-			},
+		Addresses: []netip.Prefix{
+			netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
 		},
 	}
 	routerCfg := &router.Config{}
@@ -398,18 +294,9 @@ func TestUserspaceEnginePeerMTUReconfig(t *testing.T) {
 	t.Logf("Info: OS default don't fragment bit(s) setting: %v", osDefaultDF)
 
 	// Build a set of configs to use as we change the peer MTU settings.
-	nodeKey, err := key.ParseNodePublicUntyped(mem.S("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	cfg := &wgcfg.Config{
-		Peers: []wgcfg.Peer{
-			{
-				PublicKey: nodeKey,
-				AllowedIPs: []netip.Prefix{
-					netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
-				},
-			},
+		Addresses: []netip.Prefix{
+			netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
 		},
 	}
 	routerCfg := &router.Config{}
@@ -444,64 +331,6 @@ func TestUserspaceEnginePeerMTUReconfig(t *testing.T) {
 				t.Errorf("don't fragment bit set to %v, want %v, err %v", v, tt.wantP, err)
 			}
 		})
-	}
-}
-
-func TestTSMPKeyAdvertisement(t *testing.T) {
-	var knobs controlknobs.Knobs
-
-	bus := eventbustest.NewBus(t)
-	ht := health.NewTracker(bus)
-	reg := new(usermetric.Registry)
-	e, err := NewFakeUserspaceEngine(t.Logf, 0, &knobs, ht, reg, bus)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(e.Close)
-	ue := e.(*userspaceEngine)
-	routerCfg := &router.Config{}
-	nodeKey := nkFromHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-	nm := &netmap.NetworkMap{
-		Peers: nodeViews([]*tailcfg.Node{
-			{
-				ID:  1,
-				Key: nodeKey,
-			},
-		}),
-		SelfNode: (&tailcfg.Node{
-			StableID:  "TESTCTRL00000001",
-			Name:      "test-node.test.ts.net",
-			Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32"), netip.MustParsePrefix("fd7a:115c:a1e0:ab12:4843:cd96:0:1/128")},
-		}).View(),
-	}
-	cfg := &wgcfg.Config{
-		Peers: []wgcfg.Peer{
-			{
-				PublicKey: nodeKey,
-				AllowedIPs: []netip.Prefix{
-					netip.PrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
-				},
-			},
-		},
-	}
-
-	ue.SetSelfNode(nm.SelfNode)
-	err = ue.Reconfig(cfg, routerCfg, &dns.Config{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	addr := netip.MustParseAddr("100.100.99.1")
-	previousValue := metricTSMPDiscoKeyAdvertisementSent.Value()
-	ue.sendTSMPDiscoAdvertisement(addr)
-	if val := metricTSMPDiscoKeyAdvertisementSent.Value(); val <= previousValue {
-		errs := metricTSMPDiscoKeyAdvertisementError.Value()
-		t.Errorf("Expected 1 disco key advert, got %d, errors %d", val, errs)
-	}
-	// Remove config to have the engine shut down more consistently
-	err = ue.Reconfig(&wgcfg.Config{}, &router.Config{}, &dns.Config{})
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -641,5 +470,125 @@ func TestLinkChangeReapplyPreservesMagicDNSRoutes(t *testing.T) {
 	if !slices.Equal(initial, after) {
 		t.Errorf("resolver LocalDomains changed after linkChange:\n  initial: %s\n  after:   %s",
 			logger.AsJSON(initial), logger.AsJSON(after))
+	}
+}
+
+// TestCloseWaitsForLinkChange tests that Close waits for in-flight
+// linkChangeQueue work to finish before tearing down the subsystems
+// that linkChange uses.
+//
+// See https://github.com/tailscale/tailscale/issues/17641.
+func TestCloseWaitsForLinkChange(t *testing.T) {
+	bus := eventbustest.NewBus(t)
+
+	ht := health.NewTracker(bus)
+	reg := new(usermetric.Registry)
+	e, err := NewFakeUserspaceEngine(t.Logf, 0, ht, reg, bus)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	e.(*userspaceEngine).linkChangeQueue.Add(func() {
+		close(started)
+		<-release
+		close(done)
+	})
+	<-started
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		close(release)
+	}()
+	e.Close()
+	select {
+	case <-done:
+	default:
+		t.Fatal("Close returned with link change work still in flight")
+	}
+}
+
+// TestDERPAppNamePlumbing tests that Config.DERPAppName makes it all
+// the way from the engine config to the ClientInfo received by an
+// in-process DERP server.
+func TestDERPAppNamePlumbing(t *testing.T) {
+	const appName = "app-name-plumbing-test"
+
+	priv := key.NewNode()
+	infoCh := make(chan derp.ClientInfo, 1)
+
+	derpSrv := derpserver.New(key.NewNode(), t.Logf)
+	derpSrv.ForTest().SetOnClientInfo(func(k key.NodePublic, info derp.ClientInfo) {
+		if k != priv.Public() {
+			return
+		}
+		select {
+		case infoCh <- info:
+		default:
+		}
+	})
+	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(derpSrv))
+	httpsrv.Config.ErrorLog = logger.StdLogger(t.Logf)
+	httpsrv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
+	httpsrv.StartTLS()
+	t.Cleanup(func() {
+		httpsrv.CloseClientConnections()
+		httpsrv.Close()
+		derpSrv.Close()
+	})
+
+	stunAddr, stunCleanup := stuntest.Serve(t)
+	t.Cleanup(stunCleanup)
+
+	derpMap := &tailcfg.DERPMap{
+		Regions: map[int]*tailcfg.DERPRegion{
+			1: {
+				RegionID:   1,
+				RegionCode: "test",
+				Nodes: []*tailcfg.DERPNode{{
+					Name:             "t1",
+					RegionID:         1,
+					HostName:         "test-node.unused",
+					IPv4:             "127.0.0.1",
+					IPv6:             "none",
+					STUNPort:         stunAddr.Port,
+					DERPPort:         httpsrv.Listener.Addr().(*net.TCPAddr).Port,
+					InsecureForTests: true,
+				}},
+			},
+		},
+	}
+
+	bus := eventbustest.NewBus(t)
+	noopDNS, err := dns.NewNoopManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := NewUserspaceEngine(t.Logf, Config{
+		HealthTracker: health.NewTracker(bus),
+		Metrics:       new(usermetric.Registry),
+		EventBus:      bus,
+		DNS:           noopDNS,
+		DERPAppName:   appName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(e.Close)
+
+	if err := e.Reconfig(&wgcfg.Config{PrivateKey: priv}, &router.Config{}, &dns.Config{}); err != nil {
+		t.Fatalf("Reconfig: %v", err)
+	}
+	e.(*userspaceEngine).magicConn.SetDERPMap(derpMap)
+
+	select {
+	case info := <-infoCh:
+		if info.AppName != appName {
+			t.Fatalf("ClientInfo.AppName = %q; want %q", info.AppName, appName)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for engine to connect to the test DERP server")
 	}
 }

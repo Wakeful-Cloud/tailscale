@@ -90,6 +90,10 @@ func (b *LocalBackend) GetCertPEM(ctx context.Context, domain string) (*TLSCertK
 //   - A bring-your-own Funnel domain referenced by the local serve
 //     config (e.g., "foo.com" when ServeConfig.AllowFunnel has
 //     "foo.com:443").
+//
+// On an ACME rate-limit failure the returned error implements
+// [tsweb.HTTPStatuser] with a 429 + Retry-After response; other errors
+// are returned unchanged.
 func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string, minValidity time.Duration) (*TLSCertKeyPair, error) {
 	if f, ok := HookGetCertPEM.GetOk(); ok {
 		return f(ctx, b, domain, minValidity)

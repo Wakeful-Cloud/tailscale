@@ -163,7 +163,7 @@ func getRegStringsInternal(subKey, name string) ([]string, error) {
 	return val, nil
 }
 
-// SetRegStrings sets a MULTI_SZ value in the in the local machine path
+// SetRegStrings sets a MULTI_SZ value in the local machine path
 // to the strings specified by values.
 func SetRegStrings(name string, values []string) error {
 	return setRegStringsInternal(regBase, name, values)
@@ -971,4 +971,26 @@ func GUIPathFromReg() (string, error) {
 	}
 
 	return regPath, nil
+}
+
+// IsCurrentProcessLocalSystem checks whether the current process is running
+// as LocalSystem.
+func IsCurrentProcessLocalSystem() bool {
+	localSystem, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		return false
+	}
+
+	token := windows.GetCurrentProcessToken()
+	// The current process token is a pseudo-handle so we don't need to close it.
+	if ok, err := token.IsMember(localSystem); err != nil || !ok {
+		return false
+	}
+
+	u, err := token.GetTokenUser()
+	if err != nil {
+		return false
+	}
+
+	return u.User.Sid.Equals(localSystem)
 }

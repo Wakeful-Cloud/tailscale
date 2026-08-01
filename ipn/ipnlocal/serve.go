@@ -221,14 +221,13 @@ func (s *localListener) Run() {
 		s.closeListener.Store(ln.Close)
 
 		s.logf("listening on %v", s.ap)
+		// handleListenersAccept always returns a non-nil error.
 		err = s.handleListenersAccept(ln)
 		if s.ctx.Err() != nil {
 			// context canceled, we're done
 			return
 		}
-		if err != nil {
-			s.logf("localListener accept error, retrying: %v", err)
-		}
+		s.logf("localListener accept error, retrying: %v", err)
 	}
 }
 
@@ -673,7 +672,14 @@ func (b *LocalBackend) tcpHandlerForServeTCP(tcph ipn.TCPPortHandlerView, dport 
 			defer conn.Close()
 			conn = b.meteredConnForService(conn, forVIPService)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			backConn, err := b.dialer.SystemDial(ctx, "tcp", backDst)
+			var backConn net.Conn
+			var err error
+			if socketPath, ok := strings.CutPrefix(backDst, "unix:"); ok {
+				var d net.Dialer
+				backConn, err = d.DialContext(ctx, "unix", socketPath)
+			} else {
+				backConn, err = b.dialer.SystemDial(ctx, "tcp", backDst)
+			}
 			cancel()
 			if err != nil {
 				b.logf("localbackend: failed to TCP proxy port %v (from %v) to %s: %v", dport, srcAddr, backDst, err)
@@ -714,7 +720,13 @@ func (b *LocalBackend) tcpHandlerForServeTCP(tcph ipn.TCPPortHandlerView, dport 
 func (b *LocalBackend) forwardTCPWithProxyProtocol(conn, backConn net.Conn, proxyProtoVer int, srcAddr netip.AddrPort, dport uint16, backDst string) error {
 	var proxyHeader []byte
 	if proxyProtoVer > 0 {
-		backAddr := backConn.RemoteAddr().(*net.TCPAddr)
+		// PROXY protocol requires a valid TCP destination address.
+		// For Unix socket backends, RemoteAddr is *net.UnixAddr;
+		// the CLI rejects this combination, but guard here as well.
+		backAddr, ok := backConn.RemoteAddr().(*net.TCPAddr)
+		if !ok {
+			return fmt.Errorf("PROXY protocol is not supported with non-TCP backend %s", backDst)
+		}
 
 		// We always want to format the PROXY protocol header based on
 		// the IPv4 or IPv6-ness of the client. The SourceAddr and
@@ -818,6 +830,15 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 		return h, r.URL.Path, true
 	}
 	pth := path.Clean(r.URL.Path)
+	// A well-formed origin-form request path is absolute. Malformed request
+	// targets — "*" (e.g. "GET *") and "" (e.g. "CONNECT" authority-form),
+	// clean to "*" and "." respectively. Those are path.Dir fixed points that
+	// never equal "/" and match no mount, so without this guard the loop below
+	// would spin forever on one CPU core (a remote DoS via serve, or via funnel
+	// from the internet).
+	if !strings.HasPrefix(pth, "/") {
+		return z, "", false
+	}
 	for {
 		withSlash := pth + "/"
 		if h, ok := wsc.Handlers().GetOk(withSlash); ok {
@@ -829,7 +850,13 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 		if pth == "/" {
 			return z, "", false
 		}
-		pth = path.Dir(pth)
+		// Belt-and-suspenders with the absolute-path check above: stop if
+		// path.Dir stops shrinking rather than assuming it always reaches "/".
+		if parent := path.Dir(pth); parent != pth {
+			pth = parent
+		} else {
+			return z, "", false
+		}
 	}
 }
 
