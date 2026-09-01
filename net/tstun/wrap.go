@@ -22,9 +22,9 @@ import (
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/mem"
 	"tailscale.com/disco"
-	"tailscale.com/envknob"
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
+	"tailscale.com/net/batching"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/packet/checksum"
 	"tailscale.com/net/routemanager"
@@ -1105,8 +1105,7 @@ func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook pa
 			t.injectOutboundPong(p, pingReq)
 			return filter.DropSilently, gro
 		} else if discoKeyAdvert, ok := p.AsTSMPDiscoAdvertisement(); ok {
-			if buildfeatures.HasCacheNetMap && envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") &&
-				!discoKeyAdvert.Key.IsZero() {
+			if !discoKeyAdvert.Key.IsZero() {
 				t.discoKeyAdvertisementPub.Publish(events.DiscoKeyAdvertisement{
 					Src: discoKeyAdvert.Src,
 					Key: discoKeyAdvert.Key,
@@ -1487,7 +1486,7 @@ func (t *Wrapper) BatchSize() int {
 		// Linux, and we cannot make a determination on gVisor usage at
 		// wireguard-go.Device startup, which is when this value matters for
 		// packet memory init.
-		return conn.IdealBatchSize
+		return batching.BatchSizeFromEnv(conn.IdealBatchSize)
 	}
 	return t.tdev.BatchSize()
 }

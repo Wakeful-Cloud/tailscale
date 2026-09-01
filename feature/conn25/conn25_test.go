@@ -4,6 +4,7 @@
 package conn25
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -26,6 +27,8 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/appctype"
@@ -54,6 +57,7 @@ func mustIPSetFromPrefix(s string) *netipx.IPSet {
 func TestHandleConnectorTransitIPRequest(t *testing.T) {
 
 	const appName = "TestApp"
+	const invalidAppName = "InvalidApp"
 
 	// Peer IPs
 	pipV4_1 := netip.MustParseAddr("100.101.101.101")
@@ -92,10 +96,12 @@ func TestHandleConnectorTransitIPRequest(t *testing.T) {
 	}).View()
 
 	tests := []struct {
-		name         string
-		ctipReqPeers []tailcfg.NodeView           // One entry per request and the other
-		ctipReqs     []ConnectorTransitIPRequest  // arrays in this struct must have the same
-		wants        []ConnectorTransitIPResponse // cardinality
+		name           string
+		ctipReqPeers   []tailcfg.NodeView          // One entry per request and the other
+		ctipReqs       []ConnectorTransitIPRequest // arrays in this struct must have the same
+		missingPeerCap bool
+		bypassFilter   bool
+		wants          []ConnectorTransitIPResponse // cardinality
 		// For checking lookups:
 		//	The outer array needs to correspond to the number of requests,
 		//	can be nil if no lookups need to be done after the request is processed.
@@ -316,13 +322,86 @@ func TestHandleConnectorTransitIPRequest(t *testing.T) {
 			name:         "one-peer-invalid-app",
 			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
 			ctipReqs: []ConnectorTransitIPRequest{
-				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4_1, DestinationIP: dipV4_1, App: "Unknown App"}}},
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4_1, DestinationIP: dipV4_1, App: invalidAppName}}},
 			},
 			wants: []ConnectorTransitIPResponse{
 				{TransitIPs: []TransitIPResponse{{Code: UnknownAppName, Message: unknownAppNameMessage}}},
 			},
 			wantLookups: [][][]netip.Addr{
 				{{pipV4_2, tipV4_1, netip.Addr{}}},
+			},
+		},
+		// Missing PeerCap
+		{
+			name:         "missing-peercap",
+			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4_1, DestinationIP: dipV4_1, App: appName}}},
+			},
+			missingPeerCap: true,
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{{Code: MissingAppPermission, Message: missingAppPermissionMessage}}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{{pipV4_2, tipV4_1, netip.Addr{}}},
+			},
+		},
+		// Missing PeerCap but BypassFilter is set
+		{
+			name:         "missing-peercap-bypass",
+			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4_1, DestinationIP: dipV4_1, App: appName}}},
+			},
+			missingPeerCap: true,
+			bypassFilter:   true,
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{{Code: OK, Message: ""}}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{{pipV4_2, tipV4_1, dipV4_1}},
+			},
+		},
+		// Has PeerCap and BypassFilter is set
+		{
+			name:         "has-peercap-bypass",
+			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4_1, DestinationIP: dipV4_1, App: appName}}},
+			},
+			bypassFilter: true,
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{{Code: OK, Message: ""}}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{{pipV4_2, tipV4_1, dipV4_1}},
+			},
+		},
+		{
+			name:         "invalid-app-with-peercap",
+			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4_1, DestinationIP: dipV4_1, App: invalidAppName}}},
+			},
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{{Code: UnknownAppName, Message: unknownAppNameMessage}}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{},
+			},
+		},
+		{
+			name:         "invalid-app-without-peercap",
+			ctipReqPeers: []tailcfg.NodeView{peerV4Only},
+			ctipReqs: []ConnectorTransitIPRequest{
+				{TransitIPs: []TransitIPRequest{{TransitIP: tipV4_1, DestinationIP: dipV4_1, App: invalidAppName}}},
+			},
+			missingPeerCap: true,
+			wants: []ConnectorTransitIPResponse{
+				{TransitIPs: []TransitIPResponse{{Code: MissingAppPermission, Message: missingAppPermissionMessage}}},
+			},
+			wantLookups: [][][]netip.Addr{
+				{},
 			},
 		},
 	}
@@ -345,14 +424,26 @@ func TestHandleConnectorTransitIPRequest(t *testing.T) {
 			c := newConn25(logger.Discard)
 			c.reconfig(&config{
 				isConfigured: true,
-				appsByName:   map[string]appctype.Conn25Attr{appName: {}},
+				appsByName: map[string]appctype.Conn25Attr{
+					appName: {
+						Name:                        appName,
+						TemporaryUnsafeBypassFilter: tt.bypassFilter,
+					},
+				},
 			})
 
 			for i, peer := range tt.ctipReqPeers {
 				req := tt.ctipReqs[i]
 				want := tt.wants[i]
+				peerCap := tailcfg.PeerCapMap{
+					peercap.Conn25Prefix.ToAttribute(appName):        []tailcfg.RawMessage{`"*"`},
+					peercap.Conn25Prefix.ToAttribute(invalidAppName): []tailcfg.RawMessage{`"*"`},
+				}
+				if tt.missingPeerCap {
+					peerCap = nil
+				}
 
-				resp := c.handleConnectorTransitIPRequest(peer, req)
+				resp := c.handleConnectorTransitIPRequest(peer, peerCap, req)
 
 				// Ensure that we have the expected number of responses
 				if len(resp.TransitIPs) != len(want.TransitIPs) {
@@ -381,8 +472,7 @@ func TestHandleConnectorTransitIPRequest(t *testing.T) {
 								i, j, len(wantLookup))
 						}
 						pip, tip, wantDip := wantLookup[0], wantLookup[1], wantLookup[2]
-						aa, _ := c.connector.lookupBySrcIPAndTransitIP(pip, tip)
-						gotDip := aa.addr
+						gotDip, _ := c.connector.lookupAddrBySrcIPAndTransitIP(pip, tip)
 						if gotDip != wantDip {
 							t.Errorf("wrong result on lookup[%d][%d] ([%v], [%v]): got [%v] expected [%v]",
 								i, j, pip, tip, gotDip, wantDip)
@@ -457,10 +547,10 @@ func TestReserveIPs(t *testing.T) {
 func TestReconfig(t *testing.T) {
 	rawCfg := `{"name":"app1","connectors":["tag:woo"],"domains":["example.com"]}`
 	capMap := tailcfg.NodeCapMap{
-		tailcfg.NodeCapability(AppConnectorsExperimentalAttrName): []tailcfg.RawMessage{
+		nodecap.Cap(AppConnectorsExperimentalAttrName): []tailcfg.RawMessage{
 			tailcfg.RawMessage(rawCfg),
 		},
-		tailcfg.NodeCapability(AppConnectorsExperimentalIPPoolsAttrName): []tailcfg.RawMessage{
+		nodecap.Cap(AppConnectorsExperimentalIPPoolsAttrName): []tailcfg.RawMessage{
 			tailcfg.RawMessage("{}"),
 		},
 	}
@@ -648,8 +738,8 @@ func TestConfigFromNodeView(t *testing.T) {
 				poolsCfg = getRawMessages(t, tt.poolsCfg)
 			}
 			capMap := tailcfg.NodeCapMap{
-				tailcfg.NodeCapability(AppConnectorsExperimentalAttrName):        appCfg,
-				tailcfg.NodeCapability(AppConnectorsExperimentalIPPoolsAttrName): poolsCfg,
+				nodecap.Cap(AppConnectorsExperimentalAttrName):        appCfg,
+				nodecap.Cap(AppConnectorsExperimentalIPPoolsAttrName): poolsCfg,
 			}
 			sn := (&tailcfg.Node{
 				CapMap: capMap,
@@ -792,8 +882,8 @@ func makeSelfNode(t *testing.T, attrs []appctype.Conn25Attr, pools appctype.Conn
 		t.Fatalf("unexpected error marshaling pools in test setup: %v", err)
 	}
 	capMap := tailcfg.NodeCapMap{
-		tailcfg.NodeCapability(AppConnectorsExperimentalAttrName):        cfg,
-		tailcfg.NodeCapability(AppConnectorsExperimentalIPPoolsAttrName): {tailcfg.RawMessage(poolsBytes)},
+		nodecap.Cap(AppConnectorsExperimentalAttrName):        cfg,
+		nodecap.Cap(AppConnectorsExperimentalIPPoolsAttrName): {tailcfg.RawMessage(poolsBytes)},
 	}
 
 	return (&tailcfg.Node{
@@ -917,23 +1007,41 @@ func makeDNSResponseForSections(t *testing.T, questions []dnsmessage.Question, a
 	for _, ans := range answers {
 		switch ans.Header.Type {
 		case dnsmessage.TypeA:
-			body, ok := (ans.Body).(*dnsmessage.AResource)
-			if !ok {
-				t.Fatalf("unexpected answer type, update test")
-			}
+			body, _ := (ans.Body).(*dnsmessage.AResource)
 			b.AResource(ans.Header, *body)
 		case dnsmessage.TypeAAAA:
-			body, ok := (ans.Body).(*dnsmessage.AAAAResource)
-			if !ok {
-				t.Fatalf("unexpected answer type, update test")
-			}
+			body, _ := (ans.Body).(*dnsmessage.AAAAResource)
 			b.AAAAResource(ans.Header, *body)
 		case dnsmessage.TypeCNAME:
-			body, ok := (ans.Body).(*dnsmessage.CNAMEResource)
-			if !ok {
-				t.Fatalf("unexpected answer type, update test")
-			}
+			body, _ := (ans.Body).(*dnsmessage.CNAMEResource)
 			b.CNAMEResource(ans.Header, *body)
+		case dnsmessage.TypeHTTPS:
+			body, _ := (ans.Body).(*dnsmessage.HTTPSResource)
+			b.HTTPSResource(ans.Header, *body)
+		case dnsmessage.TypeNS:
+			body, _ := (ans.Body).(*dnsmessage.NSResource)
+			b.NSResource(ans.Header, *body)
+		case dnsmessage.TypeSOA:
+			body, _ := (ans.Body).(*dnsmessage.SOAResource)
+			b.SOAResource(ans.Header, *body)
+		case dnsmessage.TypePTR:
+			body, _ := (ans.Body).(*dnsmessage.PTRResource)
+			b.PTRResource(ans.Header, *body)
+		case dnsmessage.TypeMX:
+			body, _ := (ans.Body).(*dnsmessage.MXResource)
+			b.MXResource(ans.Header, *body)
+		case dnsmessage.TypeTXT:
+			body, _ := (ans.Body).(*dnsmessage.TXTResource)
+			b.TXTResource(ans.Header, *body)
+		case dnsmessage.TypeSRV:
+			body, _ := (ans.Body).(*dnsmessage.SRVResource)
+			b.SRVResource(ans.Header, *body)
+		case dnsmessage.TypeOPT:
+			body, _ := (ans.Body).(*dnsmessage.OPTResource)
+			b.OPTResource(ans.Header, *body)
+		case dnsmessage.TypeSVCB:
+			body, _ := (ans.Body).(*dnsmessage.SVCBResource)
+			b.SVCBResource(ans.Header, *body)
 		default:
 			t.Fatalf("unhandled answer type, update test: %v", ans.Header.Type)
 		}
@@ -1352,6 +1460,34 @@ func TestMapDNSResponsePreservesTTL(t *testing.T) {
 				nil,
 			),
 		},
+		{
+			name: "typeHTTPS",
+			toMap: makeDNSResponseForSections(t,
+				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeHTTPS, Class: dnsmessage.ClassINET}},
+				[]dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  dnsMessageName,
+							Type:  dnsmessage.TypeHTTPS,
+							Class: dnsmessage.ClassINET,
+							TTL:   wantTTL,
+						},
+						Body: &dnsmessage.HTTPSResource{
+							SVCBResource: dnsmessage.SVCBResource{
+								Priority: 1,
+								Target:   dnsMessageName,
+								Params: []dnsmessage.SVCParam{
+									{Key: dnsmessage.SVCParamALPN, Value: []byte{0x02, 'h', '2'}},
+									{Key: dnsmessage.SVCParamIPv4Hint, Value: netip.MustParseAddr("1.2.3.4").AsSlice()},
+									{Key: dnsmessage.SVCParamIPv6Hint, Value: netip.MustParseAddr("2606:4700::6812:1a78").AsSlice()},
+								},
+							},
+						},
+					},
+				},
+				nil,
+			),
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := newConn25(logger.Discard)
@@ -1532,6 +1668,7 @@ func TestAddressAssignmentIsHandled(t *testing.T) {
 		Tags:     []string{"tag:woo"},
 		Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
 		Key:      key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 1: 0xff, 31: 0x01})),
+		Online:   new(true),
 	}).View()
 
 	ext := &extension{
@@ -2085,12 +2222,118 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 			),
 			assertFx: assertParsesToAnswers(nil),
 		},
+		{
+			name: "https-record-strips-address-hints",
+			toMap: makeDNSResponseForSections(t,
+				[]dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeHTTPS, Class: dnsmessage.ClassINET}},
+				[]dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  dnsMessageName,
+							Type:  dnsmessage.TypeHTTPS,
+							Class: dnsmessage.ClassINET,
+							TTL:   300,
+						},
+						Body: &dnsmessage.HTTPSResource{
+							SVCBResource: dnsmessage.SVCBResource{
+								Priority: 1,
+								Target:   dnsMessageName,
+								Params: []dnsmessage.SVCParam{
+									{Key: dnsmessage.SVCParamALPN, Value: []byte{0x02, 'h', '2'}},
+									{Key: dnsmessage.SVCParamIPv4Hint, Value: netip.MustParseAddr("1.2.3.4").AsSlice()},
+									{Key: dnsmessage.SVCParamIPv6Hint, Value: netip.MustParseAddr("2606:4700::6812:1a78").AsSlice()},
+								},
+							},
+						},
+					},
+				},
+				nil,
+			),
+			assertFx: func(t *testing.T, bs []byte) {
+				want := []dnsmessage.HTTPSResource{
+					{
+						SVCBResource: dnsmessage.SVCBResource{
+							Priority: 1,
+							Target:   dnsMessageName,
+							Params: []dnsmessage.SVCParam{
+								{Key: dnsmessage.SVCParamALPN, Value: []byte{0x02, 'h', '2'}},
+							},
+						},
+					},
+				}
+				answers, _ := parseResponse(t, bs)
+				var got []dnsmessage.HTTPSResource
+				for _, r := range answers {
+					if b, ok := r.Body.(*dnsmessage.HTTPSResource); ok {
+						got = append(got, *b)
+					}
+				}
+				if diff := cmp.Diff(want, got); diff != "" {
+					t.Fatalf("HTTPS records mismatch (-want +got):\n%s", diff)
+				}
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := newConn25(logger.Discard)
 			c.reconfig(cfg)
 			bs := c.mapDNSResponse(tt.toMap)
 			tt.assertFx(t, bs)
+		})
+	}
+}
+
+// TestMapDNSResponseDropsUnhandledTypes asserts that for a configured domain,
+// every DNS record type dnsmessage supports other than the ones we handle
+// is dropped: the response is returned with the question echoed and no answers.
+func TestMapDNSResponseDropsUnhandledTypes(t *testing.T) {
+	configuredDomain := "example.com"
+	dnsMessageName := dnsmessage.MustNewName(configuredDomain + ".")
+	sn := makeSelfNode(t, []appctype.Conn25Attr{{
+		Name:       "app1",
+		Connectors: []string{"tag:connector"},
+		Domains:    []string{configuredDomain},
+	}}, appctype.Conn25PoolsAttr{
+		V4MagicIPPool:   []netipx.IPRange{v4RangeFrom("0", "10")},
+		V4TransitIPPool: []netipx.IPRange{v4RangeFrom("40", "50")},
+		V6MagicIPPool:   []netipx.IPRange{netipx.IPRangeFrom(netip.MustParseAddr("2606:4700::6812:100"), netip.MustParseAddr("2606:4700::6812:1ff"))},
+		V6TransitIPPool: []netipx.IPRange{netipx.IPRangeFrom(netip.MustParseAddr("2606:4700::6813:100"), netip.MustParseAddr("2606:4700::6813:1ff"))},
+	}, []string{})
+	cfg := mustConfig(t, sn)
+
+	unhandled := []struct {
+		typ  dnsmessage.Type
+		body dnsmessage.ResourceBody
+	}{
+		{dnsmessage.TypeNS, &dnsmessage.NSResource{NS: dnsMessageName}},
+		{dnsmessage.TypeCNAME, &dnsmessage.CNAMEResource{CNAME: dnsMessageName}},
+		{dnsmessage.TypeSOA, &dnsmessage.SOAResource{NS: dnsMessageName, MBox: dnsMessageName, Serial: 1}},
+		{dnsmessage.TypePTR, &dnsmessage.PTRResource{PTR: dnsMessageName}},
+		{dnsmessage.TypeMX, &dnsmessage.MXResource{Pref: 10, MX: dnsMessageName}},
+		{dnsmessage.TypeTXT, &dnsmessage.TXTResource{TXT: []string{"hello"}}},
+		{dnsmessage.TypeSRV, &dnsmessage.SRVResource{Priority: 1, Weight: 1, Port: 443, Target: dnsMessageName}},
+		{dnsmessage.TypeOPT, &dnsmessage.OPTResource{}},
+		{dnsmessage.TypeSVCB, &dnsmessage.SVCBResource{Priority: 1, Target: dnsMessageName}},
+	}
+	for _, tt := range unhandled {
+		t.Run(tt.typ.String(), func(t *testing.T) {
+			toMap := makeDNSResponseForSections(t,
+				[]dnsmessage.Question{{Name: dnsMessageName, Type: tt.typ, Class: dnsmessage.ClassINET}},
+				[]dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{Name: dnsMessageName, Type: tt.typ, Class: dnsmessage.ClassINET, TTL: 300},
+						Body:   tt.body,
+					},
+				},
+				nil,
+			)
+			c := newConn25(logger.Discard)
+			c.reconfig(cfg)
+			bs := c.mapDNSResponse(toMap)
+			answers, _ := parseResponse(t, bs)
+			if len(answers) != 0 {
+				t.Fatalf("expected response to be dropped (0 answers), got %d: %v", len(answers), answers)
+			}
 		})
 	}
 }
@@ -2120,12 +2363,14 @@ func TestHandleAddressAssignmentStoresTransitIPs(t *testing.T) {
 			Tags:     []string{"tag:woo"},
 			Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
 			Key:      key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0x01})),
+			Online:   new(true),
 		}).View(),
 		(&tailcfg.Node{
 			ID:       tailcfg.NodeID(2),
 			Tags:     []string{"tag:hoo"},
 			Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
 			Key:      key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0x02})),
+			Online:   new(true),
 		}).View(),
 	}
 
@@ -2496,6 +2741,107 @@ func TestConnectorRealIPForTransitIPConnection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConnectorExpireTransitIPs(t *testing.T) {
+	const appName = "app"
+
+	peerA := netip.MustParseAddr("100.101.101.101")
+	peerANode := (&tailcfg.Node{ID: 1, Addresses: []netip.Prefix{netip.PrefixFrom(peerA, 32)}}).View()
+
+	peerB := netip.MustParseAddr("100.101.101.102")
+	peerBNode := (&tailcfg.Node{ID: 2, Addresses: []netip.Prefix{netip.PrefixFrom(peerB, 32)}}).View()
+
+	tipOne := netip.MustParseAddr("0.0.0.1")
+	tipTwo := netip.MustParseAddr("0.0.0.2")
+	tipThree := netip.MustParseAddr("0.0.0.3")
+	tipFour := netip.MustParseAddr("0.0.0.4")
+
+	c := newConn25(logger.Discard)
+	c.reconfig(&config{
+		isConfigured: true,
+		appsByName:   map[string]appctype.Conn25Attr{appName: {}},
+	})
+	clock := tstest.NewClock(tstest.ClockOpts{Start: time.Now()})
+	// this would be a data race if we had started the sweeper, but we haven't.
+	c.connector.clock = clock
+
+	peerCap := tailcfg.PeerCapMap{
+		peercap.Conn25Prefix.ToAttribute(appName): []tailcfg.RawMessage{`"*"`},
+	}
+
+	register := func(peer tailcfg.NodeView, tip, dst netip.Addr) {
+		c.handleConnectorTransitIPRequest(peer, peerCap, ConnectorTransitIPRequest{
+			TransitIPs: []TransitIPRequest{{TransitIP: tip, DestinationIP: dst, App: appName}},
+		})
+	}
+
+	register(peerANode, tipOne, netip.MustParseAddr("10.0.0.1"))
+	register(peerANode, tipFour, netip.MustParseAddr("10.0.0.4"))
+	register(peerBNode, tipThree, netip.MustParseAddr("10.0.0.3"))
+
+	clock.Advance(30 * time.Minute)
+	register(peerANode, tipTwo, netip.MustParseAddr("10.0.0.2"))
+	// write over the tipFour mapping, with a different dst
+	register(peerANode, tipFour, netip.MustParseAddr("10.0.0.5"))
+
+	// advance past the hour expiry time of peerA+tipOne and peerB+tipThree
+	// the peerA+tipTwo and the updated peerA+tipFour registrations are still within expiry
+	clock.Advance(31 * time.Minute)
+	if got := c.connector.expireTransitIPs(clock.Now()); got != 2 {
+		t.Fatalf("expireTransitIPs removed %d mappings, want 2", got)
+	}
+
+	c.connector.mu.Lock()
+	if _, ok := c.connector.transitIPs[peerA][tipOne]; ok {
+		t.Fatalf("expected tipOne %v to be removed from the map", tipOne)
+	}
+	if _, ok := c.connector.transitIPs[peerA][tipTwo]; !ok {
+		t.Fatalf("expected tipTwo %v to remain in the map", tipTwo)
+	}
+	if _, ok := c.connector.transitIPs[peerB]; ok {
+		t.Fatalf("expected peerB sub-map to be pruned after its only mapping expired")
+	}
+	c.connector.mu.Unlock()
+
+	// advance another 30 mins, expire the other two mappings
+	clock.Advance(30 * time.Minute)
+	if got := c.connector.expireTransitIPs(clock.Now()); got != 2 {
+		t.Fatalf("expireTransitIPs removed %d mappings, want 2", got)
+	}
+	c.connector.mu.Lock()
+	if c.connector.expiryQueue.Len() != 0 {
+		t.Fatalf("queue should be all done now")
+	}
+	if _, ok := c.connector.transitIPs[peerA]; ok {
+		t.Fatalf("expected peerA sub-map to be pruned after all mappings expired")
+	}
+	c.connector.mu.Unlock()
+
+	uint32ToIPv4 := func(n uint32) netip.Addr {
+		var buf [4]byte
+		binary.BigEndian.PutUint32(buf[:], n)
+		return netip.AddrFrom4(buf)
+	}
+	var i uint32
+	for i = 0; i < 100003; i++ {
+		tip := uint32ToIPv4(i + 10)
+		dst := uint32ToIPv4(i + 100014)
+		register(peerANode, tip, dst)
+	}
+	// go past expiry time out
+	clock.Advance(61 * time.Minute)
+	if got := c.connector.expireTransitIPs(clock.Now()); got != 100000 {
+		t.Fatalf("expireTransitIPs removed %d mappings, want 100000, the limit for one run", got)
+	}
+	c.connector.mu.Lock()
+	if c.connector.expiryQueue.Len() != 3 {
+		t.Fatalf("expected 3 items remaining in queue")
+	}
+	if len(c.connector.transitIPs[peerA]) != 3 {
+		t.Fatalf("expected 3 items remaining in peerA transitIPs")
+	}
+	c.connector.mu.Unlock()
 }
 
 func TestIsKnownTransitIP(t *testing.T) {
@@ -2896,6 +3242,158 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 				if !as.expiresAt.Equal(expected) {
 					t.Fatalf("a: %v, as.ExpiredAt: %v, expected: %v, dur: %v", a, as.expiresAt, expected, dur)
 				}
+			}
+		})
+	}
+}
+
+func TestPickConnector(t *testing.T) {
+	exampleApp := appctype.Conn25Attr{
+		Name:       "example",
+		Connectors: []string{"tag:example"},
+		Domains:    []string{"example.com"},
+	}
+
+	nvWithConnectorSet := func(id tailcfg.NodeID, isConnector bool, tags ...string) tailcfg.NodeView {
+		return (&tailcfg.Node{
+			ID:       id,
+			Tags:     tags,
+			Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(isConnector)}).View(),
+			Online:   new(true),
+		}).View()
+	}
+
+	nvWithOnlineSet := func(id tailcfg.NodeID, online bool, tags ...string) tailcfg.NodeView {
+		return (&tailcfg.Node{
+			ID:       id,
+			Tags:     tags,
+			Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
+			Online:   new(online),
+		}).View()
+	}
+
+	nv := func(id tailcfg.NodeID, tags ...string) tailcfg.NodeView {
+		return nvWithConnectorSet(id, true, tags...)
+	}
+
+	for _, tt := range []struct {
+		name       string
+		candidates []tailcfg.NodeView
+		app        appctype.Conn25Attr
+		want       []tailcfg.NodeView
+	}{
+		{
+			name:       "empty-everything",
+			candidates: []tailcfg.NodeView{},
+			app:        appctype.Conn25Attr{},
+			want:       nil,
+		},
+		{
+			name:       "empty-candidates",
+			candidates: []tailcfg.NodeView{},
+			app:        exampleApp,
+			want:       nil,
+		},
+		{
+			name:       "empty-app",
+			candidates: []tailcfg.NodeView{nv(1, "tag:example")},
+			app:        appctype.Conn25Attr{},
+			want:       nil,
+		},
+		{
+			name:       "one-matches",
+			candidates: []tailcfg.NodeView{nv(1, "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(1, "tag:example")},
+		},
+		{
+			name: "invalid-candidate",
+			candidates: []tailcfg.NodeView{
+				{},
+				nv(1, "tag:example"),
+			},
+			app: exampleApp,
+			want: []tailcfg.NodeView{
+				nv(1, "tag:example"),
+			},
+		},
+		{
+			name: "no-host-info",
+			candidates: []tailcfg.NodeView{
+				(&tailcfg.Node{
+					ID:   1,
+					Tags: []string{"tag:example"},
+				}).View(),
+				nv(2, "tag:example"),
+			},
+			app:  exampleApp,
+			want: []tailcfg.NodeView{nv(2, "tag:example")},
+		},
+		{
+			name:       "not-a-connector",
+			candidates: []tailcfg.NodeView{nvWithConnectorSet(1, false, "tag:example"), nv(2, "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(2, "tag:example")},
+		},
+		{
+			name:       "without-matches",
+			candidates: []tailcfg.NodeView{nv(1, "tag:woo"), nv(2, "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(2, "tag:example")},
+		},
+		{
+			name:       "multi-tags",
+			candidates: []tailcfg.NodeView{nv(1, "tag:woo", "tag:hoo"), nv(2, "tag:woo", "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(2, "tag:woo", "tag:example")},
+		},
+		{
+			name:       "multi-matches",
+			candidates: []tailcfg.NodeView{nv(1, "tag:woo", "tag:hoo"), nv(2, "tag:woo", "tag:example"), nv(3, "tag:example1", "tag:example")},
+			app: appctype.Conn25Attr{
+				Name:       "example2",
+				Connectors: []string{"tag:example1", "tag:example"},
+				Domains:    []string{"example.com"},
+			},
+			want: []tailcfg.NodeView{nv(2, "tag:woo", "tag:example"), nv(3, "tag:example1", "tag:example")},
+		},
+		{
+			name: "bit-of-everything",
+			candidates: []tailcfg.NodeView{
+				nv(3, "tag:woo", "tag:hoo"),
+				{},
+				nv(2, "tag:woo", "tag:example"),
+				nvWithConnectorSet(4, false, "tag:example"),
+				nv(1, "tag:example1", "tag:example"),
+				nv(7, "tag:example1", "tag:example"),
+				nvWithConnectorSet(5, false),
+				nv(6),
+				nvWithConnectorSet(8, false, "tag:example"),
+				nvWithConnectorSet(9, false),
+				nvWithConnectorSet(10, false),
+			},
+			app: appctype.Conn25Attr{
+				Name:       "example2",
+				Connectors: []string{"tag:example1", "tag:example", "tag:example2"},
+				Domains:    []string{"example.com"},
+			},
+			want: []tailcfg.NodeView{
+				nv(1, "tag:example1", "tag:example"),
+				nv(2, "tag:woo", "tag:example"),
+				nv(7, "tag:example1", "tag:example"),
+			},
+		},
+		{
+			name:       "not-online",
+			candidates: []tailcfg.NodeView{nvWithOnlineSet(1, false, "tag:example"), nv(2, "tag:example")},
+			app:        exampleApp,
+			want:       []tailcfg.NodeView{nv(2, "tag:example")},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pickConnector(&testNodeBackend{peers: tt.candidates}, tt.app)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Fatalf("PickConnectors (-want, +got):\n%s", diff)
 			}
 		})
 	}

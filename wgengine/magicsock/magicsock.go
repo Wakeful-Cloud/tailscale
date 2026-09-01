@@ -51,6 +51,8 @@ import (
 	"tailscale.com/net/tstun"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsconst"
 	"tailscale.com/tstime"
 	"tailscale.com/tstime/mono"
@@ -165,12 +167,12 @@ type Conn struct {
 	derpActiveFunc         func()
 	idleFunc               func() time.Duration // nil means unknown
 	testOnlyPacketListener nettype.PacketListener
-	onDERPRecv             func(int, key.NodePublic, []byte) bool // or nil, see Options.OnDERPRecv
-	netMon                 *netmon.Monitor                        // must be non-nil
-	health                 *health.Tracker                        // or nil
-	extraRootCAs           *x509.CertPool                         // additional trusted root CAs; or nil
-	controlKnobs           *controlknobs.Knobs                    // or nil
-	derpAppName            string                                 // or empty, see Options.DERPAppName
+	onDERPRecv             func(tailcfg.DERPRegionID, key.NodePublic, []byte) bool // or nil, see Options.OnDERPRecv
+	netMon                 *netmon.Monitor                                         // must be non-nil
+	health                 *health.Tracker                                         // or nil
+	extraRootCAs           *x509.CertPool                                          // additional trusted root CAs; or nil
+	controlKnobs           *controlknobs.Knobs                                     // or nil
+	derpAppName            string                                                  // or empty, see Options.DERPAppName
 
 	// ================================================================
 	// No locking required to access these fields, either because
@@ -357,16 +359,16 @@ type Conn struct {
 	self      tailcfg.NodeView                    // from last SetNetworkMap
 	peersByID map[tailcfg.NodeID]tailcfg.NodeView // current peer set, keyed by NodeID. Maintained by SetNetworkMap/UpsertPeer/RemovePeer. Note: per-field NodeMutation patches received in UpdateNetmapDelta are never applied to these snapshots.
 
-	filt               *filter.Filter     // from last SetFilter
-	relayClientEnabled bool               // whether we can allocate UDP relay endpoints on UDP relay servers or receive CallMeMaybeVia messages from peers
-	lastFlags          debugFlags         // at time of last SetNetworkMap
-	privateKey         key.NodePrivate    // WireGuard private key for this node
-	everHadKey         bool               // whether we ever had a non-zero private key
-	myDerp             int                // nearest DERP region ID; 0 means none/unknown
-	homeless           bool               // if true, don't try to find & stay conneted to a DERP home (myDerp will stay 0)
-	derpStarted        chan struct{}      // closed on first connection to DERP; for tests & cleaner Close
-	activeDerp         map[int]activeDerp // DERP regionID -> connection to a node in that region
-	prevDerp           map[int]*syncs.WaitGroupChan
+	filt               *filter.Filter                      // from last SetFilter
+	relayClientEnabled bool                                // whether we can allocate UDP relay endpoints on UDP relay servers or receive CallMeMaybeVia messages from peers
+	lastFlags          debugFlags                          // at time of last SetNetworkMap
+	privateKey         key.NodePrivate                     // WireGuard private key for this node
+	everHadKey         bool                                // whether we ever had a non-zero private key
+	myDerp             tailcfg.DERPRegionID                // nearest DERP region ID; 0 means none/unknown
+	homeless           bool                                // if true, don't try to find & stay conneted to a DERP home (myDerp will stay 0)
+	derpStarted        chan struct{}                       // closed on first connection to DERP; for tests & cleaner Close
+	activeDerp         map[tailcfg.DERPRegionID]activeDerp // DERP regionID -> connection to a node in that region
+	prevDerp           map[tailcfg.DERPRegionID]*syncs.WaitGroupChan
 
 	// derpRoute contains optional alternate routes to use as an
 	// optimization instead of contacting a peer via their home
@@ -379,7 +381,7 @@ type Conn struct {
 
 	// peerLastDerp tracks which DERP node we last used to speak with a
 	// peer. It's only used to quiet logging, so we only log on change.
-	peerLastDerp map[key.NodePublic]int
+	peerLastDerp map[key.NodePublic]tailcfg.DERPRegionID
 
 	// wgPinger is the WireGuard only pinger used for latency measurements.
 	wgPinger lazy.SyncValue[*ping.Pinger]
@@ -521,7 +523,7 @@ type Options struct {
 	// true, the packet is considered handled and is not passed to
 	// WireGuard. The pkt slice is borrowed and must be copied if
 	// the callee needs to retain it.
-	OnDERPRecv func(regionID int, src key.NodePublic, pkt []byte) bool
+	OnDERPRecv func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool
 }
 
 func (o *Options) logf() logger.Logf {
@@ -583,7 +585,7 @@ func newConn(logf logger.Logf) *Conn {
 		logf:          logf,
 		derpRecvCh:    make(chan derpReadResult, 1), // must be buffered, see issue 3736
 		derpStarted:   make(chan struct{}),
-		peerLastDerp:  make(map[key.NodePublic]int),
+		peerLastDerp:  make(map[key.NodePublic]tailcfg.DERPRegionID),
 		peerMap:       newPeerMap(),
 		discoInfo:     make(map[key.DiscoPublic]*discoInfo),
 		cloudInfo:     cloudinfo.New(logf),
@@ -627,14 +629,14 @@ func (c *Conn) onUDPRelayAllocResp(allocResp UDPRelayAllocResp) {
 	if disco == nil {
 		return
 	}
-	if disco.key.Compare(allocResp.ReqRxFromDiscoKey) != 0 {
+	if disco.key().Compare(allocResp.ReqRxFromDiscoKey) != 0 {
 		return
 	}
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 	derpAddr := ep.derpAddr
 	if derpAddr.IsValid() {
-		go c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, disco.key, allocResp.Message, discoVerboseLog)
+		go c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, disco.key(), allocResp.Message, discoVerboseLog)
 	}
 }
 
@@ -1221,7 +1223,7 @@ func (c *Conn) populateCLIPingResponseLocked(res *ipnstate.PingResult, latency t
 		}
 		return
 	}
-	regionID := int(ep.ap.Port())
+	regionID := tailcfg.DERPRegionID(ep.ap.Port())
 	res.DERPRegionID = regionID
 	res.DERPRegionCode = c.derpRegionCodeLocked(regionID)
 }
@@ -1666,7 +1668,7 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, is
 		return c.sendUDP(addr, b, isDisco, isGeneveEncap)
 	}
 
-	regionID := int(addr.Port())
+	regionID := tailcfg.DERPRegionID(addr.Port())
 	ch := c.derpWriteChanForRegion(regionID, pubKey)
 	if ch == nil {
 		metricSendDERPErrorChan.Add(1)
@@ -2376,7 +2378,8 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		if epDisco == nil {
 			return
 		}
-		if epDisco.key != di.discoKey {
+		// TODO(cmol): Switch active keys based on what we see here
+		if epDisco.key() != di.discoKey {
 			if isVia {
 				metricRecvDiscoCallMeMaybeViaBadDisco.Add(1)
 			} else {
@@ -2401,13 +2404,13 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		}
 		if isVia {
 			c.dlogf("[v1] magicsock: disco: %v<-%v via %v (%v, %v)  got call-me-maybe-via, %d endpoints",
-				c.discoAtomic.Short(), epDisco.short, via.ServerDisco.ShortString(),
+				c.discoAtomic.Short(), epDisco.shortString(), via.ServerDisco.ShortString(),
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				len(via.AddrPorts))
 			c.relayManager.handleCallMeMaybeVia(ep, lastBest, lastBestIsTrusted, via)
 		} else {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got call-me-maybe, %d endpoints",
-				c.discoAtomic.Short(), epDisco.short,
+				c.discoAtomic.Short(), epDisco.shortString(),
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				len(cmm.MyNumber))
 			go ep.handleCallMeMaybe(cmm)
@@ -2441,7 +2444,8 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 		if epDisco == nil {
 			return
 		}
-		if epDisco.key != di.discoKey {
+		// TODO(cmol): Switch active keys based on what we see here
+		if epDisco.key() != di.discoKey {
 			if isResp {
 				metricRecvDiscoAllocUDPRelayEndpointResponseBadDisco.Add(1)
 			} else {
@@ -2453,7 +2457,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 
 		if isResp {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v) got %s, %d endpoints",
-				c.discoAtomic.Short(), epDisco.short,
+				c.discoAtomic.Short(), epDisco.shortString(),
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				msgType,
 				len(resp.AddrPorts))
@@ -2467,7 +2471,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 			return
 		} else {
 			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v) got %s disco[0]=%v disco[1]=%v",
-				c.discoAtomic.Short(), epDisco.short,
+				c.discoAtomic.Short(), epDisco.shortString(),
 				ep.publicKey.ShortString(), derpStr(src.String()),
 				msgType,
 				req.ClientDisco[0].ShortString(), req.ClientDisco[1].ShortString())
@@ -2481,7 +2485,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 			// unexpected
 			return
 		}
-		if !nodeHasCap(c.filt, peer, c.self, tailcfg.PeerCapabilityRelay) {
+		if !nodeHasCap(c.filt, peer, c.self, peercap.Relay) {
 			return
 		}
 		// [Conn.mu] must not be held while publishing, or [Conn.onUDPRelayAllocResp]
@@ -2505,9 +2509,10 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 // c.mu must be held.
 func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic, derpNodeSrc key.NodePublic) (nk key.NodePublic, ok bool) {
 	if !derpNodeSrc.IsZero() {
+		// TODO(cmol): Switch active keys based on what we see here
 		if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
 			epDisco := ep.disco.Load()
-			if epDisco != nil && epDisco.key == dk {
+			if epDisco != nil && epDisco.key() == dk {
 				return derpNodeSrc, true
 			}
 		}
@@ -2517,7 +2522,8 @@ func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic
 	if !dm.NodeKey.IsZero() {
 		if ep, ok := c.peerMap.endpointForNodeKey(dm.NodeKey); ok {
 			epDisco := ep.disco.Load()
-			if epDisco != nil && epDisco.key == dk {
+			// TODO(cmol): Switch active keys based on what we see here
+			if epDisco != nil && epDisco.key() == dk {
 				return dm.NodeKey, true
 			}
 		}
@@ -2525,6 +2531,9 @@ func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic
 
 	// If there's exactly 1 node in our netmap with DiscoKey dk,
 	// then it's not ambiguous which node key dm was from.
+	c.peerMap.nodesMu.RLock()
+	defer c.peerMap.nodesMu.RUnlock()
+
 	if set := c.peerMap.nodesOfDisco[dk]; len(set) == 1 {
 		for nk = range set {
 			return nk, true
@@ -2655,7 +2664,7 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
 		c.dlogf("[v1] magicsock: want call-me-maybe but endpoints stale; restunning")
 
 		mak.Set(&c.onEndpointRefreshed, de, func() {
-			c.dlogf("[v1] magicsock: STUN done; sending call-me-maybe to %v %v", epDisco.short, de.publicKey.ShortString())
+			c.dlogf("[v1] magicsock: STUN done; sending call-me-maybe to %v %v", epDisco.shortString(), de.publicKey.ShortString())
 			c.enqueueCallMeMaybe(derpAddr, de)
 		})
 		// TODO(bradfitz): make a new 'reSTUNQuickly' method
@@ -2674,12 +2683,12 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
 	for _, ep := range c.lastEndpoints {
 		eps = append(eps, ep.Addr)
 	}
-	go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, de.publicKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+	go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, de.publicKey, epDisco.key(), &disco.CallMeMaybe{MyNumber: eps}, discoLog)
 	if debugSendCallMeUnknownPeer() {
 		// Send a callMeMaybe packet to a non-existent peer
 		unknownKey := key.NewNode().Public()
 		c.logf("magicsock: sending CallMeMaybe to unknown peer per TS_DEBUG_SEND_CALLME_UNKNOWN_PEER")
-		go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, unknownKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+		go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, unknownKey, epDisco.key(), &disco.CallMeMaybe{MyNumber: eps}, discoLog)
 	}
 }
 
@@ -2934,7 +2943,7 @@ func (c *Conn) updateRelayServersSet(filt *filter.Filter, self tailcfg.NodeView,
 			// compiled [tailcfg.CurrentCapabilityVersion]) forward.
 			continue
 		}
-		if !nodeHasCap(filt, maybeCandidate, self, tailcfg.PeerCapabilityRelayTarget) {
+		if !nodeHasCap(filt, maybeCandidate, self, peercap.RelayTarget) {
 			continue
 		}
 		relayServers.Add(candidatePeerRelay{
@@ -2949,7 +2958,7 @@ func (c *Conn) updateRelayServersSet(filt *filter.Filter, self tailcfg.NodeView,
 }
 
 // nodeHasCap returns true if src has cap on dst, otherwise it returns false.
-func nodeHasCap(filt *filter.Filter, src, dst tailcfg.NodeView, cap tailcfg.PeerCapability) bool {
+func nodeHasCap(filt *filter.Filter, src, dst tailcfg.NodeView, cap peercap.Cap) bool {
 	if filt == nil ||
 		!src.Valid() ||
 		!dst.Valid() {
@@ -3025,8 +3034,8 @@ func (c *Conn) setNetworkMapInternal(self tailcfg.NodeView, peers []tailcfg.Node
 	peersChanged, selfWasValid := c.updateNodes(self, peers)
 
 	relayClientEnabled := self.Valid() &&
-		!self.HasCap(tailcfg.NodeAttrDisableRelayClient) &&
-		!self.HasCap(tailcfg.NodeAttrOnlyTCP443)
+		!self.HasCap(nodecap.DisableRelayClient) &&
+		!self.HasCap(nodecap.OnlyTCP443)
 
 	udpOffloadKnobsChanged := false
 	var curGRO, curGSO bool
@@ -3217,10 +3226,13 @@ func (c *Conn) upsertPeerLocked(n tailcfg.NodeView, flags debugFlags, entriesPer
 		}
 		var oldDiscoKey key.DiscoPublic
 		if epDisco := ep.disco.Load(); epDisco != nil {
-			oldDiscoKey = epDisco.key
+			// Upserted peers originates from control. Compare with the discoKey
+			// learned from control.
+			oldDiscoKey = epDisco.keyFromControl()
 		}
 		ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
-		c.peerMap.upsertEndpoint(ep, oldDiscoKey) // maybe update discokey mappings in peerMap
+		// Maybe update the control learned discokey mappings in peerMap.
+		c.peerMap.upsertEndpoint(ep, oldDiscoKey, false)
 		return
 	}
 
@@ -3283,7 +3295,7 @@ func (c *Conn) upsertPeerLocked(n tailcfg.NodeView, flags debugFlags, entriesPer
 	}
 
 	ep.updateFromNode(n, flags.heartbeatDisabled, flags.probeUDPLifetimeOn)
-	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+	c.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
 }
 
 // UpsertPeer adds or updates a single peer in c. It is the efficient
@@ -3391,7 +3403,7 @@ func (c *Conn) relayCandidateLocked(p tailcfg.NodeView) (ok bool, cp candidatePe
 	if !capVerIsRelayCapable(p.Cap()) {
 		return false, candidatePeerRelay{}
 	}
-	if !nodeHasCap(c.filt, p, c.self, tailcfg.PeerCapabilityRelayTarget) {
+	if !nodeHasCap(c.filt, p, c.self, peercap.RelayTarget) {
 		return false, candidatePeerRelay{}
 	}
 	return true, candidatePeerRelay{
@@ -3471,7 +3483,7 @@ func (c *connBind) BatchSize() int {
 	// TODO(raggi): determine by properties rather than hardcoding platform behavior
 	switch runtime.GOOS {
 	case "linux":
-		return conn.IdealBatchSize
+		return batching.BatchSizeFromEnv(conn.IdealBatchSize)
 	default:
 		return 1
 	}
@@ -3973,7 +3985,7 @@ func (c *Conn) UpdateStatus(sb *ipnstate.StatusBuilder) {
 		})
 	}
 
-	c.foreachActiveDerpSortedLocked(func(node int, ad activeDerp) {
+	c.foreachActiveDerpSortedLocked(func(node tailcfg.DERPRegionID, ad activeDerp) {
 		// TODO(bradfitz): add a method to ipnstate.StatusBuilder
 		// to include all the DERP connections we have open
 		// and add it here. See the other caller of foreachActiveDerpSortedLocked.
@@ -4100,7 +4112,7 @@ func (c *Conn) DebugPickNewDERP() error {
 	return errors.New("too few regions")
 }
 
-func (c *Conn) DebugForcePreferDERP(n int) {
+func (c *Conn) DebugForcePreferDERP(n tailcfg.DERPRegionID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -4369,7 +4381,7 @@ func (c *Conn) AddNetcheckReportForTest(dm *tailcfg.DERPMap, report *netcheck.Re
 // few regions), netcheck's history retains every region measured by the most
 // recent full netcheck, so this can rank regions the latest report did not
 // re-probe. It returns nil if the netcheck client is not yet initialized.
-func (c *Conn) GetDERPRegionLatency() map[int]time.Duration {
+func (c *Conn) GetDERPRegionLatency() map[tailcfg.DERPRegionID]time.Duration {
 	if c.netChecker == nil {
 		return nil
 	}
@@ -4518,7 +4530,8 @@ func (c *Conn) HandleDiscoKeyAdvertisement(node tailcfg.NodeView, update packet.
 
 	oldDiscoKey := key.DiscoPublic{}
 	if epDisco := ep.disco.Load(); epDisco != nil {
-		oldDiscoKey = epDisco.key
+		// Compare with the known key (could be a zero key) learned via TSMP.
+		oldDiscoKey = epDisco.keyFromTSMP()
 	}
 	// If the key did not change, count it and return.
 	if oldDiscoKey.Compare(discoKey) == 0 {
@@ -4527,8 +4540,8 @@ func (c *Conn) HandleDiscoKeyAdvertisement(node tailcfg.NodeView, update packet.
 		return
 	}
 	c.discoInfoForKnownPeerLocked(discoKey)
-	ep.updateDiscoKey(discoKey)
-	c.peerMap.upsertEndpoint(ep, oldDiscoKey)
+	ep.updateTSMPDiscoKey(discoKey)
+	c.peerMap.upsertEndpoint(ep, oldDiscoKey, true)
 	if !oldDiscoKey.IsZero() && !c.peerMap.knownPeerDiscoKey(oldDiscoKey) {
 		delete(c.discoInfo, oldDiscoKey)
 	}

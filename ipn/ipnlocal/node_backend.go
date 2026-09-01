@@ -24,6 +24,8 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -227,13 +229,13 @@ func (nb *nodeBackend) SelfUserID() tailcfg.UserID {
 }
 
 // SelfHasCap reports whether the specified capability was granted to the self node in the most recent netmap.
-func (nb *nodeBackend) SelfHasCap(wantCap tailcfg.NodeCapability) bool {
+func (nb *nodeBackend) SelfHasCap(wantCap nodecap.Cap) bool {
 	return nb.SelfHasCapOr(wantCap, false)
 }
 
 // SelfHasCapOr is like [nodeBackend.SelfHasCap], but returns the specified default value
 // if the netmap is not available yet.
-func (nb *nodeBackend) SelfHasCapOr(wantCap tailcfg.NodeCapability, def bool) bool {
+func (nb *nodeBackend) SelfHasCapOr(wantCap nodecap.Cap, def bool) bool {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	if nb.netMap == nil {
@@ -418,8 +420,8 @@ func (nb *nodeBackend) PeerCaps(src netip.Addr) tailcfg.PeerCapMap {
 }
 
 // srcIsUnsignedPeerLocked reports whether src is an address of a peer with
-// UnsignedPeerAPIOnly set. Such peers are not covered by tailnet lock and must
-// never be granted peer capabilities.
+// UnsignedPeerAPIOnly set. Such peers are not covered by tailnet lock and may
+// only hold the capabilities permitted by capsAllowedForUnsignedPeer.
 //
 // nb.mu must be held before calling.
 func (nb *nodeBackend) srcIsUnsignedPeerLocked(src netip.Addr) bool {
@@ -431,10 +433,21 @@ func (nb *nodeBackend) srcIsUnsignedPeerLocked(src netip.Addr) bool {
 	return ok && n.UnsignedPeerAPIOnly()
 }
 
-func (nb *nodeBackend) peerCapsLocked(src netip.Addr) tailcfg.PeerCapMap {
-	if nb.srcIsUnsignedPeerLocked(src) {
-		return nil
+// capsAllowedForUnsignedPeer filters caps down to the set that an unsigned
+// (UnsignedPeerAPIOnly) peer may hold. Unsigned peers aren't covered by
+// tailnet lock, so a possibly malicious control server must not be able to
+// grant them capabilities. The sole exception is PeerCapabilityIngress:
+// Tailscale Funnel ingress nodes are unsigned by design, and the capability
+// only permits ingress requests over the PeerAPI, which unsigned peers can
+// already reach.
+func capsAllowedForUnsignedPeer(caps tailcfg.PeerCapMap) tailcfg.PeerCapMap {
+	if vals, ok := caps[tailcfg.PeerCapabilityIngress]; ok {
+		return tailcfg.PeerCapMap{tailcfg.PeerCapabilityIngress: vals}
 	}
+	return nil
+}
+
+func (nb *nodeBackend) peerCapsLocked(src netip.Addr) tailcfg.PeerCapMap {
 	if nb.netMap == nil {
 		return nil
 	}
@@ -450,7 +463,11 @@ func (nb *nodeBackend) peerCapsLocked(src netip.Addr) tailcfg.PeerCapMap {
 		}
 		dst := a.Addr()
 		if dst.BitLen() == src.BitLen() { // match on family
-			return filt.CapsWithValues(src, dst)
+			caps := filt.CapsWithValues(src, dst)
+			if nb.srcIsUnsignedPeerLocked(src) {
+				caps = capsAllowedForUnsignedPeer(caps)
+			}
+			return caps
 		}
 	}
 	return nil
@@ -463,9 +480,6 @@ func (nb *nodeBackend) peerCapsLocked(src netip.Addr) tailcfg.PeerCapMap {
 func (nb *nodeBackend) PeerCapsForIP(src, dst netip.Addr) tailcfg.PeerCapMap {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
-	if nb.srcIsUnsignedPeerLocked(src) {
-		return nil
-	}
 	if nb.netMap == nil {
 		return nil
 	}
@@ -473,7 +487,11 @@ func (nb *nodeBackend) PeerCapsForIP(src, dst netip.Addr) tailcfg.PeerCapMap {
 	if filt == nil {
 		return nil
 	}
-	return filt.CapsWithValues(src, dst)
+	caps := filt.CapsWithValues(src, dst)
+	if nb.srcIsUnsignedPeerLocked(src) {
+		caps = capsAllowedForUnsignedPeer(caps)
+	}
+	return caps
 }
 
 // PeerCapsForService returns the capabilities that remote src IP has when
@@ -483,9 +501,6 @@ func (nb *nodeBackend) PeerCapsForIP(src, dst netip.Addr) tailcfg.PeerCapMap {
 func (nb *nodeBackend) PeerCapsForService(src netip.Addr, svcName tailcfg.ServiceName) tailcfg.PeerCapMap {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
-	if nb.srcIsUnsignedPeerLocked(src) {
-		return nil
-	}
 	if nb.netMap == nil {
 		return nil
 	}
@@ -496,7 +511,11 @@ func (nb *nodeBackend) PeerCapsForService(src netip.Addr, svcName tailcfg.Servic
 	addrs := nb.netMap.GetVIPServiceIPMap()[svcName]
 	for _, ip := range addrs {
 		if ip.BitLen() == src.BitLen() {
-			return filt.CapsWithValues(src, ip)
+			caps := filt.CapsWithValues(src, ip)
+			if nb.srcIsUnsignedPeerLocked(src) {
+				caps = capsAllowedForUnsignedPeer(caps)
+			}
+			return caps
 		}
 	}
 	return nil
@@ -504,7 +523,7 @@ func (nb *nodeBackend) PeerCapsForService(src netip.Addr, svcName tailcfg.Servic
 
 // PeerHasCap reports whether the peer contains the given capability string,
 // with any value(s).
-func (nb *nodeBackend) PeerHasCap(peer tailcfg.NodeView, wantCap tailcfg.PeerCapability) bool {
+func (nb *nodeBackend) PeerHasCap(peer tailcfg.NodeView, wantCap peercap.Cap) bool {
 	if !peer.Valid() {
 		return false
 	}
@@ -519,7 +538,7 @@ func (nb *nodeBackend) PeerHasCap(peer tailcfg.NodeView, wantCap tailcfg.PeerCap
 	return false
 }
 
-func (nb *nodeBackend) peerHasCapLocked(addr netip.Addr, wantCap tailcfg.PeerCapability) bool {
+func (nb *nodeBackend) peerHasCapLocked(addr netip.Addr, wantCap peercap.Cap) bool {
 	return nb.peerCapsLocked(addr).HasCapability(wantCap)
 }
 
@@ -566,7 +585,7 @@ func (nb *nodeBackend) PeerIsReachable(rp RouteCheckReport, p tailcfg.NodeView) 
 	self := nm.SelfNode
 	useRouteCheck := isRouteCheckEnabled(self)
 
-	if !useRouteCheck && !self.HasCap(tailcfg.NodeAttrClientSideReachability) {
+	if !useRouteCheck && !self.HasCap(nodecap.ClientSideReachability) {
 		// Legacy behavior is to always trust the control plane, which
 		// isn’t always correct because the peer could be slow to check
 		// in so that control marks it as offline.
@@ -579,7 +598,7 @@ func (nb *nodeBackend) PeerIsReachable(rp RouteCheckReport, p tailcfg.NodeView) 
 		return true
 	}
 
-	if !useRouteCheck && !self.HasCap(tailcfg.NodeAttrClientSideReachabilityRouteCheck) {
+	if !useRouteCheck && !self.HasCap(nodecap.ClientSideReachabilityRouteCheck) {
 		// TODO(sfllaw): The following does not actually test for client-side
 		// reachability. This would require a mechanism that tracks whether the
 		// current node can actually reach this peer, either because they are
@@ -1059,6 +1078,10 @@ type netmapDeltaResult struct {
 	// way that requires a WireGuard session reset (see
 	// [nodeBackend.discoChangedLocked]).
 	DiscoChanged set.Set[key.NodePublic]
+
+	// RemovedPeers is a slice of peer stable node IDs (if any) that were
+	// removed by applying the delta.
+	RemovedPeers []tailcfg.StableNodeID
 }
 
 // UpdateNetmapDelta applies the given netmap mutations to the live
@@ -1143,6 +1166,7 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (res netmap
 				nb.removeNodeNameLocked(old.Name())
 				delete(nb.peers, nid)
 				rt.RemovePeer(nid)
+				res.RemovedPeers = append(res.RemovedPeers, old.StableID())
 			}
 			continue
 		}
@@ -1214,7 +1238,7 @@ func (nb *nodeBackend) magicDNSHostAddrs(fqdn dnsname.FQDN) (ips []netip.Addr, o
 		!nm.GetAddresses().ContainsFunc(tsaddr.PrefixIs4) {
 		flags |= selfV6Only
 	}
-	if nm.AllCaps.Contains(tailcfg.NodeAttrMagicDNSPeerAAAA) {
+	if nm.AllCaps.Contains(nodecap.MagicDNSPeerAAAA) {
 		flags |= wantAAAA
 	}
 	return magicDNSAddrs(n.Addresses(), flags), true
@@ -1257,18 +1281,29 @@ func (nb *nodeBackend) magicDNSSubdomainHost(fqdn dnsname.FQDN) bool {
 		return false
 	}
 	if nm := nb.netMap; nm != nil && nm.SelfNode.Valid() && nm.SelfNode.ID() == n.ID() {
-		return nm.AllCaps.Contains(tailcfg.NodeAttrDNSSubdomainResolve)
+		return nm.AllCaps.Contains(nodecap.DNSSubdomainResolve)
 	}
-	return n.CapMap().Contains(tailcfg.NodeAttrDNSSubdomainResolve)
+	return n.CapMap().Contains(nodecap.DNSSubdomainResolve)
 }
 
 // nodeByFQDNLocked returns the node (peer or self) with the given
-// MagicDNS FQDN. nb.mu must be held.
+// MagicDNS FQDN. If fqdn is a short name (has no suffix),
+// it is resolved only if MagicDNS is enabled.
+// nb.mu must be held.
 func (nb *nodeBackend) nodeByFQDNLocked(fqdn dnsname.FQDN) (_ tailcfg.NodeView, ok bool) {
+	nm := nb.netMap
+	if nm == nil {
+		return tailcfg.NodeView{}, false
+	}
 	// The resolver already lowercases query names, but lowercase
 	// again (nearly free when already lowercase) so that no other
 	// caller of the [resolver.MagicDNSHosts] hook can miss on case.
-	nid, ok := nb.nodeByName[strings.ToLower(strings.TrimSuffix(string(fqdn), "."))]
+	canon := strings.ToLower(strings.TrimSuffix(string(fqdn), "."))
+	// Don't resolve bare hostnames (e.g. "foo") if MagicDNS is disabled.
+	if !nm.DNS.Proxied && !strings.Contains(canon, ".") {
+		return tailcfg.NodeView{}, false
+	}
+	nid, ok := nb.nodeByName[canon]
 	if !ok {
 		return tailcfg.NodeView{}, false
 	}
@@ -1457,7 +1492,7 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 		addrFlags |= selfV6Only
 		dcfg.OnlyIPv6 = true
 	}
-	if nm.AllCaps.Contains(tailcfg.NodeAttrMagicDNSPeerAAAA) {
+	if nm.AllCaps.Contains(nodecap.MagicDNSPeerAAAA) {
 		addrFlags |= wantAAAA
 	}
 
@@ -1486,6 +1521,9 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 			set(peer.Name(), peer.Addresses())
 		}
 	}
+	// extraRecordNames are the ExtraRecord FQDNs, tracked separately from
+	// dcfg.Hosts because on Windows that map also holds every node's records.
+	var extraRecordNames []dnsname.FQDN
 	for _, rec := range nm.DNS.ExtraRecords {
 		switch rec.Type {
 		case "", "A", "AAAA":
@@ -1502,6 +1540,9 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 		fqdn, err := dnsname.ToFQDN(rec.Name)
 		if err != nil {
 			continue
+		}
+		if !slices.Contains(extraRecordNames, fqdn) {
+			extraRecordNames = append(extraRecordNames, fqdn)
 		}
 		dcfg.Hosts[fqdn] = append(dcfg.Hosts[fqdn], ip)
 	}
@@ -1551,6 +1592,34 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 		}
 	}
 
+	// coverExtraRecords adds an authoritative (resolver-less) route for each
+	// ExtraRecord name not already covered by one, so dns.Manager can scope
+	// quad-100 to those names instead of having to install it as the OS's
+	// primary resolver just to answer them. This is the same convention
+	// addSplitDNSRoutes implements for control-sent empty routes (Issue 2706);
+	// here we apply it to records control sent without a matching route.
+	//
+	// Only ExtraRecords, not all of dcfg.Hosts: on Windows Hosts also carries
+	// every node's records, and routing each one individually would mean a
+	// per-node NRPT rule.
+	//
+	// Must run after all addSplitDNSRoutes calls so a control-sent route for
+	// the same suffix wins.
+	coverExtraRecords := func() {
+		for _, fqdn := range extraRecordNames {
+			covered := false
+			for route := range dcfg.Routes {
+				if route.Contains(fqdn) {
+					covered = true
+					break
+				}
+			}
+			if !covered {
+				dcfg.Routes[fqdn] = nil
+			}
+		}
+	}
+
 	// conn25 split DNS routes are calculated from the domains in the SelfNode.CapMap
 	// section of the netmap, so need to be assembled separately.
 	// TODO(tailscale/corp#37125): make this a hook the extension can add
@@ -1576,6 +1645,7 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 
 			addSplitDNSRoutes(useWithExitNodeRoutes(nm.DNS.Routes))
 			addSplitDNSRoutes(useWithExitNodeRoutes(conn25AppRoutes))
+			coverExtraRecords()
 			return dcfg
 		}
 	}
@@ -1594,6 +1664,7 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 	// Add split DNS routes, with no regard to exit node configuration.
 	addSplitDNSRoutes(nm.DNS.Routes)
 	addSplitDNSRoutes(conn25AppRoutes)
+	coverExtraRecords()
 
 	// Set FallbackResolvers as the default resolvers in the
 	// scenarios that can't handle a purely split-DNS config. See

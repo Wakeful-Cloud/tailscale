@@ -24,6 +24,7 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime"
 	"tailscale.com/types/dnstype"
@@ -58,7 +59,7 @@ func TestUpdatePeersStateFromResponse(t *testing.T) {
 			n.LastSeen = &t
 		}
 	}
-	withDERP := func(regionID int) func(*tailcfg.Node) {
+	withDERP := func(regionID tailcfg.DERPRegionID) func(*tailcfg.Node) {
 		return func(n *tailcfg.Node) {
 			n.HomeDERP = regionID
 		}
@@ -1053,7 +1054,7 @@ func first[T any](s []T) T {
 }
 
 func TestDeltaDERPMap(t *testing.T) {
-	regions1 := map[int]*tailcfg.DERPRegion{
+	regions1 := map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 		1: {
 			RegionID: 1,
 			Nodes: []*tailcfg.DERPNode{{
@@ -1067,7 +1068,7 @@ func TestDeltaDERPMap(t *testing.T) {
 	}
 
 	// As above, but with a changed IPv4 addr
-	regions2 := map[int]*tailcfg.DERPRegion{1: regions1[1].Clone()}
+	regions2 := map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: regions1[1].Clone()}
 	regions2[1].Nodes[0].IPv4 = "127.0.0.1"
 
 	type step struct {
@@ -1107,10 +1108,10 @@ func TestDeltaDERPMap(t *testing.T) {
 				// Send home params, want to still have the same regions
 				{
 					&tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{
-						RegionScore: map[int]float64{1: 0.5},
+						RegionScore: map[tailcfg.DERPRegionID]float64{1: 0.5},
 					}},
 					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
-						RegionScore: map[int]float64{1: 0.5},
+						RegionScore: map[tailcfg.DERPRegionID]float64{1: 0.5},
 					}},
 				},
 			},
@@ -1121,24 +1122,24 @@ func TestDeltaDERPMap(t *testing.T) {
 				// Send a DERP map with home params
 				{
 					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
-						RegionScore: map[int]float64{1: 0.5},
+						RegionScore: map[tailcfg.DERPRegionID]float64{1: 0.5},
 					}},
 					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
-						RegionScore: map[int]float64{1: 0.5},
+						RegionScore: map[tailcfg.DERPRegionID]float64{1: 0.5},
 					}},
 				},
 				// Sending a struct with a 'HomeParams' field but nil RegionScore doesn't change home params...
 				{
 					&tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{RegionScore: nil}},
 					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
-						RegionScore: map[int]float64{1: 0.5},
+						RegionScore: map[tailcfg.DERPRegionID]float64{1: 0.5},
 					}},
 				},
 				// ... but sending one with a non-nil and empty RegionScore field zeroes that out.
 				{
-					&tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{RegionScore: map[int]float64{}}},
+					&tailcfg.DERPMap{HomeParams: &tailcfg.DERPHomeParams{RegionScore: map[tailcfg.DERPRegionID]float64{}}},
 					&tailcfg.DERPMap{Regions: regions1, HomeParams: &tailcfg.DERPHomeParams{
-						RegionScore: map[int]float64{},
+						RegionScore: map[tailcfg.DERPRegionID]float64{},
 					}},
 				},
 			},
@@ -1250,38 +1251,38 @@ func TestPeerChangeDiff(t *testing.T) {
 		},
 		{
 			name: "patch-capmap-add-value-to-existing-key",
-			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
-			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: []tailcfg.RawMessage{"true"}}},
-			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: []tailcfg.RawMessage{"true"}}},
+			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil}},
+			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: []tailcfg.RawMessage{"true"}}},
+			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: []tailcfg.RawMessage{"true"}}},
 		},
 		{
 			name: "patch-capmap-add-new-key",
-			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
-			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil, tailcfg.CapabilityDebug: nil}},
-			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil, tailcfg.CapabilityDebug: nil}},
+			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil}},
+			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil, nodecap.Debug: nil}},
+			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil, nodecap.Debug: nil}},
 		},
 		{
 			name: "patch-capmap-remove-key",
-			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil}},
 			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{}},
 			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{}},
 		},
 		{
 			name: "patch-capmap-remove-as-nil",
-			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			a:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil}},
 			b:    &tailcfg.Node{ID: 1},
 			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{}},
 		},
 		{
 			name: "patch-capmap-add-key-to-empty-map",
 			a:    &tailcfg.Node{ID: 1},
-			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
-			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			b:    &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil}},
+			want: &tailcfg.PeerChange{NodeID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil}},
 		},
 		{
 			name:      "patch-capmap-no-change",
-			a:         &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
-			b:         &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{tailcfg.CapabilityAdmin: nil}},
+			a:         &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil}},
+			b:         &tailcfg.Node{ID: 1, CapMap: tailcfg.NodeCapMap{nodecap.Admin: nil}},
 			wantEqual: true,
 		},
 	}

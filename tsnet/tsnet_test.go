@@ -52,7 +52,9 @@ import (
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/deptest"
 	"tailscale.com/tstest/integration"
@@ -557,6 +559,115 @@ func TestConn(t *testing.T) {
 	}
 }
 
+// TestDialThroughExitNode verifies that a tsnet server configured to use
+// another node as an exit node (via the ExitNodeID pref) routes a Dial of
+// a non-tailnet IP over WireGuard to that exit node rather than dialing
+// it from the host network.
+//
+// The exit node here is itself a tsnet server. tsnet does not forward
+// exit-node traffic onward to the host network (flows with no matching
+// listener are rejected in getTCPHandlerForFlow), so the test stands in
+// for the upstream destination with a fallback TCP handler on the exit
+// node that echoes the connection.
+func TestDialThroughExitNode(t *testing.T) {
+	tstest.ResourceCheck(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	controlURL, c := startControl(t)
+	s1, s1ip, s1PubKey := startServer(t, ctx, controlURL, "s1")
+
+	// dstAddr is a TEST-NET-3 (documentation) address standing in for
+	// an address out on the internet, past the exit node.
+	dstAddr := netip.MustParseAddrPort("203.0.113.42:8080")
+
+	var gotSrc atomic.Value // of netip.AddrPort; src seen by s1's fallback handler
+	s1.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
+		t.Logf("s1: fallback TCP handler called for %v -> %v", src, dst)
+		if dst != dstAddr {
+			return nil, true // reject with a RST
+		}
+		gotSrc.Store(src)
+		return func(conn net.Conn) {
+			defer conn.Close()
+			io.Copy(conn, conn)
+		}, true
+	})
+
+	lc1 := must.Get(s1.LocalClient())
+	must.Get(lc1.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs: ipn.Prefs{
+			AdvertiseRoutes: tsaddr.ExitRoutes(),
+		},
+		AdvertiseRoutesSet: true,
+	}))
+	c.SetSubnetRoutes(s1PubKey, tsaddr.ExitRoutes())
+
+	// Start s2 after s1 is fully set up, so s2's first netmap already
+	// shows s1 offering exit node routes.
+	s2, s2ip, _ := startServer(t, ctx, controlURL, "s2")
+	lc2 := must.Get(s2.LocalClient())
+
+	// Ping to make sure the connection is up.
+	pingCtx, cancelPing := pingTimeout(ctx)
+	defer cancelPing()
+	must.Get(lc2.Ping(pingCtx, s1ip, tailcfg.PingTSMP))
+
+	must.Get(lc2.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs: ipn.Prefs{
+			ExitNodeID: c.Node(s1PubKey).StableID,
+		},
+		ExitNodeIDSet: true,
+	}))
+
+	// Wait for the exit node's default route to be installed in s2's
+	// route table; it's what UserDial consults to decide that a
+	// non-tailnet IP should be dialed through netstack over WireGuard.
+	if err := tstest.WaitFor(30*time.Second, func() error {
+		p, ok := s2.lb.PeerForIP(dstAddr.Addr())
+		if !ok {
+			return fmt.Errorf("no peer for %v yet", dstAddr.Addr())
+		}
+		if p.Node.Key() != s1PubKey {
+			return fmt.Errorf("peer for %v is %v; want s1 %v", dstAddr.Addr(), p.Node.Key(), s1PubKey)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A dial of a non-tailnet IP must go through the exit node, never
+	// the host network.
+	s2dialer := s2.Sys().Dialer.Get()
+	s2dialer.SetSystemDialerForTest(func(ctx context.Context, netw, addr string) (net.Conn, error) {
+		t.Logf("s2: unexpected system dial called for %s %s", netw, addr)
+		return nil, fmt.Errorf("system dialer called unexpectedly for %s %s", netw, addr)
+	})
+
+	conn, err := s2.Dial(ctx, "tcp", dstAddr.String())
+	if err != nil {
+		t.Fatalf("s2.Dial(%v): %v", dstAddr, err)
+	}
+	defer conn.Close()
+
+	const msg = "hello via exit node"
+	if _, err := io.WriteString(conn, msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := string(buf); got != msg {
+		t.Fatalf("echo through exit node: got %q, want %q", got, msg)
+	}
+
+	src, _ := gotSrc.Load().(netip.AddrPort)
+	if src.Addr() != s2ip {
+		t.Errorf("exit node saw connection from %v; want s2's tailnet IP %v", src, s2ip)
+	}
+}
+
 func TestLoopbackLocalAPI(t *testing.T) {
 	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/8557")
 	tstest.ResourceCheck(t)
@@ -820,9 +931,28 @@ func TestFunnel(t *testing.T) {
 	ctx, dialCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer dialCancel()
 
-	controlURL, _ := startControl(t)
+	controlURL, control := startControl(t)
 	s1, _, _ := startServer(t, ctx, controlURL, "s1")
-	s2, _, _ := startServer(t, ctx, controlURL, "s2")
+	s2, s2ip, s2key := startServer(t, ctx, controlURL, "s2")
+
+	// Real Funnel ingress nodes appear in the target node's netmap as
+	// unsigned (UnsignedPeerAPIOnly) peers. Mark s2 the same way and wait
+	// for s1 to see it, so that this test exercises the same peer
+	// capability checks that production Funnel traffic does.
+	control.SetUnsignedPeerAPIOnly(s2key, true)
+	lc1 := must.Get(s1.LocalClient())
+	if err := tstest.WaitFor(10*time.Second, func() error {
+		res, err := lc1.WhoIs(ctx, s2ip.String())
+		if err != nil {
+			return err
+		}
+		if !res.Node.UnsignedPeerAPIOnly {
+			return errors.New("s1 does not yet see s2 as UnsignedPeerAPIOnly")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	ln := must.Get(s1.ListenFunnel("tcp", ":443"))
 	defer ln.Close()
@@ -992,17 +1122,17 @@ func setUpServiceState(t *testing.T, name, ip string, host, client *Server,
 	// is a mapping from the Service name to the Service VIP.
 	cm := host.lb.NetMap().SelfNode.CapMap()
 	svcIPMap := make(tailcfg.ServiceIPMappings)
-	if cm.Contains(tailcfg.NodeAttrServiceHost) {
-		parsed := must.Get(tailcfg.UnmarshalNodeCapViewJSON[tailcfg.ServiceIPMappings](cm, tailcfg.NodeAttrServiceHost))
+	if cm.Contains(nodecap.ServiceHost) {
+		parsed := must.Get(tailcfg.UnmarshalNodeCapViewJSON[tailcfg.ServiceIPMappings](cm, nodecap.ServiceHost))
 		if len(parsed) != 1 {
-			t.Fatalf("expected only one capability for %v, got %d", tailcfg.NodeAttrServiceHost, len(parsed))
+			t.Fatalf("expected only one capability for %v, got %d", nodecap.ServiceHost, len(parsed))
 		}
 		svcIPMap = parsed[0]
 	}
 	svcIPMap[serviceName] = []netip.Addr{netip.MustParseAddr(ip)}
 	svcIPMapJSON := must.Get(json.Marshal(svcIPMap))
 	newCM := cm.AsMap()
-	mak.Set(&newCM, tailcfg.NodeAttrServiceHost, []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)})
+	mak.Set(&newCM, nodecap.ServiceHost, []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)})
 	control.SetNodeCapMap(host.lb.NodeKey(), newCM)
 
 	// The Service host must be allowed to advertise the Service VIP.
@@ -3904,4 +4034,69 @@ func TestListenMultipleEphemeralPorts(t *testing.T) {
 		lt := setupTwoClientTest(t, true)
 		testMultipleEphemeral(t, lt)
 	})
+}
+
+// TestCloseBeforeStart verifies that Close on a Server whose Start never ran
+// (or failed early) does not panic. s.sys is assigned partway through doInit,
+// so it is still nil in that state, and close previously dereferenced
+// s.sys.Bus unconditionally.
+func TestCloseBeforeStart(t *testing.T) {
+	s := &Server{}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestHTTPClientDefaultTransport verifies that the transport returned by
+// HTTPClient matches http.DefaultTransport's settings, except for the
+// fields that HTTPClient intentionally overrides.
+func TestHTTPClientDefaultTransport(t *testing.T) {
+	s := &Server{}
+	tr, ok := s.HTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport is %T; want *http.Transport", s.HTTPClient().Transport)
+	}
+	if tr.DialContext == nil {
+		t.Error("DialContext is nil; want it set to Server.Dial")
+	}
+	if tr.Proxy != nil {
+		t.Error("Proxy is non-nil; want nil, as environment proxies are unreachable over the tailnet")
+	}
+
+	// It is safe for a test to assume that no application has replaced or
+	// modified http.DefaultTransport. Production tsnet code cannot assume that.
+	want := http.DefaultTransport.(*http.Transport)
+	gotv := reflect.ValueOf(tr).Elem()
+	wantv := reflect.ValueOf(want).Elem()
+	for i := range gotv.NumField() {
+		f := gotv.Type().Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		switch f.Name {
+		case "DialContext", "Proxy":
+			// Intentionally different; checked above.
+		case "TLSClientConfig", "TLSNextProto", "HTTP2":
+			// net/http may populate these lazily on http.DefaultTransport
+			// when another test uses HTTP/2. They are nil in its definition.
+			if !gotv.Field(i).IsNil() {
+				t.Errorf("field %s is non-nil; want nil (as defined in http.DefaultTransport)", f.Name)
+			}
+		case "OnProxyConnectResponse", "Dial", "DialTLSContext", "DialTLS",
+			"TLSHandshakeTimeout",
+			"DisableKeepAlives", "DisableCompression",
+			"MaxIdleConns", "MaxIdleConnsPerHost", "MaxConnsPerHost",
+			"IdleConnTimeout", "ResponseHeaderTimeout", "ExpectContinueTimeout",
+			"ProxyConnectHeader", "GetProxyConnectHeader",
+			"MaxResponseHeaderBytes", "WriteBufferSize", "ReadBufferSize",
+			"ForceAttemptHTTP2", "Protocols":
+			// Expected to match http.DefaultTransport.
+			g, w := gotv.Field(i).Interface(), wantv.Field(i).Interface()
+			if !reflect.DeepEqual(g, w) {
+				t.Errorf("field %s = %v; want %v (as in http.DefaultTransport)", f.Name, g, w)
+			}
+		default:
+			t.Errorf("unexpected http.Transport field %q; decide how HTTPClient should handle it and update this test", f.Name)
+		}
+	}
 }

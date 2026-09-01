@@ -1315,6 +1315,27 @@ spec:
                                                                 x-kubernetes-list-type: atomic
                                                         type: object
                                                 type: object
+                                            imagePullSecrets:
+                                                description: |-
+                                                    Nameserver Pod's image pull Secrets.
+                                                    https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec
+                                                items:
+                                                    description: |-
+                                                        LocalObjectReference contains enough information to let you locate the
+                                                        referenced object inside the same namespace.
+                                                    properties:
+                                                        name:
+                                                            default: ""
+                                                            description: |-
+                                                                Name of the referent.
+                                                                This field is effectively required, but due to backwards compatibility is
+                                                                allowed to be empty. Instances of this type with an empty value here are
+                                                                almost certainly wrong.
+                                                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                                            type: string
+                                                    type: object
+                                                    x-kubernetes-map-type: atomic
+                                                type: array
                                             nodeSelector:
                                                 additionalProperties:
                                                     type: string
@@ -1523,6 +1544,15 @@ spec:
                                     AWS contains configuration for pinning each replica to a specific AWS Elastic IP and subnet. Only meaningful
                                     when running on EKS with the AWS Load Balancer Controller. When set, the per-replica values override any
                                     aws-load-balancer-eip-allocations or aws-load-balancer-subnets values supplied via spec.service.annotations.
+
+                                    Leave this unset unless the peer relays must be reachable on addresses you control. Pinning a subnet
+                                    confines a replica's load balancer to that subnet's availability zone, and an AWS Network Load Balancer
+                                    only forwards to targets in a zone that is enabled on it, so a replica whose pod is scheduled into any
+                                    other zone stops receiving traffic. Setting this field therefore also requires pinning the pods to the
+                                    matching zone with a ProxyClass, as described on ElasticIPs. Without this field the AWS Load Balancer
+                                    Controller instead provisions each load balancer across every zone it discovers, and the operator turns on
+                                    cross-zone load balancing so the replica is reachable wherever it happens to be scheduled, with no
+                                    scheduling constraints needed.
                                 properties:
                                     elasticIPs:
                                         description: |-
@@ -1531,12 +1561,25 @@ spec:
                                             per replica: replica N uses ElasticIPs[N]. The list must be at least as long as spec.replicas so every replica
                                             has a distinct EIP; extra entries are permitted so that scale-up doesn't immediately trip validation.
 
+                                            Pinning a subnet enables only that subnet's availability zone on the replica's load balancer, and a Network
+                                            Load Balancer only forwards to targets in an enabled zone. Nothing constrains the scheduler to place the
+                                            replica's pod in that zone, so a pod scheduled elsewhere, including after a reschedule, becomes unreachable
+                                            on its Elastic IP while still appearing healthy.
+
+                                            Every replica of a PeerRelay shares one pod template, so a ProxyClass referenced by spec.proxyClass can
+                                            confine the pods to a zone but cannot place different replicas in different zones. To use this field
+                                            safely, name subnets in a single availability zone and pin the pods to that same zone with a ProxyClass
+                                            setting spec.statefulSet.pod.nodeSelector to topology.kubernetes.io/zone. Note that this trades the zone
+                                            redundancy that running several replicas would otherwise buy. Spreading replicas across zones with their
+                                            own Elastic IPs needs a per-replica scheduling constraint that neither PeerRelay nor ProxyClass can
+                                            currently express.
+
                                             When set, the reconciler stamps
                                             service.beta.kubernetes.io/aws-load-balancer-eip-allocations and
                                             service.beta.kubernetes.io/aws-load-balancer-subnets on each per-replica Service, overriding any values in
                                             spec.service.annotations.
                                         items:
-                                            description: PeerRelayAWSElasticIP pairs an EIP allocation with the subnet in the same AZ.
+                                            description: PeerRelayAWSElasticIP pairs an EIP allocation with the subnet it is attached to.
                                             properties:
                                                 allocationID:
                                                     description: |-
@@ -1546,9 +1589,11 @@ spec:
                                                     type: string
                                                 subnetID:
                                                     description: |-
-                                                        SubnetID is the AWS subnet in the same availability zone as AllocationID (e.g. subnet-0123abcd). Stamped as
-                                                        service.beta.kubernetes.io/aws-load-balancer-subnets on the replica's Service so the NLB is provisioned in
-                                                        the same AZ as the EIP.
+                                                        SubnetID is the AWS subnet the replica's load balancer is provisioned in (e.g. subnet-0123abcd). It must be
+                                                        a public subnet, and no two replicas may name subnets in the same availability zone, since a load balancer
+                                                        accepts only one Elastic IP per zone. A standard VPC Elastic IP is regional rather than zonal, so it takes
+                                                        the zone of whichever subnet it is paired with here. Stamped as
+                                                        service.beta.kubernetes.io/aws-load-balancer-subnets on the replica's Service.
                                                     pattern: ^subnet-[0-9a-f]+$
                                                     type: string
                                             required:
@@ -1690,9 +1735,10 @@ spec:
                                 x-kubernetes-list-type: map
                             endpoints:
                                 description: |-
-                                    Endpoints lists the public address:port pairs each peer relay replica is reachable on. There is one entry
-                                    per replica whose LoadBalancer Service has been assigned a public address; entries appear as the underlying
-                                    cloud provisions each Service.
+                                    Endpoints lists the public address:port pairs each peer relay replica is reachable on. Entries appear as the
+                                    underlying cloud provisions each Service. A replica has one entry per address its LoadBalancer Service was
+                                    given, which is usually one, but a load balancer spanning several availability zones has an address in each
+                                    and every one of them is listed.
                                 items:
                                     properties:
                                         address:
@@ -1716,6 +1762,7 @@ spec:
                                 type: array
                                 x-kubernetes-list-map-keys:
                                     - replica
+                                    - address
                                 x-kubernetes-list-type: map
                         type: object
                 required:
@@ -4158,6 +4205,142 @@ kind: CustomResourceDefinition
 metadata:
     annotations:
         controller-gen.kubebuilder.io/version: v0.17.0
+    name: proxygrouppolicies.tailscale.com
+spec:
+    group: tailscale.com
+    names:
+        kind: ProxyGroupPolicy
+        listKind: ProxyGroupPolicyList
+        plural: proxygrouppolicies
+        shortNames:
+            - pgp
+        singular: proxygrouppolicy
+    scope: Namespaced
+    versions:
+        - additionalPrinterColumns:
+            - jsonPath: .metadata.creationTimestamp
+              name: Age
+              type: date
+          name: v1alpha1
+          schema:
+            openAPIV3Schema:
+                properties:
+                    apiVersion:
+                        description: |-
+                            APIVersion defines the versioned schema of this representation of an object.
+                            Servers should convert recognized schemas to the latest internal value, and
+                            may reject unrecognized values.
+                            More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+                        type: string
+                    kind:
+                        description: |-
+                            Kind is a string value representing the REST resource this object represents.
+                            Servers may infer this from the endpoint the client submits requests to.
+                            Cannot be updated.
+                            In CamelCase.
+                            More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                        type: string
+                    metadata:
+                        type: object
+                    spec:
+                        description: |-
+                            Spec describes the desired state of the ProxyGroupPolicy.
+                            More info:
+                            https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+                        properties:
+                            egress:
+                                description: |-
+                                    Names of ProxyGroup resources that can be used by Service resources within this namespace. An empty list
+                                    denotes that no egress via ProxyGroups is allowed within this namespace.
+                                items:
+                                    type: string
+                                type: array
+                            ingress:
+                                description: |-
+                                    Names of ProxyGroup resources that can be used by Ingress resources within this namespace. An empty list
+                                    denotes that no ingress via ProxyGroups is allowed within this namespace.
+                                items:
+                                    type: string
+                                type: array
+                        type: object
+                    status:
+                        description: |-
+                            Status describes the status of the ProxyGroupPolicy. This is set
+                            and managed by the Tailscale operator.
+                        properties:
+                            conditions:
+                                items:
+                                    description: Condition contains details for one aspect of the current state of this API Resource.
+                                    properties:
+                                        lastTransitionTime:
+                                            description: |-
+                                                lastTransitionTime is the last time the condition transitioned from one status to another.
+                                                This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                                            format: date-time
+                                            type: string
+                                        message:
+                                            description: |-
+                                                message is a human readable message indicating details about the transition.
+                                                This may be an empty string.
+                                            maxLength: 32768
+                                            type: string
+                                        observedGeneration:
+                                            description: |-
+                                                observedGeneration represents the .metadata.generation that the condition was set based upon.
+                                                For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                                                with respect to the current state of the instance.
+                                            format: int64
+                                            minimum: 0
+                                            type: integer
+                                        reason:
+                                            description: |-
+                                                reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                                                Producers of specific condition types may define expected values and meanings for this field,
+                                                and whether the values are considered a guaranteed API.
+                                                The value should be a CamelCase string.
+                                                This field may not be empty.
+                                            maxLength: 1024
+                                            minLength: 1
+                                            pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                                            type: string
+                                        status:
+                                            description: status of the condition, one of True, False, Unknown.
+                                            enum:
+                                                - "True"
+                                                - "False"
+                                                - Unknown
+                                            type: string
+                                        type:
+                                            description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                                            maxLength: 316
+                                            pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                                            type: string
+                                    required:
+                                        - lastTransitionTime
+                                        - message
+                                        - reason
+                                        - status
+                                        - type
+                                    type: object
+                                type: array
+                                x-kubernetes-list-map-keys:
+                                    - type
+                                x-kubernetes-list-type: map
+                        type: object
+                required:
+                    - metadata
+                    - spec
+                type: object
+          served: true
+          storage: true
+          subresources:
+            status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+    annotations:
+        controller-gen.kubebuilder.io/version: v0.17.0
     name: proxygroups.tailscale.com
 spec:
     group: tailscale.com
@@ -4426,142 +4609,6 @@ spec:
                                 type: string
                         type: object
                 required:
-                    - spec
-                type: object
-          served: true
-          storage: true
-          subresources:
-            status: {}
----
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-    annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
-    name: proxygrouppolicies.tailscale.com
-spec:
-    group: tailscale.com
-    names:
-        kind: ProxyGroupPolicy
-        listKind: ProxyGroupPolicyList
-        plural: proxygrouppolicies
-        shortNames:
-            - pgp
-        singular: proxygrouppolicy
-    scope: Namespaced
-    versions:
-        - additionalPrinterColumns:
-            - jsonPath: .metadata.creationTimestamp
-              name: Age
-              type: date
-          name: v1alpha1
-          schema:
-            openAPIV3Schema:
-                properties:
-                    apiVersion:
-                        description: |-
-                            APIVersion defines the versioned schema of this representation of an object.
-                            Servers should convert recognized schemas to the latest internal value, and
-                            may reject unrecognized values.
-                            More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
-                        type: string
-                    kind:
-                        description: |-
-                            Kind is a string value representing the REST resource this object represents.
-                            Servers may infer this from the endpoint the client submits requests to.
-                            Cannot be updated.
-                            In CamelCase.
-                            More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-                        type: string
-                    metadata:
-                        type: object
-                    spec:
-                        description: |-
-                            Spec describes the desired state of the ProxyGroupPolicy.
-                            More info:
-                            https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
-                        properties:
-                            egress:
-                                description: |-
-                                    Names of ProxyGroup resources that can be used by Service resources within this namespace. An empty list
-                                    denotes that no egress via ProxyGroups is allowed within this namespace.
-                                items:
-                                    type: string
-                                type: array
-                            ingress:
-                                description: |-
-                                    Names of ProxyGroup resources that can be used by Ingress resources within this namespace. An empty list
-                                    denotes that no ingress via ProxyGroups is allowed within this namespace.
-                                items:
-                                    type: string
-                                type: array
-                        type: object
-                    status:
-                        description: |-
-                            Status describes the status of the ProxyGroupPolicy. This is set
-                            and managed by the Tailscale operator.
-                        properties:
-                            conditions:
-                                items:
-                                    description: Condition contains details for one aspect of the current state of this API Resource.
-                                    properties:
-                                        lastTransitionTime:
-                                            description: |-
-                                                lastTransitionTime is the last time the condition transitioned from one status to another.
-                                                This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
-                                            format: date-time
-                                            type: string
-                                        message:
-                                            description: |-
-                                                message is a human readable message indicating details about the transition.
-                                                This may be an empty string.
-                                            maxLength: 32768
-                                            type: string
-                                        observedGeneration:
-                                            description: |-
-                                                observedGeneration represents the .metadata.generation that the condition was set based upon.
-                                                For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
-                                                with respect to the current state of the instance.
-                                            format: int64
-                                            minimum: 0
-                                            type: integer
-                                        reason:
-                                            description: |-
-                                                reason contains a programmatic identifier indicating the reason for the condition's last transition.
-                                                Producers of specific condition types may define expected values and meanings for this field,
-                                                and whether the values are considered a guaranteed API.
-                                                The value should be a CamelCase string.
-                                                This field may not be empty.
-                                            maxLength: 1024
-                                            minLength: 1
-                                            pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-                                            type: string
-                                        status:
-                                            description: status of the condition, one of True, False, Unknown.
-                                            enum:
-                                                - "True"
-                                                - "False"
-                                                - Unknown
-                                            type: string
-                                        type:
-                                            description: type of condition in CamelCase or in foo.example.com/CamelCase.
-                                            maxLength: 316
-                                            pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
-                                            type: string
-                                    required:
-                                        - lastTransitionTime
-                                        - message
-                                        - reason
-                                        - status
-                                        - type
-                                    type: object
-                                type: array
-                                x-kubernetes-list-map-keys:
-                                    - type
-                                x-kubernetes-list-type: map
-                        type: object
-                required:
-                    - metadata
                     - spec
                 type: object
           served: true

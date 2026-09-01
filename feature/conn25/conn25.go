@@ -9,6 +9,8 @@ package conn25
 
 import (
 	"bytes"
+	"cmp"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +19,7 @@ import (
 	"iter"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -35,6 +38,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstime"
 	"tailscale.com/types/appctype"
 	"tailscale.com/types/key"
@@ -95,6 +99,7 @@ func handleConnectorTransitIP(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, 
 	}
 	if !e.conn25.isConfigured() {
 		http.Error(w, "conn25 not configured", http.StatusServiceUnavailable)
+		return
 	}
 	e.handleConnectorTransitIP(h, w, r)
 }
@@ -141,6 +146,7 @@ func (e *extension) Init(host ipnext.Host) error {
 	e.ctxCancel = cancel
 	go e.sendLoop(ctx)
 	dph.StartFlowExpirySweepers(ctx)
+	e.conn25.connector.startExpirySweeper(ctx)
 	return nil
 }
 
@@ -180,7 +186,7 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 		if urlBase == "" {
 			return "", nil
 		}
-		return urlBase + "/dns-query", nil
+		return fmt.Sprintf("%s/dns-query?app=%s", urlBase, url.QueryEscape(app.Name)), nil
 	}); err != nil {
 		return fmt.Errorf("could not register DNS resolver scheme: %w", err)
 	}
@@ -355,7 +361,7 @@ func (e *extension) handleConnectorTransitIP(h ipnlocal.PeerAPIHandler, w http.R
 		http.Error(w, "Error decoding JSON", http.StatusBadRequest)
 		return
 	}
-	resp := e.conn25.handleConnectorTransitIPRequest(h.Peer(), req)
+	resp := e.conn25.handleConnectorTransitIPRequest(h.Peer(), h.PeerCaps(), req)
 	bs, err := json.Marshal(resp)
 	if err != nil {
 		http.Error(w, "Error encoding JSON", http.StatusInternalServerError)
@@ -413,8 +419,9 @@ func (e *extension) extraWireGuardAllowedIPs(k key.NodePublic) views.Slice[netip
 }
 
 type appAddr struct {
-	app  string
-	addr netip.Addr
+	app         string
+	addr        netip.Addr
+	expiryEntry *list.Element
 }
 
 // Conn25 holds state for routing traffic for a domain via a connector.
@@ -455,8 +462,10 @@ func newConn25(logf logger.Logf) *Conn25 {
 		getIPSets:   getIPSets,
 	}
 	c.connector = &connector{
-		logf:      logf,
-		getIPSets: getIPSets,
+		logf:        logf,
+		getIPSets:   getIPSets,
+		clock:       tstime.StdClock{},
+		expiryQueue: list.New(),
 	}
 	return c
 }
@@ -478,13 +487,14 @@ const dupeTransitIPMessage = "Duplicate transit address in ConnectorTransitIPReq
 const noMatchingPeerIPFamilyMessage = "No peer IP found with matching IP family"
 const addrFamilyMismatchMessage = "Transit and Destination addresses must have matching IP family"
 const unknownAppNameMessage = "The App name in the request does not match a configured App"
+const missingAppPermissionMessage = "You do not have permission to use this App"
 
 // handleConnectorTransitIPRequest creates a ConnectorTransitIPResponse in response
 // to a ConnectorTransitIPRequest. It updates the connectors mapping of
 // TransitIP->DestinationIP per peer (using the Peer's IP that matches the address
 // family of the transitIP). If a peer has stored this mapping in the connector,
 // Conn25 will route traffic to TransitIPs to DestinationIPs for that peer.
-func (c *Conn25) handleConnectorTransitIPRequest(n tailcfg.NodeView, ctipr ConnectorTransitIPRequest) ConnectorTransitIPResponse {
+func (c *Conn25) handleConnectorTransitIPRequest(n tailcfg.NodeView, peerCaps tailcfg.PeerCapMap, ctipr ConnectorTransitIPRequest) ConnectorTransitIPResponse {
 	resp := ConnectorTransitIPResponse{}
 	cfg, ok := c.getConfig()
 	if !ok {
@@ -524,7 +534,22 @@ func (c *Conn25) handleConnectorTransitIPRequest(n tailcfg.NodeView, ctipr Conne
 			continue
 		}
 
-		if _, ok := cfg.appsByName[each.App]; !ok {
+		authorized := peerCaps.HasCapability(peercap.Conn25Prefix.ToAttribute(each.App))
+
+		app, ok := cfg.appsByName[each.App]
+		if !authorized && !(ok && app.TemporaryUnsafeBypassFilter) {
+			// Ideally this check should occur immediately after setting
+			// authorized above, but for development we have a bypass in the app
+			// config. For unknown apps that are not authorized, we should
+			// present the authorization error to prevent enumeration of apps.
+			// TODO(tailscale/corp#40076): simplify after temporary bypass is removed
+			resp.TransitIPs = append(resp.TransitIPs, TransitIPResponse{
+				Code:    MissingAppPermission,
+				Message: missingAppPermissionMessage,
+			})
+			continue
+		}
+		if !ok {
 			resp.TransitIPs = append(resp.TransitIPs, TransitIPResponse{
 				Code:    UnknownAppName,
 				Message: unknownAppNameMessage,
@@ -573,7 +598,17 @@ func (c *connector) handleTransitIPRequest(n tailcfg.NodeView, peerV4 netip.Addr
 		peerMap = make(map[netip.Addr]appAddr)
 		c.transitIPs[peerAddr] = peerMap
 	}
-	peerMap[tipr.TransitIP] = appAddr{addr: tipr.DestinationIP, app: tipr.App}
+	// if there's already an entry for this peer+transitIP, clean up the expiryQueue entry
+	if prev, ok := peerMap[tipr.TransitIP]; ok && prev.expiryEntry != nil {
+		c.expiryQueue.Remove(prev.expiryEntry)
+	}
+	// create a new expiryQueue entry
+	elem := c.expiryQueue.PushBack(&transitIPExpiryEntry{
+		peerIP:    peerAddr,
+		transitIP: tipr.TransitIP,
+		createdAt: c.clock.Now(),
+	})
+	peerMap[tipr.TransitIP] = appAddr{addr: tipr.DestinationIP, app: tipr.App, expiryEntry: elem}
 	return TransitIPResponse{}
 }
 
@@ -626,6 +661,10 @@ const (
 	// UnknownAppName indicates that the connector is not configured to handle requests
 	// for the App name that was specified in the request.
 	UnknownAppName = 5
+
+	// MissingAppPermission indicates that the client is not permitted to access
+	// the App name that was specified in the request.
+	MissingAppPermission = 6
 )
 
 // TransitIPResponse is the response to a TransitIPRequest
@@ -1065,7 +1104,7 @@ func makePeerAPIReq(ctx context.Context, httpClient *http.Client, urlBase string
 
 func (e *extension) pickConnectorURLBase(app appctype.Conn25Attr) (tailcfg.NodeView, string) {
 	nb := e.host.NodeBackend()
-	peers := appc.PickConnector(nb, app)
+	peers := pickConnector(nb, app)
 	var urlBase string
 	var conn tailcfg.NodeView
 	for _, p := range peers {
@@ -1186,10 +1225,23 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 	//  * write the questions through as they are
 	//  * not send through the additional section
 	//  * provide our answers, or no answers if we don't handle those answers (possibly in the future we should write through answers for eg TypeTXT)
-	var answers []dnsResponseRewrite
-	var cnameChain map[dnsname.FQDN]dnsname.FQDN
+	//   * We handle A, AAAA and HTTPS type questions
+	//   * We drop all others
+
+	// Question Type HTTPS
+	if question.Type == dnsmessage.TypeHTTPS {
+		newBuf, err := rewriteHTTPSResponse(hdr, questions, &p)
+		if err != nil {
+			metricDNSResponseRewriteErrorServfail.Add(1)
+			c.logf("error rewriting HTTPS dns response: %v", err)
+			return makeServFail(c.logf, hdr, question)
+		}
+		return newBuf
+	}
+
+	// Other Question Types dropped
 	if question.Type != dnsmessage.TypeA && question.Type != dnsmessage.TypeAAAA {
-		newBuf, err := c.client.rewriteDNSResponse(appName, hdr, questions, answers)
+		newBuf, err := c.client.rewriteDNSResponse(appName, hdr, questions, []dnsResponseRewrite{})
 		if err != nil {
 			metricDNSResponseRewriteUnsupportedQuestionTypeErrorServfail.Add(1)
 			c.logf("error writing empty response for unsupported type: %v", err)
@@ -1197,6 +1249,10 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 		}
 		return newBuf
 	}
+
+	// Question Type A/AAAA
+	var answers []dnsResponseRewrite
+	var cnameChain map[dnsname.FQDN]dnsname.FQDN
 	for {
 		h, err := p.AnswerHeader()
 		if err == dnsmessage.ErrSectionDone {
@@ -1359,15 +1415,78 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 	return out, nil
 }
 
+// rewriteHTTPSResponse writes through the HTTPS (type 65) answers in a DNS
+// response, stripping the ipv4hint/ipv6hint SvcParams (not obvious if we
+// should replace with magic IPs). p must be positioned at the start of the
+// answer section (i.e. questions already consumed). The additional section is
+// dropped.
+func rewriteHTTPSResponse(hdr dnsmessage.Header, questions []dnsmessage.Question, p *dnsmessage.Parser) ([]byte, error) {
+	b := dnsmessage.NewBuilder(nil, hdr)
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		return nil, err
+	}
+	for _, q := range questions {
+		if err := b.Question(q); err != nil {
+			return nil, err
+		}
+	}
+	if err := b.StartAnswers(); err != nil {
+		return nil, err
+	}
+	for {
+		h, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if h.Type != dnsmessage.TypeHTTPS {
+			// Only HTTPS records are expected in an HTTPS response; drop anything else.
+			if err := p.SkipAnswer(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		r, err := p.HTTPSResource()
+		if err != nil {
+			return nil, err
+		}
+		r.DeleteParam(dnsmessage.SVCParamIPv4Hint)
+		r.DeleteParam(dnsmessage.SVCParamIPv6Hint)
+		if err := b.HTTPSResource(h, r); err != nil {
+			return nil, err
+		}
+	}
+	return b.Finish()
+}
+
+// connectorTransitIPExpiry is the minimum length of time a peer+transitIP -> dstIP mapping will be held in the connector.
+// The longer this time is the larger the map will be in memory.
+// The shorter this time is the more often a client will try to use a mapping, find it doesn't exist anymore and have to re-register.
+// We are not (yet 2026-08-12) tracking either of those things, this is a guess at a reasonable duration.
+const connectorTransitIPExpiry = time.Hour
+
 type connector struct {
 	logf      logger.Logf
 	getIPSets func() ipSets
+	clock     tstime.Clock
 
 	// Remember to add new fields to [connector.reset] if needed.
 	mu sync.Mutex // protects the fields below
 	// transitIPs is a map of connector client peer IP -> client transitIPs that we update as connector client peers instruct us to, and then use to route traffic to its destination on behalf of connector clients.
 	// Note that each peer could potentially have two maps: one for its IPv4 address, and one for its IPv6 address. The transit IPs map for a given peer IP will contain transit IPs of the same family as the peer's IP.
 	transitIPs map[netip.Addr]map[netip.Addr]appAddr
+	// expiryQueue is processed by the goroutine from [connector.startExpirySweeper] so
+	// that transitIPs doesn't grow indefinitely.
+	expiryQueue *list.List
+}
+
+type transitIPExpiryEntry struct {
+	peerIP    netip.Addr
+	transitIP netip.Addr
+	createdAt time.Time
 }
 
 // realIPForTransitIPConnection is part of the implementation of the [Conn25Datapath] interface for dataflow lookups.
@@ -1375,11 +1494,7 @@ type connector struct {
 func (c *connector) realIPForTransitIPConnection(srcIP netip.Addr, transitIP netip.Addr) (netip.Addr, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	v, ok := c.lookupBySrcIPAndTransitIP(srcIP, transitIP)
-	if ok {
-		return v.addr, true
-	}
-	return netip.Addr{}, false
+	return c.lookupAddrBySrcIPAndTransitIP(srcIP, transitIP)
 }
 
 const packetFilterAllowReason = "app connector transit IP"
@@ -1399,13 +1514,84 @@ func (c *connector) packetFilterAllow(p packet.Parsed) (bool, string) {
 	return false, ""
 }
 
-func (c *connector) lookupBySrcIPAndTransitIP(srcIP, transitIP netip.Addr) (appAddr, bool) {
+func (c *connector) lookupAddrBySrcIPAndTransitIP(srcIP, transitIP netip.Addr) (netip.Addr, bool) {
 	m, ok := c.transitIPs[srcIP]
 	if !ok || m == nil {
-		return appAddr{}, false
+		return netip.Addr{}, false
 	}
 	v, ok := m[transitIP]
-	return v, ok
+	return v.addr, ok
+}
+
+// expireTransitIPs expires entries in the connector's transitIPs map that are
+// past their expiry time.
+// While the client keeps track of the datapath flow table and makes sure not
+// to expire state for flows that are in use, the connector just expires
+// peer+transitIP -> dstIP state at minimum 1 hour [connectorTransitIPExpiry]
+// after it is registered.
+// If a client tries to use a mapping that is expired the connector will send a
+// TSMP error and the client will reregister the mapping.
+// If this causes too much reregistry we can extend the expiry time or we may
+// have to track flows or similar.
+func (c *connector) expireTransitIPs(now time.Time) int {
+	removed := 0
+
+	// doChunk takes the chunk size and returns the number of removed entries and
+	// whether there's still work to do.
+	// Used to allow other goroutines a chance to grab the mutex while we work.
+	doChunk := func(n int) (int, bool) {
+		nRemoved := 0
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for i := 0; i < n; i++ {
+			front := c.expiryQueue.Front()
+			if front == nil {
+				return nRemoved, true
+			}
+			e := front.Value.(*transitIPExpiryEntry)
+			if now.Sub(e.createdAt) < connectorTransitIPExpiry {
+				// the list is ordered by createdAt there will be no entries to expire after this
+				return nRemoved, true
+			}
+			c.expiryQueue.Remove(front)
+			peerMap, ok := c.transitIPs[e.peerIP]
+			if !ok {
+				continue
+			}
+			delete(peerMap, e.transitIP)
+			nRemoved++
+			if len(peerMap) == 0 {
+				delete(c.transitIPs, e.peerIP)
+			}
+		}
+		return nRemoved, false
+	}
+
+	// handle at most 100,000 entries, don't just keep going if we have an
+	// unexpectedly large number of expiries, we will handle the backlog over time.
+	for i := 0; i < 1000; i++ {
+		nRemoved, finished := doChunk(100)
+		removed += nRemoved
+		if finished {
+			break
+		}
+	}
+	return removed
+}
+
+func (c *connector) startExpirySweeper(ctx context.Context) {
+	ticker, tickerCh := c.clock.NewTicker(5 * time.Minute)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tickerCh:
+				c.expireTransitIPs(c.clock.Now())
+			}
+		}
+	}()
 }
 
 // reset clears all internal state of [connector], that are not configuration
@@ -1415,6 +1601,7 @@ func (c *connector) reset() {
 	defer c.mu.Unlock()
 
 	c.transitIPs = make(map[netip.Addr]map[netip.Addr]appAddr)
+	c.expiryQueue = list.New()
 }
 
 type addrs struct {
@@ -1483,4 +1670,44 @@ func (c *client) resendTransitIPMapping(transitIP netip.Addr) {
 	if err != nil {
 		c.logf("error enqueueing address assignment for resend: %v", err)
 	}
+}
+
+func isPeerEligibleConnector(peer tailcfg.NodeView) bool {
+	if !peer.Valid() || !peer.Hostinfo().Valid() {
+		return false
+	}
+	isConn, _ := peer.Hostinfo().AppConnector().Get()
+	return isConn
+}
+
+func sortByPreference(ns []tailcfg.NodeView) {
+	// The ordering of the nodes is semantic (callers use the first node they can
+	// get a peer api url for). We don't (currently 2026-02-27) have any
+	// preference over which node is chosen as long as it's consistent.  In the
+	// future we anticipate integrating with traffic steering.
+	slices.SortFunc(ns, func(a, b tailcfg.NodeView) int {
+		return cmp.Compare(a.ID(), b.ID())
+	})
+}
+
+// pickConnector returns peers the backend knows about that match the app, in order of preference to use as
+// a connector.
+func pickConnector(nb ipnext.NodeBackend, app appctype.Conn25Attr) []tailcfg.NodeView {
+	appTagsSet := set.SetOf(app.Connectors)
+	matches := nb.AppendMatchingPeers(nil, func(n tailcfg.NodeView) bool {
+		if !isPeerEligibleConnector(n) {
+			return false
+		}
+		if !n.Online().Get() {
+			return false
+		}
+		for _, t := range n.Tags().All() {
+			if appTagsSet.Contains(t) {
+				return true
+			}
+		}
+		return false
+	})
+	sortByPreference(matches)
+	return matches
 }

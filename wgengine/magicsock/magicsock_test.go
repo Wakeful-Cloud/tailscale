@@ -60,6 +60,8 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/natlab"
 	"tailscale.com/tstime/mono"
@@ -126,7 +128,7 @@ func runDERPAndStun(t *testing.T, logf logger.Logf, ln nettype.PacketListener, s
 	stunAddr, stunCleanup := stuntest.ServeWithPacketListener(t, ln)
 
 	m := &tailcfg.DERPMap{
-		Regions: map[int]*tailcfg.DERPRegion{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			1: {
 				RegionID:   1,
 				RegionCode: "test",
@@ -556,7 +558,7 @@ func TestResetNetInfoLast(t *testing.T) {
 		got <- ni
 	})
 
-	wantCall := func(why string, wantDERP int) {
+	wantCall := func(why string, wantDERP tailcfg.DERPRegionID) {
 		t.Helper()
 		select {
 		case ni := <-got:
@@ -601,7 +603,7 @@ func TestPickDERPFallback(t *testing.T) {
 
 	c := newConn(t.Logf)
 	dm := &tailcfg.DERPMap{
-		Regions: map[int]*tailcfg.DERPRegion{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			1: {},
 			2: {},
 			3: {},
@@ -628,7 +630,7 @@ func TestPickDERPFallback(t *testing.T) {
 
 	// Test that the pointer value of c is blended in and
 	// distribution over nodes works.
-	got := map[int]int{}
+	got := map[tailcfg.DERPRegionID]int{}
 	for range 50 {
 		c = newConn(t.Logf)
 		c.derpMap = dm
@@ -1876,8 +1878,8 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 	if deDisco == nil {
 		t.Fatalf("discoEndpoint disco is nil")
 	}
-	if deDisco.key != discoKey {
-		t.Errorf("discoKey = %v; want %v", deDisco.key, discoKey)
+	if deDisco.key() != discoKey {
+		t.Errorf("discoKey = %v; want %v", deDisco.key(), discoKey)
 	}
 	if _, ok := conn.peerMap.endpointForNodeKey(nodeKey1); ok {
 		t.Errorf("didn't expect to find node for key1")
@@ -2369,7 +2371,7 @@ func TestSetNetworkMapWithNoPeers(t *testing.T) {
 
 	for i := 1; i <= 3; i++ {
 		v := !debugEnableSilentDisco()
-		envknob.Setenv("TS_DEBUG_ENABLE_SILENT_DISCO", fmt.Sprint(v))
+		envknob.SetenvForTest(t, "TS_DEBUG_ENABLE_SILENT_DISCO", fmt.Sprint(v))
 		c.SetNetworkMap(tailcfg.NodeView{}, nil)
 		if c.lastFlags.heartbeatDisabled != v {
 			t.Fatalf("call %d: didn't store netmap", i)
@@ -3266,7 +3268,7 @@ func TestAddrForPingSizeLocked(t *testing.T) {
 
 func TestMaybeSetNearestDERP(t *testing.T) {
 	derpMap := &tailcfg.DERPMap{
-		Regions: map[int]*tailcfg.DERPRegion{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			1: {
 				RegionID:   1,
 				RegionCode: "test",
@@ -3310,18 +3312,18 @@ func TestMaybeSetNearestDERP(t *testing.T) {
 	}
 
 	// Ensure that our fallback code always picks a deterministic value.
-	tstest.Replace(t, &pickDERPFallbackForTests, func() int { return 31 })
+	tstest.Replace(t, &pickDERPFallbackForTests, func() tailcfg.DERPRegionID { return 31 })
 
 	// Actually test this code path.
 	tstest.Replace(t, &checkControlHealthDuringNearestDERPInTests, true)
 
 	testCases := []struct {
 		name               string
-		old                int
-		reportDERP         int
+		old                tailcfg.DERPRegionID
+		reportDERP         tailcfg.DERPRegionID
 		connectedToControl bool
 		force              bool
-		want               int
+		want               tailcfg.DERPRegionID
 	}{
 		{
 			name:               "connected_with_report_derp",
@@ -3829,7 +3831,7 @@ func Test_nodeHasCap(t *testing.T) {
 		filt *filter.Filter
 		src  tailcfg.NodeView
 		dst  tailcfg.NodeView
-		cap  tailcfg.PeerCapability
+		cap  peercap.Cap
 		want bool
 	}{
 		{
@@ -3840,14 +3842,14 @@ func Test_nodeHasCap(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: netip.MustParsePrefix("1.1.1.1/32"),
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
 			}, nil, nil, nil, nil, nil),
 			src:  nodeCOnlyIPv4.View(),
 			dst:  nodeAOnlyIPv4.View(),
-			cap:  tailcfg.PeerCapabilityRelayTarget,
+			cap:  peercap.RelayTarget,
 			want: true,
 		},
 		{
@@ -3858,14 +3860,14 @@ func Test_nodeHasCap(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: netip.MustParsePrefix("::1/128"),
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
 			}, nil, nil, nil, nil, nil),
 			src:  nodeDOnlyIPv6.View(),
 			dst:  nodeBOnlyIPv6.View(),
-			cap:  tailcfg.PeerCapabilityRelayTarget,
+			cap:  peercap.RelayTarget,
 			want: true,
 		},
 		{
@@ -3876,14 +3878,14 @@ func Test_nodeHasCap(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: netip.MustParsePrefix("::3/128"),
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
 			}, nil, nil, nil, nil, nil),
 			src:  nodeDOnlyIPv6.View(),
 			dst:  nodeBOnlyIPv6.View(),
-			cap:  tailcfg.PeerCapabilityRelayTarget,
+			cap:  peercap.RelayTarget,
 			want: false,
 		},
 		{
@@ -3894,14 +3896,14 @@ func Test_nodeHasCap(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: netip.MustParsePrefix("::1/128"),
-							Cap: tailcfg.PeerCapabilityIngress,
+							Cap: peercap.Ingress,
 						},
 					},
 				},
 			}, nil, nil, nil, nil, nil),
 			src:  nodeDOnlyIPv6.View(),
 			dst:  nodeBOnlyIPv6.View(),
-			cap:  tailcfg.PeerCapabilityRelayTarget,
+			cap:  peercap.RelayTarget,
 			want: false,
 		},
 		{
@@ -3912,14 +3914,14 @@ func Test_nodeHasCap(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: netip.MustParsePrefix("1.1.1.1/32"),
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
 			}, nil, nil, nil, nil, nil),
 			src:  tailcfg.NodeView{},
 			dst:  nodeAOnlyIPv4.View(),
-			cap:  tailcfg.PeerCapabilityRelayTarget,
+			cap:  peercap.RelayTarget,
 			want: false,
 		},
 		{
@@ -3930,14 +3932,14 @@ func Test_nodeHasCap(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: netip.MustParsePrefix("1.1.1.1/32"),
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
 			}, nil, nil, nil, nil, nil),
 			src:  nodeCOnlyIPv4.View(),
 			dst:  tailcfg.NodeView{},
-			cap:  tailcfg.PeerCapabilityRelayTarget,
+			cap:  peercap.RelayTarget,
 			want: false,
 		},
 		{
@@ -3948,14 +3950,14 @@ func Test_nodeHasCap(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: netip.MustParsePrefix("1.1.1.1/32"),
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
 			}, nil, nil, nil, nil, nil),
 			src:  nodeCUnsigned.View(),
 			dst:  nodeAOnlyIPv4.View(),
-			cap:  tailcfg.PeerCapabilityRelayTarget,
+			cap:  peercap.RelayTarget,
 			want: false,
 		},
 	}
@@ -4004,11 +4006,11 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 
 	selfNodeNodeAttrDisableRelayClient := selfNode.Clone()
 	selfNodeNodeAttrDisableRelayClient.CapMap = make(tailcfg.NodeCapMap)
-	selfNodeNodeAttrDisableRelayClient.CapMap[tailcfg.NodeAttrDisableRelayClient] = nil
+	selfNodeNodeAttrDisableRelayClient.CapMap[nodecap.DisableRelayClient] = nil
 
 	selfNodeNodeAttrOnlyTCP443 := selfNode.Clone()
 	selfNodeNodeAttrOnlyTCP443.CapMap = make(tailcfg.NodeCapMap)
-	selfNodeNodeAttrOnlyTCP443.CapMap[tailcfg.NodeAttrOnlyTCP443] = nil
+	selfNodeNodeAttrOnlyTCP443.CapMap[nodecap.OnlyTCP443] = nil
 
 	tests := []struct {
 		name                   string
@@ -4026,7 +4028,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: selfNode.Addresses[0],
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
@@ -4050,7 +4052,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: selfNodeNodeAttrDisableRelayClient.Addresses[0],
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
@@ -4068,7 +4070,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: selfNodeNodeAttrOnlyTCP443.Addresses[0],
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
@@ -4086,7 +4088,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: selfNode.Addresses[0],
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
@@ -4110,7 +4112,7 @@ func TestConn_SetNetworkMap_updateRelayServersSet(t *testing.T) {
 					Caps: []filtertype.CapMatch{
 						{
 							Dst: selfNode.Addresses[0],
-							Cap: tailcfg.PeerCapabilityRelayTarget,
+							Cap: peercap.RelayTarget,
 						},
 					},
 				},
@@ -4193,9 +4195,7 @@ func TestConn_receiveIP(t *testing.T) {
 			publicKey:  key.NewNode().Public(),
 			lastRecvWG: lastRecvWG,
 		}
-		ep.disco.Store(&endpointDisco{
-			key: key.NewDisco().Public(),
-		})
+		ep.updateDiscoKey(key.NewDisco().Public())
 		return ep
 	}
 
@@ -4350,7 +4350,7 @@ func TestConn_receiveIP(t *testing.T) {
 					t.Fatal("unexpected tt.wantEndpointType concrete type")
 				}
 				insertEPIntoPeerMap.c = c
-				c.peerMap.upsertEndpoint(insertEPIntoPeerMap, key.DiscoPublic{})
+				c.peerMap.upsertEndpoint(insertEPIntoPeerMap, key.DiscoPublic{}, false)
 				c.peerMap.setNodeKeyForEpAddr(tt.peerMapEpAddr, insertEPIntoPeerMap.publicKey)
 			}
 
@@ -4472,9 +4472,7 @@ func Test_lazyEndpoint_InitiationMessagePublicKey(t *testing.T) {
 				nodeID:    1,
 				publicKey: key.NewNode().Public(),
 			}
-			ep.disco.Store(&endpointDisco{
-				key: key.NewDisco().Public(),
-			})
+			ep.updateDiscoKey(key.NewDisco().Public())
 
 			conn := newConn(t.Logf)
 			ep.c = conn
@@ -4483,7 +4481,7 @@ func Test_lazyEndpoint_InitiationMessagePublicKey(t *testing.T) {
 			if tt.callWithPeerMapKey {
 				copy(pubKey[:], ep.publicKey.AppendTo(nil))
 			}
-			conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+			conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
 
 			le := &lazyEndpoint{
 				c: conn,
@@ -4534,9 +4532,7 @@ func Test_lazyEndpoint_FromPeer(t *testing.T) {
 				nodeID:    1,
 				publicKey: key.NewNode().Public(),
 			}
-			ep.disco.Store(&endpointDisco{
-				key: key.NewDisco().Public(),
-			})
+			ep.updateDiscoKey(key.NewDisco().Public())
 			conn := newConn(t.Logf)
 			ep.c = conn
 
@@ -4544,7 +4540,7 @@ func Test_lazyEndpoint_FromPeer(t *testing.T) {
 			if tt.callWithPeerMapKey {
 				copy(pubKey[:], ep.publicKey.AppendTo(nil))
 			}
-			conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+			conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
 
 			le := &lazyEndpoint{
 				c:   conn,
@@ -4670,10 +4666,7 @@ func TestReceiveTSMPDiscoKeyAdvertisement(t *testing.T) {
 				nodeAddr:  netip.MustParseAddr("100.64.0.1"),
 			}
 			discoKey := key.NewDisco().Public()
-			ep.disco.Store(&endpointDisco{
-				key:   discoKey,
-				short: discoKey.ShortString(),
-			})
+			ep.updateDiscoKey(discoKey)
 			ep.c = conn
 			conn.mu.Lock()
 			nodeView := (&tailcfg.Node{
@@ -4685,7 +4678,7 @@ func TestReceiveTSMPDiscoKeyAdvertisement(t *testing.T) {
 			conn.peersByID = map[tailcfg.NodeID]tailcfg.NodeView{nodeView.ID(): nodeView}
 			conn.mu.Unlock()
 
-			conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+			conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, true)
 
 			if ep.discoShort() != discoKey.ShortString() {
 				t.Errorf("Original disco key %s, does not match %s", discoKey.ShortString(), ep.discoShort())
@@ -4702,8 +4695,8 @@ func TestReceiveTSMPDiscoKeyAdvertisement(t *testing.T) {
 				wantDiscoKey = newDiscoKey
 			}
 
-			if ep.disco.Load().short != wantDiscoKey.ShortString() {
-				t.Errorf("New disco key %s, does not match %s", newDiscoKey.ShortString(), ep.disco.Load().short)
+			if ep.disco.Load().shortString() != wantDiscoKey.ShortString() {
+				t.Errorf("New disco key %s, does not match %s", newDiscoKey.ShortString(), ep.disco.Load().shortString())
 			}
 		})
 	}
@@ -4741,10 +4734,7 @@ func TestPriorityMessageForPeer(t *testing.T) {
 	}
 
 	discoKey := key.NewDisco().Public()
-	ep.disco.Store(&endpointDisco{
-		key:   discoKey,
-		short: discoKey.ShortString(),
-	})
+	ep.updateDiscoKey(discoKey)
 
 	ep.c = conn
 
@@ -4754,7 +4744,7 @@ func TestPriorityMessageForPeer(t *testing.T) {
 	}
 
 	conn.mu.Lock()
-	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+	conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
 	conn.mu.Unlock()
 
 	// Test isWireguardOnly.
@@ -4839,10 +4829,7 @@ func BenchmarkPriorityMessageForPeer(b *testing.B) {
 				}
 
 				discoKey := key.NewDisco().Public()
-				ep.disco.Store(&endpointDisco{
-					key:   discoKey,
-					short: discoKey.ShortString(),
-				})
+				ep.updateDiscoKey(discoKey)
 
 				ep.c = conn
 				nodeView := (&tailcfg.Node{
@@ -4855,7 +4842,7 @@ func BenchmarkPriorityMessageForPeer(b *testing.B) {
 				}).View()
 				peersByID[nodeID] = nodeView
 				conn.mu.Lock()
-				conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{})
+				conn.peerMap.upsertEndpoint(ep, key.DiscoPublic{}, false)
 				conn.mu.Unlock()
 			}
 
@@ -4867,5 +4854,70 @@ func BenchmarkPriorityMessageForPeer(b *testing.B) {
 				conn.PriorityMessageForPeer(targetKey)
 			}
 		})
+	}
+}
+
+// TestHandleDiscoKeyAdvertisementControlKeyPreservedInPeermap verifies that
+// receiving a TSMP disco key advertisement does not evict the peer's existing
+// control key from nodesOfDisco.
+func TestHandleDiscoKeyAdvertisementControlKeyPreservedInPeermap(t *testing.T) {
+	conn := newTestConn(t)
+
+	nk := key.NewNode().Public()
+	dk1 := key.NewDisco().Public() // initial control key
+	dk2 := key.NewDisco().Public() // TSMP key
+
+	peer := &tailcfg.Node{
+		ID:        1,
+		Key:       nk,
+		DiscoKey:  dk1,
+		Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+	}
+	conn.SetNetworkMap(tailcfg.NodeView{}, nodeViews([]*tailcfg.Node{peer}))
+
+	conn.HandleDiscoKeyAdvertisement(peer.View(),
+		packet.TSMPDiscoKeyAdvertisement{Key: dk2})
+
+	if !conn.peerMap.knownPeerDiscoKey(dk1) {
+		t.Error("control key dk1 should still be in peermap")
+	}
+	if !conn.peerMap.knownPeerDiscoKey(dk2) {
+		t.Error("TSMP key dk2 should be in peermap after TSMP advertisement")
+	}
+}
+
+// TestUpsertPeerTSMPKeyPreservedOnControlUpdate verifies that a control-plane
+// UpsertPeer call does not evict the TSMP key from nodesOfDisco, but does
+// evict the old control learned key.
+func TestUpsertPeerTSMPKeyPreservedOnControlUpdate(t *testing.T) {
+	conn := newTestConn(t)
+
+	nk := key.NewNode().Public()
+	dk1 := key.NewDisco().Public() // control key
+	dk2 := key.NewDisco().Public() // TSMP key
+	dk3 := key.NewDisco().Public() // new control key
+
+	peer := &tailcfg.Node{
+		ID:        1,
+		Key:       nk,
+		DiscoKey:  dk1,
+		Addresses: []netip.Prefix{netip.MustParsePrefix("100.64.0.1/32")},
+	}
+	conn.SetNetworkMap(tailcfg.NodeView{}, nodeViews([]*tailcfg.Node{peer}))
+
+	conn.HandleDiscoKeyAdvertisement(peer.View(),
+		packet.TSMPDiscoKeyAdvertisement{Key: dk2})
+
+	peer.DiscoKey = dk3
+	conn.UpsertPeer(peer.View())
+
+	if !conn.peerMap.knownPeerDiscoKey(dk2) {
+		t.Error("TSMP key dk2 should still be in peermap")
+	}
+	if !conn.peerMap.knownPeerDiscoKey(dk3) {
+		t.Error("control key dk3 should be in peermap")
+	}
+	if conn.peerMap.knownPeerDiscoKey(dk1) {
+		t.Error("control key dk1 shoud not be in peermap")
 	}
 }

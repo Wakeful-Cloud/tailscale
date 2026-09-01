@@ -33,6 +33,8 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tka"
 	"tailscale.com/tstest/tkatest"
 	"tailscale.com/types/key"
@@ -152,6 +154,11 @@ type Server struct {
 
 	// peerIsJailed is the set of peers that are jailed for a node.
 	peerIsJailed map[key.NodePublic]map[key.NodePublic]bool // node => peer => isJailed
+
+	// nodeUnsignedPeerAPIOnly is the set of nodes that appear in other
+	// nodes' netmaps with tailcfg.Node.UnsignedPeerAPIOnly set, as
+	// Tailscale Funnel ingress nodes do.
+	nodeUnsignedPeerAPIOnly map[key.NodePublic]bool
 
 	// masquerades is the set of masquerades that should be applied to
 	// MapResponses sent to clients. It is keyed by the requesting nodes
@@ -682,6 +689,16 @@ func (s *Server) SetJailed(a, b key.NodePublic, jailed bool) {
 	s.updateLocked("SetJailed", s.nodeIDsLocked(0))
 }
 
+// SetUnsignedPeerAPIOnly sets whether the node with the given key
+// appears in other nodes' netmaps with UnsignedPeerAPIOnly set, as
+// Tailscale Funnel ingress nodes do.
+func (s *Server) SetUnsignedPeerAPIOnly(k key.NodePublic, unsigned bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mak.Set(&s.nodeUnsignedPeerAPIOnly, k, unsigned)
+	s.updateLocked("SetUnsignedPeerAPIOnly", s.nodeIDsLocked(0))
+}
+
 // SetMasqueradeAddresses sets the masquerade addresses for the server.
 // See MasqueradePair for more details.
 func (s *Server) SetMasqueradeAddresses(pairs []MasqueradePair) {
@@ -1042,10 +1059,10 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 			capMap = *s.DefaultNodeCapabilities
 		} else {
 			capMap = tailcfg.NodeCapMap{
-				tailcfg.CapabilityHTTPS:                           []tailcfg.RawMessage{},
-				tailcfg.NodeAttrFunnel:                            []tailcfg.RawMessage{},
-				tailcfg.CapabilityFileSharing:                     []tailcfg.RawMessage{},
-				tailcfg.CapabilityFunnelPorts + "?ports=8080,443": []tailcfg.RawMessage{},
+				nodecap.HTTPS:                           []tailcfg.RawMessage{},
+				nodecap.Funnel:                          []tailcfg.RawMessage{},
+				nodecap.FileSharing:                     []tailcfg.RawMessage{},
+				nodecap.FunnelPorts + "?ports=8080,443": []tailcfg.RawMessage{},
 			}
 		}
 
@@ -1445,7 +1462,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 		}
 		endpoints := filterInvalidIPv6Endpoints(req.Endpoints)
 		var hi tailcfg.HostinfoView
-		var newDERP int
+		var newDERP tailcfg.DERPRegionID
 		if req.Hostinfo != nil {
 			hi = req.Hostinfo.View()
 			if ni := hi.NetInfo(); ni.Valid() {
@@ -1587,14 +1604,15 @@ var keepAliveMsg = &struct {
 	KeepAlive: true,
 }
 
-func packetFilterWithIngress(addRelayCaps bool) []tailcfg.FilterRule {
+func packetFilterWithIngress(addRelayCaps bool, allowSrcs []string) []tailcfg.FilterRule {
 	out := slices.Clone(tailcfg.FilterAllowAll)
-	caps := []tailcfg.PeerCapability{
-		tailcfg.PeerCapabilityIngress,
+	out[0].SrcIPs = allowSrcs
+	caps := []peercap.Cap{
+		peercap.Ingress,
 	}
 	if addRelayCaps {
-		caps = append(caps, tailcfg.PeerCapabilityRelay)
-		caps = append(caps, tailcfg.PeerCapabilityRelayTarget)
+		caps = append(caps, peercap.Relay)
+		caps = append(caps, peercap.RelayTarget)
 	}
 	out = append(out, tailcfg.FilterRule{
 		SrcIPs: []string{"*"},
@@ -1621,6 +1639,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 
 	s.mu.Lock()
 	nodeCapMap := maps.Clone(s.nodeCapMaps[nk])
+	unsignedNodes := maps.Clone(s.nodeUnsignedPeerAPIOnly)
 	var dns *tailcfg.DNSConfig
 	if s.DNSConfig != nil {
 		dns = s.DNSConfig.Clone()
@@ -1630,9 +1649,9 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 	s.mu.Unlock()
 
 	node.CapMap = nodeCapMap
-	node.Capabilities = append(node.Capabilities, tailcfg.NodeAttrDisableUPnP)
+	node.Capabilities = append(node.Capabilities, nodecap.DisableUPnP)
 	if sshPolicy != nil {
-		mak.Set(&node.CapMap, tailcfg.CapabilitySSH, nil)
+		mak.Set(&node.CapMap, nodecap.SSH, nil)
 	}
 
 	t := time.Date(2020, 8, 3, 0, 0, 0, 1, time.UTC)
@@ -1640,12 +1659,30 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		dns.CertDomains = append(dns.CertDomains, node.Hostinfo.Hostname()+"."+magicDNSDomain)
 	}
 
+	// Real control never includes unsigned (UnsignedPeerAPIOnly) peers as
+	// sources in filter rules that permit traffic; clients treat such a
+	// packet filter as invalid and discard it entirely. When any unsigned
+	// nodes exist, enumerate the signed nodes' addresses instead of using
+	// a wildcard.
+	allowSrcs := []string{"*"}
+	if len(unsignedNodes) > 0 {
+		allowSrcs = nil
+		for _, n := range s.AllNodes() {
+			if unsignedNodes[n.Key] {
+				continue
+			}
+			for _, a := range n.Addresses {
+				allowSrcs = append(allowSrcs, a.String())
+			}
+		}
+	}
+
 	res = &tailcfg.MapResponse{
 		Node:            node,
 		DERPMap:         s.DERPMap,
 		Domain:          domain,
 		CollectServices: cmp.Or(s.CollectServices, opt.True),
-		PacketFilter:    packetFilterWithIngress(s.PeerRelayGrants),
+		PacketFilter:    packetFilterWithIngress(s.PeerRelayGrants, allowSrcs),
 		DNSConfig:       dns,
 		SSHPolicy:       sshPolicy,
 		ControlTime:     &t,
@@ -1668,6 +1705,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 			}
 		}
 		p.IsJailed = jailed[p.Key]
+		p.UnsignedPeerAPIOnly = unsignedNodes[p.Key]
 
 		s.mu.Lock()
 		peerAddress := s.masquerades[p.Key][node.Key]

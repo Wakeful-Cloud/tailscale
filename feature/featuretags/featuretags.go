@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The featuretags package is a registry of all the ts_omit-able build tags.
+// Package featuretags is a registry of all the ts_omit-able build tags.
 package featuretags
 
 import "tailscale.com/util/set"
@@ -230,6 +230,7 @@ var Features = map[FeatureTag]FeatureMeta{
 		Deps: []FeatureTag{"dbus"},
 	},
 	"serviceclientprefs": {Sym: "ServiceClientPrefs", Desc: "Desktop client service launch preferences"},
+	"favorites":          {Sym: "Favorites", Desc: "Locally-pinned favorite devices, exit nodes, and services"},
 	"qrcodes":            {Sym: "QRCodes", Desc: "QR codes in tailscale CLI"},
 	"relayserver":        {Sym: "RelayServer", Desc: "Relay server"},
 	"remoteconfig": {

@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package appcfg contains an experimental configuration structure for
+// Package appctype contains an experimental configuration structure for
 // "tailscale.com/app-connectors" capmap extensions.
 package appctype
 
@@ -107,6 +107,11 @@ type Conn25Attr struct {
 	// These can either be "*" to match any advertising connector, or a
 	// tag of the form tag:<tag-name>.
 	Connectors []string `json:"connectors,omitempty"`
+	// TemporaryUnsafeBypassFilter indicates that the connector should not look
+	// for peer capabilities when determining authorization to use an app. This
+	// is a temporary measure during development and will be removed without
+	// warning.
+	TemporaryUnsafeBypassFilter bool `json:"temporaryUnsafeBypassFilter,omitzero"`
 }
 
 type Conn25PoolsAttr struct {

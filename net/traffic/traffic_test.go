@@ -5,9 +5,11 @@ package traffic_test
 
 import (
 	"maps"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"testing"
+	"testing/quick"
 
 	gocmp "github.com/google/go-cmp/cmp"
 	"tailscale.com/net/traffic"
@@ -123,8 +125,8 @@ func FuzzNodeHasherCompare(f *testing.F) {
 		selfID, aID, bID := seed[0], seed[1], seed[2]
 		f.Add(selfID, aID, bID)
 	}
+
 	f.Fuzz(func(t *testing.T, selfID, aID, bID uint64) {
-		t.Logf("selfID %d, aID %d, bID %d", selfID, aID, bID)
 		h := traffic.MakeRendezvousHasher(tailcfg.NodeID(selfID))
 		a, b := tailcfg.NodeID(aID), tailcfg.NodeID(bID)
 		c := h.Compare(a, b)
@@ -143,14 +145,6 @@ func FuzzNodeHasherCompare(f *testing.F) {
 // FuzzSortNodes tests that nodes are sorted such that every node
 // with an equal score has an equal chance of being first.
 func FuzzSortNodes(f *testing.F) {
-	nodeIDs := func(nodes []tailcfg.NodeView) []tailcfg.NodeID {
-		nids := make([]tailcfg.NodeID, len(nodes))
-		for i, n := range nodes {
-			nids[i] = n.ID()
-		}
-		return nids
-	}
-
 	for _, seed := range [][]uint64{
 		{0, 0},
 		{1, 2},
@@ -159,17 +153,28 @@ func FuzzSortNodes(f *testing.F) {
 	} {
 		f.Add(seed[0], seed[1])
 	}
+
 	f.Fuzz(func(t *testing.T, seed1, seed2 uint64) {
-		t.Logf("using random seeds %d %d", seed1, seed2)
 		rnd := rand.New(rand.NewPCG(seed1, seed2))
 
 		wantScore := traffic.Score(rnd.IntN(2000))
 
-		// Create a reasonably large tailnet, between 20 and 40 nodes.
+		// Create a reasonably large tailnet.
 		// If the number of nodes is too small, the chances of one node
 		// getting ranked best becomes non-trivial.
-		nodes := make([]tailcfg.NodeView, rnd.IntN(20)+20)
-		for i := range len(nodes) {
+		clients := make([]tailcfg.NodeView, 10_000)
+		for i := range len(clients) {
+			n := tailcfg.Node{
+				ID: tailcfg.NodeID(rnd.Int64()),
+			}
+			clients[i] = n.View()
+		}
+
+		// Smaller number of candidates, crossing some power of
+		// two boundaries to ensure most-significant-bits don't skew
+		// the hash output distribution.
+		candidates := make([]tailcfg.NodeView, rnd.IntN(16)+1)
+		for i := range len(candidates) {
 			n := tailcfg.Node{
 				ID: tailcfg.NodeID(rnd.Int64()),
 				Hostinfo: (&tailcfg.Hostinfo{
@@ -178,37 +183,63 @@ func FuzzSortNodes(f *testing.F) {
 					},
 				}).View(),
 			}
-			nodes[i] = n.View()
+			candidates[i] = n.View()
 		}
-		t.Logf("node ids: %v", nodeIDs(nodes))
 
 		// All scores should be the same.
-		ss := traffic.ScoresFor(nodes[0].ID(), nodes)
-		for _, n := range nodes {
+		ss := traffic.ScoresFor(clients[0].ID(), candidates)
+		for _, n := range candidates {
 			s := ss.Score(n)
 			if s != wantScore {
 				t.Errorf("%s: score %d, want %d", n.ID(), s, wantScore)
 			}
 		}
 
-		// Sort nodes from the point-of-view of each node and ensure that
-		// every node is equally represented by ensuring one node isn’t
-		// sorted highest too often.
-		best := make(map[tailcfg.NodeID][]tailcfg.NodeID, len(nodes))
-		for i := range len(nodes) {
-			peers := slices.Clone(nodes)
-			selfID := peers[i].ID()
+		// Map each candidate to the number of clients that it was the best candidate for
+		best := make(map[tailcfg.NodeID]int, len(candidates))
+		for i := range len(clients) {
+			peers := slices.Clone(candidates)
+			selfID := clients[i].ID()
 			ss := traffic.ScoresFor(selfID, peers)
 			ss.SortNodes(peers)
-			t.Logf("self %s, sorted %v", selfID, nodeIDs(peers))
 			bestID := peers[0].ID()
-			best[bestID] = append(best[bestID], selfID)
+			best[bestID]++
 		}
-		for nid, selfIDs := range best {
-			if count := len(selfIDs); count > len(nodes)/2 {
-				t.Errorf("%s is best too frequently: %d", nid, selfIDs)
+
+		// 20% margin off perfect fairness
+		fair := float64(len(clients)) / float64(len(candidates))
+		lo, hi := math.Floor(fair*0.8), math.Ceil(fair*1.2)
+
+		for candidateID, count := range best {
+			if float64(count) < lo || float64(count) > hi {
+				t.Logf("total clients %d; total candidates %d; fair %f", len(clients), len(candidates), fair)
+				t.Errorf("%s is best too frequently: %d", candidateID, count)
 				t.Fatalf("best map: %v", best)
 			}
+		}
+	})
+}
+
+func TestMakeRendezvousHasher(t *testing.T) {
+	t.Run("new-hasher", func(t *testing.T) {
+		f := func(from, to tailcfg.NodeID) uint64 {
+			h := traffic.MakeRendezvousHasher(from)
+			return h(to)
+		}
+		if err := quick.CheckEqual(f, f, nil); err != nil {
+			t.Error(err)
+		}
+	})
+
+	t.Run("same-hasher", func(t *testing.T) {
+		f := func(from, to tailcfg.NodeID) bool {
+			h := traffic.MakeRendezvousHasher(from)
+			first := h(to)
+			second := h(to)
+			return first == second
+		}
+		if err := quick.Check(f, nil); err != nil {
+			t.Error(err)
 		}
 	})
 }

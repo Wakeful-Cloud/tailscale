@@ -407,8 +407,7 @@ func TestStartShutsDownPreviousControlClient(t *testing.T) {
 // predictable, but maybe a bit less thorough. This is more of an overall
 // state machine test than a test of the wgengine+magicsock integration.
 func TestStateMachine(t *testing.T) {
-	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
-	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
+	envknob.SetenvForTest(t, "TAILSCALE_USE_WIP_CODE", "1")
 	c := qt.New(t)
 
 	logf := tstest.WhileTestRunningLogger(t)
@@ -1766,7 +1765,7 @@ func buildNetmapWithPeers(self tailcfg.NodeView, peers ...tailcfg.NodeView) *net
 	}
 
 	derpmap := &tailcfg.DERPMap{
-		Regions: make(map[int]*tailcfg.DERPRegion),
+		Regions: make(map[tailcfg.DERPRegionID]*tailcfg.DERPRegion),
 	}
 	makeDERPRegionForNode := func(n *tailcfg.Node) {
 		if n.HomeDERP == 0 {

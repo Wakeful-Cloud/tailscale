@@ -309,10 +309,7 @@ func Test_endpoint_maybeProbeUDPLifetimeLocked(t *testing.T) {
 				bestAddr: tt.bestAddr,
 			}
 			if tt.remoteDisco != nil {
-				remote := &endpointDisco{
-					key: *tt.remoteDisco,
-				}
-				de.disco.Store(remote)
+				de.updateDiscoKey(*tt.remoteDisco)
 			}
 			p := tt.probeUDPLifetimeFn()
 			de.probeUDPLifetime = p
@@ -570,9 +567,9 @@ func Test_endpoint_sendDiscoPingsLocked_neverDirectUDP(t *testing.T) {
 		t.Run(fmt.Sprintf("neverDirectUDP=%v", neverDirectUDP), func(t *testing.T) {
 			prev := envknob.String("TS_DEBUG_NEVER_DIRECT_UDP")
 			if neverDirectUDP {
-				envknob.Setenv("TS_DEBUG_NEVER_DIRECT_UDP", "true")
+				envknob.SetenvForTest(t, "TS_DEBUG_NEVER_DIRECT_UDP", "true")
 			} else {
-				envknob.Setenv("TS_DEBUG_NEVER_DIRECT_UDP", "")
+				envknob.SetenvForTest(t, "TS_DEBUG_NEVER_DIRECT_UDP", "")
 			}
 			t.Cleanup(func() { envknob.Setenv("TS_DEBUG_NEVER_DIRECT_UDP", prev) })
 			now := mono.Now()
@@ -585,7 +582,7 @@ func Test_endpoint_sendDiscoPingsLocked_neverDirectUDP(t *testing.T) {
 				sentPing:      make(map[stun.TxID]sentPing),
 				endpointState: make(map[netip.AddrPort]*endpointState),
 			}
-			de.disco.Store(&endpointDisco{key: key.NewDisco().Public()})
+			de.updateDiscoKey(key.NewDisco().Public())
 			de.endpointState[directAddr] = &endpointState{}
 			de.sendDiscoPingsLocked(now, true)
 
@@ -595,6 +592,81 @@ func Test_endpoint_sendDiscoPingsLocked_neverDirectUDP(t *testing.T) {
 			}
 			if gotPing := de.endpointState[directAddr].lastPing == now; gotPing != wantPing {
 				t.Errorf("direct endpoint lastPing set = %v, want %v", gotPing, wantPing)
+			}
+		})
+	}
+}
+
+func Test_endpoint_updateFromNodeAfterDiscoKeyChange(t *testing.T) {
+	relayAddr := epAddr{ap: netip.MustParseAddrPort("192.0.2.2:77")}
+	relayAddr.vni.Set(1)
+	directAddr := epAddr{ap: netip.MustParseAddrPort("192.0.2.1:7")}
+
+	for _, tc := range []struct {
+		name       string
+		bestAddr   epAddr
+		keyChanges bool
+	}{
+		{
+			name:       "relay-bestaddr-key-changed",
+			bestAddr:   relayAddr,
+			keyChanges: true,
+		},
+		{
+			name:       "direct-bestaddr-key-changed",
+			bestAddr:   directAddr,
+			keyChanges: true,
+		},
+		{
+			name:       "relay-bestaddr-key-unchanged",
+			bestAddr:   relayAddr,
+			keyChanges: false,
+		},
+		{
+			name:       "direct-bestaddr-key-unchanged",
+			bestAddr:   directAddr,
+			keyChanges: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := mono.Now()
+			c := &Conn{
+				logf: func(msg string, args ...any) {},
+			}
+			c.discoAtomic.Set(key.NewDisco())
+			c.relayManager.hasPeerRelayServers.Store(true)
+
+			oldKey := key.NewDisco().Public()
+			de := &endpoint{
+				c:                  c,
+				publicKey:          key.NewNode().Public(),
+				bestAddr:           addrQuality{epAddr: tc.bestAddr},
+				trustBestAddrUntil: now.Add(time.Hour),
+				sentPing:           make(map[stun.TxID]sentPing),
+				endpointState:      make(map[netip.AddrPort]*endpointState),
+				debugUpdates:       ringlog.New[EndpointChange](10),
+			}
+			de.lastUDPRelayPathDiscovery = mono.Now()
+			de.updateDiscoKey(oldKey)
+
+			incomingKey := oldKey
+			if tc.keyChanges {
+				incomingKey = key.NewDisco().Public()
+			}
+			nv := (&tailcfg.Node{
+				ID:       1,
+				Key:      key.NewNode().Public(),
+				DiscoKey: incomingKey,
+				HomeDERP: 1,
+				Cap:      121, // capVerIsRelayCapable
+			}).View()
+			de.updateFromNode(nv, false, false)
+
+			de.mu.Lock()
+			got := de.wantUDPRelayPathDiscoveryLocked(now)
+			de.mu.Unlock()
+			if got != tc.keyChanges {
+				t.Errorf("wantUDPRelayPathDiscoveryLocked = %v, want %v", got, tc.keyChanges)
 			}
 		})
 	}
@@ -722,6 +794,62 @@ func Test_endpoint_handlePongConnLocked(t *testing.T) {
 					t.Errorf("expected sentPing[txid] to be removed, but it still exists")
 				}
 			})
+		})
+	}
+}
+
+// TestUpdateFromNodeUsesControlKeyForComparison verifies that updateFromNode
+// compares the netmap-provided disco key against the endpoint's control-learned
+// key (keyFromControl), not the currently active key (key()).
+// Some of this is scaffold for later changes.
+func TestUpdateFromNodeUsesControlKeyForComparison(t *testing.T) {
+	dk1 := key.NewDisco().Public() // initial control key
+	dk2 := key.NewDisco().Public() // TSMP key
+
+	tests := []struct {
+		name           string
+		netmapDiscoKey key.DiscoPublic
+		wantControlKey key.DiscoPublic
+		wantActiveKey  key.DiscoPublic
+		wantTsmpActive bool
+	}{
+		{
+			name:           "control_catches_up_to_tsmp_key",
+			netmapDiscoKey: dk2,
+			wantControlKey: dk2,
+			wantActiveKey:  dk2,
+			wantTsmpActive: false,
+		},
+		{
+			name:           "unchanged_netmap_key_preserves_active",
+			netmapDiscoKey: dk1,
+			wantControlKey: dk1,
+			wantActiveKey:  dk2,
+			wantTsmpActive: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			de := &endpoint{c: &Conn{logf: func(msg string, args ...any) {}}}
+			de.updateDiscoKey(dk1)
+			de.updateTSMPDiscoKey(dk2)
+
+			// Calls updateDiscoKey() internally and sets the endpoint `disco` field.
+			de.updateFromNode(
+				(&tailcfg.Node{Key: de.publicKey, DiscoKey: tt.netmapDiscoKey}).View(),
+				false, false)
+
+			epDisco := de.disco.Load()
+			if got := epDisco.keyFromControl(); got != tt.wantControlKey {
+				t.Errorf("keyFromControl: got %v, want %v", got, tt.wantControlKey)
+			}
+			if got := epDisco.tsmpActive; got != tt.wantTsmpActive {
+				t.Errorf("tsmpActive: got %t, want %t", got, tt.wantTsmpActive)
+			}
+			if got := epDisco.key(); got != tt.wantActiveKey {
+				t.Errorf("key(): got %v, want %v", got, tt.wantActiveKey)
+			}
 		})
 	}
 }
