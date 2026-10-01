@@ -55,6 +55,7 @@ import (
 	"tailscale.com/tstest"
 	"tailscale.com/tstest/deptest"
 	"tailscale.com/tstest/typewalk"
+	"tailscale.com/tstime"
 	"tailscale.com/types/appctype"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
@@ -372,6 +373,29 @@ func newTestLocalBackendWithSys(t testing.TB, sys *tsd.System) *LocalBackend {
 	return lb
 }
 
+func TestPortlistServicesUpdatesHostinfo(t *testing.T) {
+	b := newTestLocalBackend(t)
+	publisher := eventbus.Publish[PortlistServices](b.sys.Bus.Get().Client("portlist"))
+	want := []tailcfg.Service{{Proto: tailcfg.TCP, Port: 3300}}
+	publisher.Publish(PortlistServices(want))
+
+	err := tstest.WaitFor(30*time.Second, func() error {
+		b.mu.Lock()
+		var got []tailcfg.Service
+		if b.hostinfo != nil {
+			got = slices.Clone(b.hostinfo.Services)
+		}
+		b.mu.Unlock()
+		if diff := cmp.Diff(want, got); diff != "" {
+			return fmt.Errorf("Hostinfo.Services mismatch (-want +got):\n%s", diff)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Issue 1573: don't generate a machine key if we don't want to be running.
 func TestLazyMachineKeyGeneration(t *testing.T) {
 	tstest.Replace(t, &panicOnMachineKeyGeneration, func() bool { return true })
@@ -505,7 +529,9 @@ func TestLoadCachedNetMap(t *testing.T) {
 			Addresses: []netip.Prefix{
 				netip.MustParsePrefix("100.2.3.4/32"),
 			},
+			CapMap: tailcfg.NodeCapMap{nodecap.CacheNetworkMaps: nil},
 		}).View(),
+		AllCaps: set.Of(nodecap.CacheNetworkMaps),
 		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
 			tailcfg.UserID(1): (&tailcfg.UserProfile{
 				ID:          1,
@@ -557,6 +583,9 @@ func TestLoadCachedNetMap(t *testing.T) {
 	t.Cleanup(e.Close)
 	sys.Set(e)
 	sys.Set(new(mem.Store))
+	if sys.ControlKnobs().CacheNetworkMaps.Load() {
+		t.Error("Control knobs unexpectedly already set")
+	}
 
 	logf := tstest.WhileTestRunningLogger(t)
 	clb, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
@@ -584,6 +613,11 @@ func TestLoadCachedNetMap(t *testing.T) {
 		cmpopts.EquateComparable(key.NodePublic{}, key.MachinePublic{}),
 	); diff != "" {
 		t.Error(diff)
+	}
+
+	// Check that the controlknobs got updated from the cached map.
+	if !sys.ControlKnobs().CacheNetworkMaps.Load() {
+		t.Error("Control knobs were not properly updated from the cache")
 	}
 }
 
@@ -1925,6 +1959,48 @@ func TestStatusPeerCapabilities(t *testing.T) {
 	}
 }
 
+func TestStatusStableTailnetID(t *testing.T) {
+	b := newTestLocalBackend(t)
+	for _, tt := range []struct {
+		name     string
+		stableID tailcfg.StableTailnetID
+	}{
+		{name: "populated", stableID: "tailnet-abcd"},
+		{name: "missing"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			b.setNetMapLocked(&netmap.NetworkMap{
+				Domain: "example.com",
+				SelfNode: (&tailcfg.Node{
+					MachineAuthorized: true,
+					Addresses:         ipps("100.101.101.101"),
+					StableTailnetID:   tt.stableID,
+				}).View(),
+			})
+
+			// The ID is returned with or without peers.
+			t.Run("with_peers", func(t *testing.T) {
+				st := b.Status()
+				if st.CurrentTailnet == nil {
+					t.Fatalf("CurrentTailnet is nil")
+				}
+				if got := st.CurrentTailnet.StableID; got != tt.stableID {
+					t.Errorf("CurrentTailnet.StableID = %q; want %q", got, tt.stableID)
+				}
+			})
+			t.Run("without_peers", func(t *testing.T) {
+				st := b.StatusWithoutPeers()
+				if st.CurrentTailnet == nil {
+					t.Fatalf("CurrentTailnet is nil")
+				}
+				if got := st.CurrentTailnet.StableID; got != tt.stableID {
+					t.Errorf("CurrentTailnet.StableID = %q; want %q", got, tt.stableID)
+				}
+			})
+		})
+	}
+}
+
 // TestStatusWithoutPeersSelfUserProfile verifies that the self user's
 // UserProfile is reported in Status.User even when peers are omitted, so that
 // callers like `tailscale status --peers=false` can resolve the self node's
@@ -2469,9 +2545,6 @@ func TestSetControlClientStatusSendsFullNetmapAsPeerChanges(t *testing.T) {
 			if n.SelfChange == nil {
 				return false
 			}
-			if n.NetMap != nil {
-				t.Errorf("NetMap was delivered to NotifyNoNetMap watcher")
-			}
 			if got, want := len(n.PeersChanged), 2; got != want {
 				t.Errorf("PeersChanged len = %d; want %d", got, want)
 				return false
@@ -2507,6 +2580,244 @@ func TestSetControlClientStatusSendsFullNetmapAsPeerChanges(t *testing.T) {
 	}
 	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: nm, LoggedIn: true})
 	nw.check()
+}
+
+// sendFullNetmap delivers a full netmap from control, as after a
+// MapResponse that can't be applied as a delta or on a new map session.
+func sendFullNetmap(b *LocalBackend, peers ...tailcfg.NodeView) {
+	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: &netmap.NetworkMap{
+		SelfNode: makePeer(1),
+		Peers:    peers,
+	}, LoggedIn: true})
+}
+
+// TestSetControlClientStatusFullNetmapReportsRemovedPeers checks that peers
+// missing from a full netmap reach peer-change watchers as
+// [ipn.Notify.PeersRemoved]. Watchers upsert PeersChanged, so without it they
+// list the missing peers forever.
+func TestSetControlClientStatusFullNetmapReportsRemovedPeers(t *testing.T) {
+	tests := []struct {
+		name        string
+		next        []tailcfg.NodeView
+		wantRemoved []tailcfg.NodeID
+	}{
+		{"some-peers-dropped", []tailcfg.NodeView{makePeer(10)}, []tailcfg.NodeID{20, 30}},
+		{"last-peer-dropped", nil, []tailcfg.NodeID{10, 20, 30}},
+		{"no-peer-dropped", []tailcfg.NodeView{makePeer(10), makePeer(20), makePeer(30)}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := newTestLocalBackend(t)
+			sendFullNetmap(b, makePeer(10), makePeer(20))
+			// Peer 30 arrives by delta, so it is in the live peer set but
+			// not in the previous full netmap.
+			b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: makePeer(30)}})
+
+			nw := newNotificationWatcher(t, b, ipnauth.Self)
+			nw.watch(ipn.NotifyPeerChanges, []wantedNotification{{
+				name: "next full netmap",
+				cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+					if n.SelfChange == nil {
+						return false
+					}
+					got := slices.Sorted(slices.Values(n.PeersRemoved))
+					if !slices.Equal(got, tt.wantRemoved) {
+						t.Errorf("PeersRemoved = %v; want %v", got, tt.wantRemoved)
+					}
+					return true
+				},
+			}})
+			sendFullNetmap(b, tt.next...)
+			nw.check()
+		})
+	}
+}
+
+// TestFullNetmapPeerDroppedThenRestored checks that a peer dropped by one
+// full netmap and back in the next is reported removed, then changed.
+func TestFullNetmapPeerDroppedThenRestored(t *testing.T) {
+	b := newTestLocalBackend(t)
+	sendFullNetmap(b, makePeer(10), makePeer(20))
+
+	nw := newNotificationWatcher(t, b, ipnauth.Self)
+	nw.watch(ipn.NotifyPeerChanges, []wantedNotification{{
+		name: "full netmap without peer 20",
+		cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+			if n.SelfChange == nil {
+				return false
+			}
+			if !slices.Equal(n.PeersRemoved, []tailcfg.NodeID{20}) {
+				t.Errorf("PeersRemoved = %v; want [20]", n.PeersRemoved)
+			}
+			return true
+		},
+	}, {
+		name: "full netmap with peer 20 again",
+		cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+			if n.SelfChange == nil {
+				return false
+			}
+			if len(n.PeersRemoved) != 0 {
+				t.Errorf("PeersRemoved = %v; want none", n.PeersRemoved)
+			}
+			if !slices.ContainsFunc(n.PeersChanged, func(p *tailcfg.Node) bool { return p.ID == 20 }) {
+				t.Errorf("PeersChanged lacks peer 20")
+			}
+			return true
+		},
+	}})
+	sendFullNetmap(b, makePeer(10))
+	sendFullNetmap(b, makePeer(10), makePeer(20))
+	nw.check()
+}
+
+// TestDeltaPeerRemovalReportedOnce checks that a peer removed by a delta is
+// not reported again by the next full netmap.
+func TestDeltaPeerRemovalReportedOnce(t *testing.T) {
+	b := newTestLocalBackend(t)
+	sendFullNetmap(b, makePeer(10), makePeer(20))
+
+	nw := newNotificationWatcher(t, b, ipnauth.Self)
+	nw.watch(ipn.NotifyPeerChanges, []wantedNotification{{
+		name: "delta removing peer 20",
+		cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+			return slices.Equal(n.PeersRemoved, []tailcfg.NodeID{20})
+		},
+	}, {
+		name: "next full netmap",
+		cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+			if n.SelfChange == nil {
+				return false
+			}
+			if len(n.PeersRemoved) != 0 {
+				t.Errorf("PeersRemoved = %v; want none", n.PeersRemoved)
+			}
+			return true
+		},
+	}})
+	b.UpdateNetmapDelta([]netmap.NodeMutation{netmap.MakeNodeMutationRemove(20)})
+	sendFullNetmap(b, makePeer(10))
+	nw.check()
+}
+
+// TestWatchNotificationsInitialStatusPeers verifies that the initial
+// status is sized to the subscription: Status.Peer entries are only
+// populated for watchers that subscribed to peer deltas, while
+// Status.Self is populated either way.
+func TestWatchNotificationsInitialStatusPeers(t *testing.T) {
+	tests := []struct {
+		name      string
+		mask      ipn.NotifyWatchOpt
+		wantPeers bool
+	}{
+		{"self-only", ipn.NotifyInitialStatus, false},
+		{"peer-changes", ipn.NotifyInitialStatus | ipn.NotifyPeerChanges, true},
+		{"peer-patches", ipn.NotifyInitialStatus | ipn.NotifyPeerPatches, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := newTestLocalBackend(t)
+			b.currentNode().SetNetMap(&netmap.NetworkMap{
+				SelfNode: (&tailcfg.Node{
+					ID:   1,
+					User: 1,
+					Key:  makeNodeKeyFromID(1),
+				}).View(),
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{ID: 10, User: 1, Key: makeNodeKeyFromID(10)}).View(),
+				},
+			})
+
+			nw := newNotificationWatcher(t, b, ipnauth.Self)
+			nw.watch(tt.mask, []wantedNotification{{
+				name: "initial status",
+				cond: func(t testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+					if n.InitialStatus == nil {
+						return false
+					}
+					if n.InitialStatus.Self == nil {
+						t.Errorf("InitialStatus.Self = nil; want non-nil")
+					}
+					if got := len(n.InitialStatus.Peer); (got > 0) != tt.wantPeers {
+						t.Errorf("len(InitialStatus.Peer) = %d; wantPeers = %v", got, tt.wantPeers)
+					}
+					return true
+				},
+			}})
+			nw.check()
+		})
+	}
+}
+
+type expiryCallbackClock struct {
+	tstime.StdClock
+	now       time.Time
+	afterFunc func()
+}
+
+type expiryCallbackTimer struct{}
+
+func (*expiryCallbackTimer) Reset(time.Duration) bool { return false }
+func (*expiryCallbackTimer) Stop() bool               { return true }
+
+func (c *expiryCallbackClock) Now() time.Time { return c.now }
+
+func (c *expiryCallbackClock) AfterFunc(_ time.Duration, f func()) tstime.TimerController {
+	c.afterFunc = f
+	return new(expiryCallbackTimer)
+}
+
+func TestNetmapExpiryTimerPreservesPeerDeltas(t *testing.T) {
+	b := newTestLocalBackend(t)
+	now := time.Unix(1770000000, 0)
+	clock := &expiryCallbackClock{now: now}
+	b.ForTest().SetClock(clock)
+
+	oldPeer := makePeer(1, func(n *tailcfg.Node) {
+		n.KeyExpiry = now.Add(time.Minute)
+	})
+	nm := &netmap.NetworkMap{
+		SelfNode: makePeer(2),
+		Peers:    []tailcfg.NodeView{oldPeer},
+	}
+	b.SetControlClientStatus(b.cc, controlclient.Status{NetMap: nm})
+	if clock.afterFunc == nil {
+		t.Fatal("expiry timer was not scheduled")
+	}
+	expiryFunc := clock.afterFunc
+
+	newPeer := oldPeer.AsStruct()
+	newPeer.Key = makeNodeKeyFromID(3)
+	newPeer.KeyExpiry = now.Add(time.Hour)
+	b.UpdateNetmapDelta([]netmap.NodeMutation{
+		netmap.NodeMutationUpsert{Node: newPeer.View()},
+	})
+
+	clock.now = now.Add(time.Minute + 10*time.Second)
+	expiryFunc()
+
+	got, ok := b.PeerByID(oldPeer.ID())
+	if !ok {
+		t.Fatal("peer disappeared when expiry timer fired")
+	}
+	if got.Key() != newPeer.Key {
+		t.Errorf("peer key reverted when expiry timer fired: got %v, want %v", got.Key(), newPeer.Key)
+	}
+	if got.Expired() {
+		t.Error("re-authenticated peer was marked expired when expiry timer fired")
+	}
+}
+
+func TestNetmapExpiryIgnoredDuringControlClientShutdown(t *testing.T) {
+	b := newTestLocalBackend(t)
+	call := b.numClientStatusCalls.Load()
+	b.ignoreControlClientUpdates.Store(true)
+
+	b.handleNetmapExpiry(b.cc, controlclient.Status{}, call, 0)
+
+	if got := b.numClientStatusCalls.Load(); got != call {
+		t.Errorf("status calls = %d, want %d", got, call)
+	}
 }
 
 // TestNotifyForSessionUserProfilesGating verifies that
@@ -5176,6 +5487,11 @@ func TestDriveManageShares(t *testing.T) {
 				0,
 				func() { wg.Done() },
 				func(n *ipn.Notify) bool {
+					if n.DriveShares.IsNil() {
+						// Skip unrelated notifications, such as the
+						// initial SelfChange sent to every watcher.
+						return true
+					}
 					select {
 					case result <- n.DriveShares:
 					default:

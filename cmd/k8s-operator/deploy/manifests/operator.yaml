@@ -31,7 +31,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
     annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
+        controller-gen.kubebuilder.io/version: v0.22.0
     name: connectors.tailscale.com
 spec:
     group: tailscale.com
@@ -348,7 +348,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
     annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
+        controller-gen.kubebuilder.io/version: v0.22.0
     name: dnsconfigs.tailscale.com
 spec:
     group: tailscale.com
@@ -397,7 +397,12 @@ spec:
                     NB: if you want cluster workloads to be able to refer to Tailscale Ingress
                     using its MagicDNS name, you must also annotate the Ingress resource with
                     tailscale.com/experimental-forward-cluster-traffic-via-ingress annotation to
-                    ensure that the proxy created for the Ingress listens on its Pod IP address.
+                    ensure that the proxy created for the Ingress is available via its Pod IP
+                    address. The annotation installs rules that DNAT traffic sent to the proxy's
+                    Pod IP to its Tailscale IP, and allows the Serve listener on that Tailscale IP
+                    to accept packets arriving through the Pod interface. Traffic accepted via this
+                    path does not traverse the Tailscale tunnel and is not affected by tailnet
+                    ACLs. Restrict access using Kubernetes network policy.
                 properties:
                     apiVersion:
                         description: |-
@@ -1487,7 +1492,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
     annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
+        controller-gen.kubebuilder.io/version: v0.22.0
     name: peerrelays.tailscale.com
 spec:
     group: tailscale.com
@@ -1641,7 +1646,32 @@ spec:
                                             Annotations to apply to the LoadBalancer service. Any annotations that conflict with those used by known
                                             cloud providers to ensure IP addresses rather than DNS names are ignored.
                                         type: object
+                                    port:
+                                        default: 41641
+                                        description: |-
+                                            Port is the UDP port each peer relay replica listens on and that its LoadBalancer Service exposes
+                                            externally. The two are always equal: the relay advertises address:port to peers, so the load balancer
+                                            must forward without rewriting the port. Changing the port on an existing PeerRelay briefly interrupts
+                                            relay traffic while the load balancer updates. Defaults to 41641.
+                                        maximum: 65535
+                                        minimum: 1
+                                        type: integer
                                 type: object
+                            staticEndpoints:
+                                description: |-
+                                    StaticEndpoints is an optional list of address:port pairs on which every replica of this PeerRelay is
+                                    reachable from outside the cluster, for example the public side of a NAT or firewall in front of the
+                                    cluster. These supplement the endpoints discovered from each replica's LoadBalancer Service: they are
+                                    added to every replica's entries in status.endpoints and advertised to peers alongside them. If an entry
+                                    names an address a replica's load balancer already provides, the entry's port takes precedence for that
+                                    address. Each address may appear at most once across all entries.
+                                    Entries take the form accepted by Go's net/netip.ParseAddrPort, e.g. 203.0.113.1:41641. IPv6
+                                    addresses must be enclosed in brackets, e.g. [2001:db8::1]:41641.
+                                items:
+                                    pattern: ^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-fA-F:.]+\]):\d{1,5}$
+                                    type: string
+                                type: array
+                                x-kubernetes-list-type: set
                             tags:
                                 description: |-
                                     Tags that the Tailscale node will be tagged with.
@@ -1738,13 +1768,14 @@ spec:
                                     Endpoints lists the public address:port pairs each peer relay replica is reachable on. Entries appear as the
                                     underlying cloud provisions each Service. A replica has one entry per address its LoadBalancer Service was
                                     given, which is usually one, but a load balancer spanning several availability zones has an address in each
-                                    and every one of them is listed.
+                                    and every one of them is listed. Entries from spec.staticEndpoints are listed for every replica in addition
+                                    to the load balancer addresses.
                                 items:
                                     properties:
                                         address:
                                             description: |-
-                                                Address is the public IP or hostname the cloud has allocated for this replica's LoadBalancer Service.
-                                                Peers reach this relay by connecting to Address:Port over UDP.
+                                                Address is the public IP or hostname the cloud has allocated for this replica's LoadBalancer Service, or
+                                                an address supplied via spec.staticEndpoints. Peers reach this relay by connecting to Address:Port over UDP.
                                             type: string
                                         port:
                                             description: Port is the UDP port the peer relay listens on.
@@ -1766,7 +1797,6 @@ spec:
                                 x-kubernetes-list-type: map
                         type: object
                 required:
-                    - metadata
                     - spec
                 type: object
           served: true
@@ -1778,7 +1808,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
     annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
+        controller-gen.kubebuilder.io/version: v0.22.0
     name: proxyclasses.tailscale.com
 spec:
     group: tailscale.com
@@ -3015,11 +3045,8 @@ spec:
                                                             Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes
                                                             whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their
                                                             CSIDriver instance. Other volumes are always re-labelled recursively.
-                                                            "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
 
-                                                            If not specified and SELinuxMount feature gate is enabled, "MountOption" is used.
-                                                            If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes
-                                                            and "Recursive" for all other volumes.
+                                                            If not specified, "MountOption" is used.
 
                                                             This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
 
@@ -3371,7 +3398,6 @@ spec:
                                                                     procMount denotes the type of proc mount to use for the containers.
                                                                     The default value is Default which uses the container runtime defaults for
                                                                     readonly paths and masked paths.
-                                                                    This requires the ProcMountType feature flag to be enabled.
                                                                     Note that this field cannot be set when spec.os.name is windows.
                                                                 type: string
                                                             readOnlyRootFilesystem:
@@ -3712,7 +3738,6 @@ spec:
                                                                     procMount denotes the type of proc mount to use for the containers.
                                                                     The default value is Default which uses the container runtime defaults for
                                                                     readonly paths and masked paths.
-                                                                    This requires the ProcMountType feature flag to be enabled.
                                                                     Note that this field cannot be set when spec.os.name is windows.
                                                                 type: string
                                                             readOnlyRootFilesystem:
@@ -4204,7 +4229,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
     annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
+        controller-gen.kubebuilder.io/version: v0.22.0
     name: proxygrouppolicies.tailscale.com
 spec:
     group: tailscale.com
@@ -4328,7 +4353,6 @@ spec:
                                 x-kubernetes-list-type: map
                         type: object
                 required:
-                    - metadata
                     - spec
                 type: object
           served: true
@@ -4340,7 +4364,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
     annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
+        controller-gen.kubebuilder.io/version: v0.22.0
     name: proxygroups.tailscale.com
 spec:
     group: tailscale.com
@@ -4620,7 +4644,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
     annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
+        controller-gen.kubebuilder.io/version: v0.22.0
     name: recorders.tailscale.com
 spec:
     group: tailscale.com
@@ -5784,7 +5808,6 @@ spec:
                                                                     procMount denotes the type of proc mount to use for the containers.
                                                                     The default value is Default which uses the container runtime defaults for
                                                                     readonly paths and masked paths.
-                                                                    This requires the ProcMountType feature flag to be enabled.
                                                                     Note that this field cannot be set when spec.os.name is windows.
                                                                 type: string
                                                             readOnlyRootFilesystem:
@@ -6034,11 +6057,8 @@ spec:
                                                             Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes
                                                             whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their
                                                             CSIDriver instance. Other volumes are always re-labelled recursively.
-                                                            "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
 
-                                                            If not specified and SELinuxMount feature gate is enabled, "MountOption" is used.
-                                                            If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes
-                                                            and "Recursive" for all other volumes.
+                                                            If not specified, "MountOption" is used.
 
                                                             This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
 
@@ -6417,7 +6437,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
     annotations:
-        controller-gen.kubebuilder.io/version: v0.17.0
+        controller-gen.kubebuilder.io/version: v0.22.0
     name: tailnets.tailscale.com
 spec:
     group: tailscale.com
@@ -6550,7 +6570,6 @@ spec:
                                 x-kubernetes-list-type: map
                         type: object
                 required:
-                    - metadata
                     - spec
                 type: object
           served: true

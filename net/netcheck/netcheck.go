@@ -707,6 +707,9 @@ func (rs *reportState) addNodeLatency(node *tailcfg.DERPNode, ipp netip.AddrPort
 
 	switch {
 	case ipp.Addr().Is6():
+		// Receiving a STUN response proves that the corresponding probe was
+		// sent, even if the response races SendPacket returning in runProbe.
+		ret.IPv6CanSend = true
 		updateLatency(ret.RegionV6Latency, node.RegionID, d)
 		ret.IPv6 = true
 		ret.GlobalV6 = ipp
@@ -714,6 +717,7 @@ func (rs *reportState) addNodeLatency(node *tailcfg.DERPNode, ipp netip.AddrPort
 		// TODO: track MappingVariesByDestIP for IPv6
 		// too? Would be sad if so, but who knows.
 	case ipp.Addr().Is4():
+		ret.IPv4CanSend = true
 		updateLatency(ret.RegionV4Latency, node.RegionID, d)
 		ret.IPv4 = true
 		mak.Set(&ret.GlobalV4Counters, ipp, ret.GlobalV4Counters[ipp]+1)
@@ -932,8 +936,10 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		go rs.probePortMapServices()
 	}
 
+	// Without NAT traversal, we never send STUN: we behave as if UDP were
+	// blocked and measure DERP latency over HTTPS (and ICMP) instead.
 	var plan probePlan
-	if opts == nil || !opts.OnlyTCP443 {
+	if buildfeatures.HasNATTraversal && (opts == nil || !opts.OnlyTCP443) {
 		plan = makeProbePlan(dm, ifState, last, preferredDERP)
 	}
 
@@ -951,16 +957,18 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 	}
 
 	wg := syncs.NewWaitGroupChan()
-	wg.Add(len(plan))
-	for _, probeSet := range plan {
-		setCtx, cancelSet := context.WithCancel(ctx)
-		go func(probeSet []probe) {
-			for _, probe := range probeSet {
-				go rs.runProbe(setCtx, dm, probe, cancelSet)
-			}
-			<-setCtx.Done()
-			wg.Decr()
-		}(probeSet)
+	if buildfeatures.HasNATTraversal {
+		wg.Add(len(plan))
+		for _, probeSet := range plan {
+			setCtx, cancelSet := context.WithCancel(ctx)
+			go func(probeSet []probe) {
+				for _, probe := range probeSet {
+					go rs.runProbe(setCtx, dm, probe, cancelSet)
+				}
+				<-setCtx.Done()
+				wg.Decr()
+			}(probeSet)
+		}
 	}
 
 	stunTimer := time.NewTimer(stunProbeTimeout)
@@ -1001,7 +1009,10 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 			}
 		}
 		if len(need) > 0 {
-			if opts == nil || !opts.OnlyTCP443 {
+			// Without UDP to peers, DERP is our only transport and its
+			// latency is measured over HTTPS alone; ICMP is not worth
+			// linking in just for that.
+			if buildfeatures.HasUDPTransport && (opts == nil || !opts.OnlyTCP443) {
 				// Kick off ICMP in parallel to HTTPS checks; we don't
 				// reuse the same WaitGroup for those probes because we
 				// need to close the underlying Pinger after a timeout

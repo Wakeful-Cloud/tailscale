@@ -23,7 +23,20 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." # repository root
 # The copy is also rebuilt below against the same toolchain, so this script stays correct as
 # tailscale's required Go version changes without editing anything here.
 tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
+
+# Sibling _test.go files hidden from go-118-fuzz-build_v2 during a build;
+# restored by the EXIT trap below. See build_fuzzer.
+hidden_test_files=()
+
+restore_hidden_test_files() {
+	local f
+	for f in "${hidden_test_files[@]:+${hidden_test_files[@]}}"; do
+		mv "$f.__hidden__" "$f"
+	done
+	hidden_test_files=()
+}
+
+trap 'restore_hidden_test_files; rm -rf "$tmpdir"' EXIT
 
 # Pin go-118-fuzz-build to an immutable commit. Fetch by SHA rather than tracking the v2
 # branch so upstream rewrites can't silently change or break this build.
@@ -59,26 +72,94 @@ prepare() {
 	GOFLAGS=-mod=mod go get github.com/AdamKorcz/go-118-fuzz-build/testing@$fuzzbuild_ref
 }
 
+# Wraps compile_native_go_fuzzer_v2, working around go-118-fuzz-build_v2
+# (fc5dc53b) overlaying every sibling _test.go in the fuzzer's directory onto a
+# virtual non-test path (<base>_libFuzzer.go). Siblings declaring an external
+# test package (package foo_test) then collide with the fuzzer's package
+# ("found packages foo (..) and foo_test (..) in ..."). Such files are a
+# different package and can never be referenced from the fuzzer, so hide them
+# for the duration of the build and restore them afterwards.
+#
+# Rather than inferring each file's package by grepping its package clause or
+# function signature (order- and formatting-dependent), ask `go list` directly:
+# .XTestGoFiles are exactly the external-package (_test) files that collide, so
+# hide precisely those. Internal test files (.TestGoFiles, same package as the
+# fuzzer) stay put because they may define helpers the fuzz target calls.
+build_fuzzer() {
+	local path=$1 function=$2 name=$3
+	local dir rel f
+	# Use the same -tags gofuzz view as compile_native_go_fuzzer_v2 so the
+	# hidden file set matches what the build actually sees.
+	dir=$(go list -tags gofuzz -f '{{.Dir}}' "$path")
+	while IFS= read -r rel; do
+		[ -n "$rel" ] || continue
+		f="$dir/$rel"
+		mv "$f" "$f.__hidden__"
+		hidden_test_files+=("$f")
+	done < <(go list -tags gofuzz -f '{{range .XTestGoFiles}}{{.}}{{"\n"}}{{end}}' "$path")
+	compile_native_go_fuzzer_v2 "$path" "$function" "$name"
+	restore_hidden_test_files
+}
+
 build_fuzzers() {
-	compile_native_go_fuzzer_v2 tailscale.com/disco FuzzDiscoParse disco_parse_fuzzer
-	compile_native_go_fuzzer_v2 tailscale.com/net/stun FuzzParseResponse stun_parser_response_fuzzer
-	compile_native_go_fuzzer_v2 tailscale.com/net/stun FuzzParseBindingRequest stun_parser_request_fuzzer
-	compile_native_go_fuzzer_v2 tailscale.com/net/dns/resolver FuzzClampEDNSSize dns_clamp_edns_size
-	compile_native_go_fuzzer_v2 tailscale.com/net/traffic FuzzNodeHasherCompare traffic_node_hasher_compare
-	compile_native_go_fuzzer_v2 tailscale.com/net/traffic FuzzSortNodes traffic_sort_nodes
+	# control (controlbase, tsp)
+	build_fuzzer tailscale.com/control/controlbase FuzzWholeMessageLocked controlbase_whole_message_locked
+	build_fuzzer tailscale.com/control/controlbase FuzzDecryptLocked controlbase_decrypt_locked
+	build_fuzzer tailscale.com/control/controlbase FuzzConnRead controlbase_conn_read
+	build_fuzzer tailscale.com/control/controlbase FuzzConnWrite controlbase_conn_write
+	build_fuzzer tailscale.com/control/tsp FuzzFramedReader tsp_framed_reader
+	build_fuzzer tailscale.com/control/tsp FuzzBoundedReader tsp_bounded_reader
 
-	compile_native_go_fuzzer_v2 tailscale.com/tailcfg FuzzNodeIsRouter tailcfg_node_isrouter
+	# derp (top-level)
+	build_fuzzer tailscale.com/derp FuzzReadFrameHeader derp_read_frame_header
+	build_fuzzer tailscale.com/derp FuzzReadFrame derp_read_frame
+	build_fuzzer tailscale.com/derp FuzzRecvTimeout derp_recv_timeout
+	build_fuzzer tailscale.com/derp FuzzRecvServerKey derp_recv_server_key
 
-	compile_native_go_fuzzer_v2 tailscale.com/types/geo FuzzPointSphericalAngleTo geo_spherical_angle_to
+	# disco (top-level)
+	build_fuzzer tailscale.com/disco FuzzDiscoParse disco_parse_fuzzer
 
-	compile_native_go_fuzzer_v2 tailscale.com/util/cobs FuzzRoundtrip cobs_roundtrip
-	compile_native_go_fuzzer_v2 tailscale.com/util/cobs FuzzMostlyBijective cobs_mostly_bijective
-	compile_native_go_fuzzer_v2 tailscale.com/util/def FuzzBool def_bool
-	compile_native_go_fuzzer_v2 tailscale.com/util/def FuzzDuration def_duration
-	compile_native_go_fuzzer_v2 tailscale.com/util/nocasemaps FuzzAppendToLower nocase_append_tolower
-	compile_native_go_fuzzer_v2 tailscale.com/util/safediff FuzzDiff safediff_diff
+	# net (dnscache, dns/resolver, packet, portmapper, stun, traffic)
+	build_fuzzer tailscale.com/net/dnscache FuzzGetDNSQueryCacheKey dnscache_get_dns_query_cache_key
+	build_fuzzer tailscale.com/net/dnscache FuzzAsciiLowerName dnscache_ascii_lower_name
+	build_fuzzer tailscale.com/net/dns/resolver FuzzClampEDNSSize dns_clamp_edns_size
+	build_fuzzer tailscale.com/net/packet FuzzParsedDecode packet_parsed_decode
+	build_fuzzer tailscale.com/net/packet FuzzParsedPayload packet_parsed_payload
+	build_fuzzer tailscale.com/net/packet FuzzDecode4 packet_decode4
+	build_fuzzer tailscale.com/net/packet FuzzDecode6 packet_decode6
+	build_fuzzer tailscale.com/net/packet FuzzIP4Checksum packet_ip4_checksum
+	build_fuzzer tailscale.com/net/packet FuzzChecksumBytes packet_checksum_bytes
+	build_fuzzer tailscale.com/net/packet FuzzICMP6Checksum packet_icmp6_checksum
+	build_fuzzer tailscale.com/net/packet FuzzGeneveDecode packet_geneve_decode
+	build_fuzzer tailscale.com/net/portmapper FuzzParsePCPResponse portmapper_parse_pcp_response
+	build_fuzzer tailscale.com/net/portmapper FuzzParsePCPMapResponse portmapper_parse_pcp_map_response
+	build_fuzzer tailscale.com/net/stun FuzzParseResponse stun_parser_response_fuzzer
+	build_fuzzer tailscale.com/net/stun FuzzParseBindingRequest stun_parser_request_fuzzer
+	build_fuzzer tailscale.com/net/stun FuzzMappedAddress stun_mapped_address
+	build_fuzzer tailscale.com/net/stun FuzzForeachAttr stun_foreach_attr
+	build_fuzzer tailscale.com/net/stun FuzzXorMappedAddress stun_xor_mapped_address
+	build_fuzzer tailscale.com/net/traffic FuzzNodeHasherCompare traffic_node_hasher_compare
+	build_fuzzer tailscale.com/net/traffic FuzzSortNodes traffic_sort_nodes
 
-	compile_native_go_fuzzer_v2 tailscale.com/wgengine/netlog FuzzQuotedLen netlog_quoted_len
+	# tka (top-level)
+	build_fuzzer tailscale.com/tka FuzzAUMUnserializeValidate tka_aum_unserialize_validate
+	build_fuzzer tailscale.com/tka FuzzNodeKeySignatureUnserialize tka_node_key_signature_unserialize
+
+	# types (geo, key)
+	build_fuzzer tailscale.com/types/geo FuzzPointSphericalAngleTo geo_spherical_angle_to
+	build_fuzzer tailscale.com/types/key FuzzParseHex key_parse_hex
+	build_fuzzer tailscale.com/types/key FuzzFromHexChar key_from_hex_char
+	build_fuzzer tailscale.com/types/key FuzzNodePublicUnmarshalBinary key_node_public_unmarshal_binary
+	build_fuzzer tailscale.com/types/key FuzzOpen key_open
+
+	# util (cobs, def, nocasemaps, safediff, zstdframe)
+	build_fuzzer tailscale.com/util/cobs FuzzRoundtrip cobs_roundtrip
+	build_fuzzer tailscale.com/util/cobs FuzzMostlyBijective cobs_mostly_bijective
+	build_fuzzer tailscale.com/util/def FuzzBool def_bool
+	build_fuzzer tailscale.com/util/def FuzzDuration def_duration
+	build_fuzzer tailscale.com/util/nocasemaps FuzzAppendToLower nocase_append_tolower
+	build_fuzzer tailscale.com/util/safediff FuzzDiff safediff_diff
+	build_fuzzer tailscale.com/util/zstdframe FuzzNextSize zstdframe_next_size
 }
 
 prepare

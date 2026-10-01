@@ -150,10 +150,11 @@ func (n *network) initStack() error {
 			icmp.NewProtocol4,
 		},
 	})
-	sackEnabledOpt := tcpip.TCPSACKEnabled(true) // TCP SACK is disabled by default
-	tcpipErr := n.ns.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
-	if tcpipErr != nil {
-		return fmt.Errorf("SetTransportProtocolOption SACK: %v", tcpipErr)
+	// Cubic is the default congestion control on Linux and matches
+	// wgengine/netstack's configuration; gVisor defaults to reno.
+	cubicOpt := tcpip.CongestionControlOption("cubic")
+	if err := n.ns.SetTransportProtocolOption(tcp.ProtocolNumber, &cubicOpt); err != nil {
+		return fmt.Errorf("SetTransportProtocolOption cubic: %v", err)
 	}
 	// Raise the TCP buffer limits (defaults: 1 MB send, 1 MB receive)
 	// so that netstack-terminated connections (the fake control plane,
@@ -179,12 +180,6 @@ func (n *network) initStack() error {
 	rcvBufOpt := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4 << 10, Default: 4 << 20, Max: 16 << 20}
 	if err := n.ns.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBufOpt); err != nil {
 		return fmt.Errorf("SetTransportProtocolOption recv buf: %v", err)
-	}
-	// Enable receive buffer moderation (auto-tuning) so idle
-	// connections don't hold the full 4 MB.
-	modRcvBufOpt := tcpip.TCPModerateReceiveBufferOption(true)
-	if err := n.ns.SetTransportProtocolOption(tcp.ProtocolNumber, &modRcvBufOpt); err != nil {
-		return fmt.Errorf("SetTransportProtocolOption moderate recv buf: %v", err)
 	}
 	// The queue is sized to hold a full TCP send buffer's worth of
 	// 1500-byte frames (see the send buffer sizing above) so that a
@@ -599,7 +594,7 @@ func (n *network) serveLogCatcherConn(clientRemoteIP netip.Addr, c net.Conn) {
 			node.logCatcherWrites++
 			for _, lg := range logs {
 				tStr := lg.Logtail.Client_Time.Round(time.Millisecond).Format(time.RFC3339Nano)
-				fmt.Fprintf(&node.logBuf, "[%v] %s\n", tStr, lg.Text)
+				fmt.Fprintf(&node.logBuf, "[%v] %s\n", tStr, strings.TrimSuffix(lg.Text, "\n"))
 			}
 		}
 	})
@@ -643,6 +638,7 @@ func (m MAC) HWAddr() net.HardwareAddr {
 	return net.HardwareAddr(m[:])
 }
 
+// String returns the mac address as "xx:xx:xx:xx:xx:xx".
 func (m MAC) String() string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5])
 }
@@ -1200,6 +1196,10 @@ func (s *Server) Close() {
 		s.pcapWriter.Close()
 	}
 	s.wg.Wait()
+
+	for n := range s.networks {
+		n.ns.Close()
+	}
 }
 
 // AwaitFirstPacket waits until the first ethernet frame is received from the
@@ -3004,6 +3004,19 @@ func (s *Server) NodeAgentDialer(n *Node) netx.DialFunc {
 	}
 	mak.Set(&s.agentDialer, n.n, d)
 	return d
+}
+
+// NodeLogs returns the tailscaled log lines that node n has uploaded so far
+// to the fake log.tailscale.com log catcher, one line per entry, each
+// prefixed with the client's timestamp. It returns the empty string if the
+// node has not been started under this server or has uploaded nothing.
+func (s *Server) NodeLogs(n *Node) string {
+	if n == nil || n.n == nil {
+		return ""
+	}
+	n.n.logMu.Lock()
+	defer n.n.logMu.Unlock()
+	return n.n.logBuf.String()
 }
 
 func (s *Server) NodeAgentClient(n *Node) *NodeAgentClient {

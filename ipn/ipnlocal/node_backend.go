@@ -154,13 +154,14 @@ type nodeBackend struct {
 	// by mergeUserProfiles as deltas arrive. It parallels the peers map:
 	// netMap.UserProfiles is the frozen snapshot from the last full install,
 	// while this field reflects incremental updates. Readers that need a
-	// snapshot (e.g. the legacy Notify.NetMap path) must clone this map.
+	// snapshot (e.g. [LocalBackend.NetMapWithPeers] callers such as the
+	// c2n and debug netmap handlers) must clone this map.
 	userProfiles map[tailcfg.UserID]tailcfg.UserProfileView
 
 	// packetFilterRules and packetFilter are the live packet filter state,
 	// updated by setPacketFilter as deltas arrive. Like userProfiles, they
 	// exist separately from netMap's frozen fields so that concurrent
-	// JSON-encoding of a Notify.NetMap snapshot doesn't race with writes.
+	// JSON-encoding of a NetMap snapshot doesn't race with writes.
 	packetFilterRules views.Slice[tailcfg.FilterRule]
 	packetFilter      []filter.Match
 
@@ -169,14 +170,6 @@ type nodeBackend struct {
 	// [nodeBackend.AwaitNodeKeyForTest]. It is populated lazily and remains
 	// nil in production, where no test installs a waiter.
 	keyWaitersForTest map[key.NodePublic]chan struct{}
-
-	// tsmpLearnedDisco records, per node key, a peer disco key that was
-	// learned via TSMP (that is, over an existing WireGuard session with
-	// that peer). When a netmap update later reports the same disco key
-	// change, the peer's WireGuard session does not need to be reset,
-	// because the change demonstrably arrived over a working session.
-	// See [nodeBackend.discoChangedLocked].
-	tsmpLearnedDisco map[key.NodePublic]key.DiscoPublic
 
 	// routeMgr tracks this node's view of which IPs route to which
 	// peers and publishes lock-free snapshots for the data plane and
@@ -795,16 +788,17 @@ func (nb *nodeBackend) addNodeNameLocked(name string, nid tailcfg.NodeID) {
 }
 
 // removeNodeNameLocked removes both the FQDN and short-name keys for the
-// given node from nb.nodeByName. nb.mu must be held.
-func (nb *nodeBackend) removeNodeNameLocked(name string) {
+// given node from nb.nodeByName, unless another node has since claimed
+// them (see [deleteIfOwned]). nb.mu must be held.
+func (nb *nodeBackend) removeNodeNameLocked(name string, nid tailcfg.NodeID) {
 	if name == "" {
 		// We might support name-less nodes in the future; tailscale/corp#43949
 		return
 	}
 	canon := strings.ToLower(strings.TrimSuffix(name, "."))
-	delete(nb.nodeByName, canon)
+	deleteIfOwned(nb.nodeByName, canon, nid)
 	if suffix := nb.netMap.MagicDNSSuffix(); dnsname.HasSuffix(canon, suffix) {
-		delete(nb.nodeByName, dnsname.TrimSuffix(canon, suffix))
+		deleteIfOwned(nb.nodeByName, dnsname.TrimSuffix(canon, suffix), nid)
 	}
 }
 
@@ -881,14 +875,8 @@ func (nb *nodeBackend) updatePeersLocked() (discoChanged []key.NodePublic, route
 	}
 
 	for _, p := range nb.peers {
-		if prev, ok := prevDisco[p.Key()]; ok && nb.discoChangedLocked(p.Key(), prev, p.DiscoKey()) {
+		if prev, ok := prevDisco[p.Key()]; ok && nb.discoChanged(p.Key(), prev, p.DiscoKey()) {
 			discoChanged = append(discoChanged, p.Key())
-		}
-	}
-	// Drop TSMP-learned disco keys for peers no longer in the netmap.
-	for k := range nb.tsmpLearnedDisco {
-		if _, ok := nb.nodeByKey[k]; !ok {
-			delete(nb.tsmpLearnedDisco, k)
 		}
 	}
 
@@ -908,47 +896,17 @@ func (nb *nodeBackend) updatePeersLocked() (discoChanged []key.NodePublic, route
 	return discoChanged, res.AllowedIPs
 }
 
-// recordTSMPLearnedDisco notes that a peer's new disco key was learned via
-// TSMP, so the netmap update carrying the same change need not reset the
-// peer's WireGuard session. See the [nodeBackend.tsmpLearnedDisco] field doc.
-func (nb *nodeBackend) recordTSMPLearnedDisco(pub key.NodePublic, disco key.DiscoPublic) {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	mak.Set(&nb.tsmpLearnedDisco, pub, disco)
-}
-
-// discoChangedLocked reports whether a peer's disco key change from prev to
-// cur should reset the peer's WireGuard session. A changed disco key means
-// the peer restarted, so any existing session key material is dead weight;
-// resetting lets the handshake start over immediately. The exception is a
-// key change already learned via TSMP: that arrived over a working WireGuard
-// session with the peer, so the session is demonstrably fine and is kept.
-//
-// It consumes any [nodeBackend.tsmpLearnedDisco] entry for pub.
-// nb.mu must be held.
-func (nb *nodeBackend) discoChangedLocked(pub key.NodePublic, prev, cur key.DiscoPublic) bool {
-	if prev.IsZero() || cur.IsZero() || prev == cur {
+// discoChanged reports whether a peer's disco key change from prev to
+// cur should trigger an opportunistic handshake the peer's WireGuard session.
+// A changed disco key means the peer restarted, or that control caught up with
+// the TSMP learned key material, so any existing session key material is
+// possibly dead weight. Sending an opportunistic handshake lets the connection
+// recover faster in the case where the peer restarted.
+func (nb *nodeBackend) discoChanged(pub key.NodePublic, prev, cur key.DiscoPublic) bool {
+	if cur.IsZero() || prev == cur {
 		return false
 	}
-	if discoTSMP, ok := nb.tsmpLearnedDisco[pub]; ok {
-		delete(nb.tsmpLearnedDisco, pub)
-		if discoTSMP == cur {
-			nb.logf("nodeBackend: skipping WireGuard session reset (TSMP key): %s changed from %q to %q",
-				pub.ShortString(), prev, cur)
-			return false
-		}
-		// The new disco key does not match what we received via
-		// TSMP for this peer. This is unexpected, though possible
-		// if processing a change in a large netmap ends up taking
-		// longer than the 2 second timeout in
-		// [controlclient.mapRoutineState.UpdateNetmapDelta], or if
-		// the context is cancelled mid update. Log the event, and reset
-		// the session as it is possibly a stale entry in the map
-		// instead of a TSMP disco key update that led us here.
-		nb.logf("nodeBackend: [unexpected] using TSMP key for %s (control stale): tsmp=%q control=%q old=%q",
-			pub.ShortString(), discoTSMP, cur, prev)
-		metricTSMPLearnedKeyMismatch.Add(1)
-	}
+
 	nb.logf("nodeBackend: peer %s disco key changed from %q to %q", pub.ShortString(), prev, cur)
 	return true
 }
@@ -1067,6 +1025,22 @@ func (nb *nodeBackend) mergeUserProfiles(profiles map[tailcfg.UserID]tailcfg.Use
 	}
 }
 
+// deleteIfOwned deletes m[k] only if the entry still maps to nid.
+//
+// It exists because a node index entry derived from a node's last-known
+// value may have since been claimed by another node. For example, control
+// can reassign a churning ephemeral peer's Tailscale IP to a newer peer
+// and deliver the new peer's upsert before the old peer's removal, either
+// in an earlier MapResponse or reordered within one batch by the NodeID
+// sort in [netmap.MutationsFromMapResponse]. Deleting unconditionally
+// would then evict the new owner's entry, breaking lookups by IP (WhoIs,
+// and thus PeerAPI and App Connector DNS) until the next full netmap.
+func deleteIfOwned[K comparable](m map[K]tailcfg.NodeID, k K, nid tailcfg.NodeID) {
+	if m[k] == nid {
+		delete(m, k)
+	}
+}
+
 // netmapDeltaResult describes the side effects of applying netmap
 // delta mutations that the caller must propagate.
 type netmapDeltaResult struct {
@@ -1076,7 +1050,7 @@ type netmapDeltaResult struct {
 
 	// DiscoChanged is the set of peers whose disco key changed in a
 	// way that requires a WireGuard session reset (see
-	// [nodeBackend.discoChangedLocked]).
+	// [nodeBackend.discoChanged]).
 	DiscoChanged set.Set[key.NodePublic]
 
 	// RemovedPeers is a slice of peer stable node IDs (if any) that were
@@ -1115,12 +1089,10 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (res netmap
 			nid := m.Node.ID()
 			if old, ok := nb.peers[nid]; ok {
 				if old.Key() == m.Node.Key() {
-					if nb.discoChangedLocked(m.Node.Key(), old.DiscoKey(), m.Node.DiscoKey()) {
+					if nb.discoChanged(m.Node.Key(), old.DiscoKey(), m.Node.DiscoKey()) {
 						res.DiscoChanged.Make()
 						res.DiscoChanged.Add(m.Node.Key())
 					}
-				} else {
-					delete(nb.tsmpLearnedDisco, old.Key())
 				}
 				// Evict index entries derived from the old node value
 				// before re-adding them from the new one below, so a
@@ -1129,15 +1101,17 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (res netmap
 				// console arrives as an upsert with a new Name, and a
 				// stale nodeByName entry would keep serving MagicDNS
 				// answers for the old name (tailscale/corp#45631).
+				// Evictions are conditional (see [deleteIfOwned]) so
+				// entries already claimed by another node are kept.
 				for _, ipp := range old.Addresses().All() {
 					if ipp.IsSingleIP() {
-						delete(nb.nodeByAddr, ipp.Addr())
+						deleteIfOwned(nb.nodeByAddr, ipp.Addr(), nid)
 					}
 				}
-				delete(nb.nodeByKey, old.Key())
-				delete(nb.nodeByWGString, old.Key().WireGuardGoString())
-				delete(nb.nodeByStableID, old.StableID())
-				nb.removeNodeNameLocked(old.Name())
+				deleteIfOwned(nb.nodeByKey, old.Key(), nid)
+				deleteIfOwned(nb.nodeByWGString, old.Key().WireGuardGoString(), nid)
+				deleteIfOwned(nb.nodeByStableID, old.StableID(), nid)
+				nb.removeNodeNameLocked(old.Name(), nid)
 			}
 			mak.Set(&nb.peers, nid, m.Node)
 			for _, ipp := range m.Node.Addresses().All() {
@@ -1156,14 +1130,13 @@ func (nb *nodeBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (res netmap
 			if old, ok := nb.peers[nid]; ok {
 				for _, ipp := range old.Addresses().All() {
 					if ipp.IsSingleIP() {
-						delete(nb.nodeByAddr, ipp.Addr())
+						deleteIfOwned(nb.nodeByAddr, ipp.Addr(), nid)
 					}
 				}
-				delete(nb.nodeByKey, old.Key())
-				delete(nb.nodeByWGString, old.Key().WireGuardGoString())
-				delete(nb.nodeByStableID, old.StableID())
-				delete(nb.tsmpLearnedDisco, old.Key())
-				nb.removeNodeNameLocked(old.Name())
+				deleteIfOwned(nb.nodeByKey, old.Key(), nid)
+				deleteIfOwned(nb.nodeByWGString, old.Key().WireGuardGoString(), nid)
+				deleteIfOwned(nb.nodeByStableID, old.StableID(), nid)
+				nb.removeNodeNameLocked(old.Name(), nid)
 				delete(nb.peers, nid)
 				rt.RemovePeer(nid)
 				res.RemovedPeers = append(res.RemovedPeers, old.StableID())
@@ -1554,7 +1527,12 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 	for _, dom := range nm.DNS.Domains {
 		fqdn, err := dnsname.ToFQDN(dom)
 		if err != nil {
+			// Drop the domain rather than appending the zero FQDN:
+			// FQDN.WithoutTrailingDot panics on the empty FQDN, taking
+			// down tailscaled on every netmap until control sends a
+			// valid domain.
 			logf("[unexpected] non-FQDN search domain %q", dom)
+			continue
 		}
 		dcfg.SearchDomains = append(dcfg.SearchDomains, fqdn)
 	}
@@ -1580,7 +1558,13 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 		for suffix, resolvers := range routes {
 			fqdn, err := dnsname.ToFQDN(suffix)
 			if err != nil {
+				// Drop the suffix rather than inserting the zero FQDN as a
+				// route key: FQDN.WithoutTrailingDot panics on the empty
+				// FQDN when the route is written to the OS resolver config,
+				// taking down tailscaled on every netmap until control
+				// sends a valid suffix.
 				logf("[unexpected] non-FQDN route suffix %q", suffix)
+				continue
 			}
 
 			// Create map entry even if len(resolvers) == 0; Issue 2706.

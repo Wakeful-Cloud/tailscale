@@ -339,64 +339,6 @@ func BenchmarkNameFromQuery(b *testing.B) {
 	}
 }
 
-// Reproduces https://github.com/tailscale/tailscale/issues/2533
-// Fixed by https://github.com/tailscale/tailscale/commit/f414a9cc01f3264912513d07c0244ff4f3e4ba54
-//
-// NOTE: fuzz tests act like unit tests when run without `-fuzz`
-func FuzzClampEDNSSize(f *testing.F) {
-	// Empty DNS packet
-	f.Add([]byte{
-		// query id
-		0x12, 0x34,
-		// flags: standard query, recurse
-		0x01, 0x20,
-		// num questions
-		0x00, 0x00,
-		// num answers
-		0x00, 0x00,
-		// num authority RRs
-		0x00, 0x00,
-		// num additional RRs
-		0x00, 0x00,
-	})
-
-	// Empty OPT
-	f.Add([]byte{
-		// header
-		0xaf, 0x66, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x01,
-		// query
-		0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f,
-		0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
-		// OPT
-		0x00,       // name: <root>
-		0x00, 0x29, // type: OPT
-		0x10, 0x00, // UDP payload size
-		0x00,       // higher bits in extended RCODE
-		0x00,       // EDNS0 version
-		0x80, 0x00, // "Z" field
-		0x00, 0x00, // data length
-	})
-
-	// Query for "google.com"
-	f.Add([]byte{
-		// header
-		0xaf, 0x66, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x01,
-		// query
-		0x06, 0x67, 0x6f, 0x6f, 0x67, 0x6c, 0x65, 0x03, 0x63, 0x6f,
-		0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
-		// OPT
-		0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
-		0x0c, 0x00, 0x0a, 0x00, 0x08, 0x62, 0x18, 0x1a, 0xcb, 0x19,
-		0xd7, 0xee, 0x23,
-	})
-
-	f.Fuzz(func(t *testing.T, data []byte) {
-		clampEDNSSize(data, maxResponseBytes)
-	})
-}
-
 type testDNSServerOptions struct {
 	SkipUDP bool
 	SkipTCP bool
@@ -1174,6 +1116,166 @@ func TestForwarderTCPFallbackError(t *testing.T) {
 	}
 	if got, want := respHeader.RCode, dns.RCodeServerFailure; got != want {
 		t.Errorf("wanted %v, got %v", want, got)
+	}
+}
+
+// TestForwarderIgnoresStrayDatagrams checks that a datagram that is not a
+// reply to the query in flight can neither answer the query nor end it. The
+// forwarder's upstream UDP socket is unconnected, so when reading a reply it
+// has to sort out datagrams from other sources: a spoofed reply from another
+// address carrying the query's transaction ID, a datagram from the resolver
+// with the wrong transaction ID, and a datagram too short to hold a DNS
+// header must all be ignored in favor of the resolver's real reply. A spoofed
+// reply with no real reply behind it must never be returned to the client.
+//
+// See tailscale/corp#48187.
+func TestForwarderIgnoresStrayDatagrams(t *testing.T) {
+	const domain = "stray-datagram.example.com."
+
+	// Use a nonzero query ID so that a real reply has to copy it from the
+	// query, and so that a stray datagram can carry an ID that doesn't
+	// match. The spoofed reply differs from the real one only in its
+	// answer address, so returning it is detectable.
+	const queryID = 0x1e5a
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
+	binary.BigEndian.PutUint16(request[0:2], queryID)
+	realResponse := makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1"))
+	spoofedResponse := makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.9"))
+	binary.BigEndian.PutUint16(realResponse[0:2], queryID)
+	binary.BigEndian.PutUint16(spoofedResponse[0:2], queryID)
+
+	tests := []struct {
+		name    string
+		onQuery func(resolver, spoofer *net.UDPConn, dst netip.AddrPort)
+		// wantNone is true when no reply should ever reach the client.
+		wantNone bool
+	}{
+		{
+			// A spoofed reply from some other source address, with
+			// the transaction ID of the query, then the real reply.
+			name: "wrong-source-right-txid",
+			onQuery: func(resolver, spoofer *net.UDPConn, dst netip.AddrPort) {
+				spoofer.WriteToUDPAddrPort(spoofedResponse, dst)
+				resolver.WriteToUDPAddrPort(realResponse, dst)
+			},
+		},
+		{
+			// A datagram from the resolver with the wrong
+			// transaction ID, then the real reply.
+			name: "right-source-wrong-txid",
+			onQuery: func(resolver, spoofer *net.UDPConn, dst netip.AddrPort) {
+				badTxID := append([]byte(nil), spoofedResponse...)
+				binary.BigEndian.PutUint16(badTxID[0:2], queryID+1)
+				resolver.WriteToUDPAddrPort(badTxID, dst)
+				resolver.WriteToUDPAddrPort(realResponse, dst)
+			},
+		},
+		{
+			// A datagram from the resolver too short to hold a DNS
+			// header, then the real reply.
+			name: "right-source-too-short",
+			onQuery: func(resolver, spoofer *net.UDPConn, dst netip.AddrPort) {
+				resolver.WriteToUDPAddrPort([]byte("not dns"), dst)
+				resolver.WriteToUDPAddrPort(realResponse, dst)
+			},
+		},
+		{
+			// A spoofed reply with the right transaction ID from a
+			// wrong source, and never a real reply.
+			name:     "wrong-source-right-txid-no-reply",
+			wantNone: true,
+			onQuery: func(resolver, spoofer *net.UDPConn, dst netip.AddrPort) {
+				spoofer.WriteToUDPAddrPort(spoofedResponse, dst)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The resolver the forwarder queries, and a second socket
+			// standing in for a spoofer elsewhere on the network.
+			resolver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resolver.Close()
+			spoofer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer spoofer.Close()
+
+			// On each query, aim the subtest's datagrams at the
+			// forwarder's socket, whose address is the query's source.
+			go func() {
+				buf := make([]byte, 512)
+				for {
+					n, src, err := resolver.ReadFromUDPAddrPort(buf)
+					if err != nil {
+						return
+					}
+					if !bytes.Equal(buf[:n], request) {
+						t.Errorf("invalid request\ngot:  %+v\nwant: %+v", buf[:n], request)
+						return
+					}
+					tt.onQuery(resolver, spoofer, src)
+				}
+			}()
+
+			logf := tstest.WhileTestRunningLogger(t)
+			bus := eventbustest.NewBus(t)
+			netMon, err := netmon.New(bus, logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer netMon.Close()
+
+			var dialer tsdial.Dialer
+			dialer.SetNetMon(netMon)
+			dialer.SetBus(bus)
+
+			fwd := newForwarder(logf, netMon, nil, &dialer, health.NewTracker(bus), nil)
+
+			rpkt := packet{
+				bs:     request,
+				family: "udp",
+				addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+			}
+			rchan := make(chan packet, 1)
+
+			// When a reply is expected it should arrive promptly;
+			// when none is, the query only has to outlast the
+			// spoofed datagram.
+			timeout := 5 * time.Second
+			if tt.wantNone {
+				timeout = 500 * time.Millisecond
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			resolverAddr, err := netip.ParseAddrPort(resolver.LocalAddr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fwd.forwardWithDestChan(ctx, rpkt, rchan,
+				resolverAndDelay{name: &dnstype.Resolver{Addr: resolverAddr.String()}}); err != nil && !tt.wantNone {
+				t.Fatalf("forwardWithDestChan: %v", err)
+			}
+
+			select {
+			case res := <-rchan:
+				if tt.wantNone {
+					t.Fatalf("forwarder returned a reply anyway: %+v", res.bs)
+				}
+				if !bytes.Equal(res.bs, realResponse) {
+					t.Errorf("invalid response\ngot:  %+v\nwant: %+v", res.bs, realResponse)
+				}
+			case <-ctx.Done():
+				if !tt.wantNone {
+					t.Fatalf("timed out waiting for response: %v", ctx.Err())
+				}
+			}
+		})
 	}
 }
 
