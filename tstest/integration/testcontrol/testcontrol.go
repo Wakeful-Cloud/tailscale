@@ -124,6 +124,10 @@ type Server struct {
 	// for service updates. If empty, the default is "true".
 	CollectServices opt.Bool
 
+	// OverrideDisableUPnP, if true, stops the server from sending the
+	// [nodecap.DisableUPnP] capability to every node.
+	OverrideDisableUPnP bool
+
 	// ExplicitBaseURL or HTTPTestServer must be set.
 	ExplicitBaseURL string           // e.g. "http://127.0.0.1:1234" with no trailing URL
 	HTTPTestServer  *httptest.Server // if non-nil, used to get BaseURL
@@ -450,7 +454,14 @@ func (s *Server) serveC2N(w http.ResponseWriter, r *http.Request) {
 		}
 		s.C2NResponses.Delete(token)
 
-		res, err := http.ReadResponse(bufio.NewReader(r.Body), nil)
+		// Read the whole body before handing off the response, as
+		// onRes's receiver may read res.Body after this handler
+		// returns, at which point the HTTP/2 server has closed r.Body.
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return fmt.Errorf("error reading c2n response: %w", err)
+		}
+		res, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(body)), nil)
 		if err != nil {
 			return fmt.Errorf("error reading c2n response: %w", err)
 		}
@@ -670,6 +681,20 @@ func (s *Server) SetSubnetRoutes(nodeKey key.NodePublic, routes []netip.Prefix) 
 				sendUpdate(s.updates[n.ID], updatePeerChanged)
 			}
 		}
+	}
+}
+
+// SetDNSConfig sets the DNS configuration and notifies all nodes.
+// If dns is nil, it sends an empty DNSConfig to clear the configuration.
+func (s *Server) SetDNSConfig(dns *tailcfg.DNSConfig) {
+	if dns == nil {
+		dns = new(tailcfg.DNSConfig)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.DNSConfig = dns
+	for _, n := range s.nodes {
+		sendUpdate(s.updates[n.ID], updateSelfChanged)
 	}
 }
 
@@ -1650,7 +1675,9 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 	s.mu.Unlock()
 
 	node.CapMap = nodeCapMap
-	node.Capabilities = append(node.Capabilities, nodecap.DisableUPnP)
+	if !s.OverrideDisableUPnP {
+		node.Capabilities = append(node.Capabilities, nodecap.DisableUPnP)
+	}
 	if sshPolicy != nil {
 		mak.Set(&node.CapMap, nodecap.SSH, nil)
 	}

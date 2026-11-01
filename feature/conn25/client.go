@@ -47,7 +47,7 @@ func (c *client) transitIPForMagicIP(magicIP netip.Addr) (netip.Addr, bool) {
 	defer c.mu.Unlock()
 	v, ok := c.assignments.lookupByMagicIP(magicIP)
 	if ok {
-		return v.transit, true
+		return v.connectorAddr.transit, true
 	}
 	return netip.Addr{}, false
 }
@@ -58,8 +58,6 @@ func (c *client) transitIPForMagicIP(magicIP netip.Addr) (netip.Addr, bool) {
 // but conn25 uses link-local addresses for transit IPs.
 // Let the filter know if this is one of our addresses and should be allowed.
 func (c *client) linkLocalAllow(p packet.Parsed) (bool, string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	ok := c.isKnownTransitIP(p.Dst.Addr())
 	if ok {
 		return true, packetFilterAllowReason
@@ -68,6 +66,8 @@ func (c *client) linkLocalAllow(p packet.Parsed) (bool, string) {
 }
 
 func (c *client) isKnownTransitIP(tip netip.Addr) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	_, ok := c.assignments.lookupByTransitIP(tip)
 	return ok
 }
@@ -105,13 +105,38 @@ func (c *client) reset() {
 // the app name refers to a configured app.
 // It checks that this domain should be routed and that this client is not itself a connector for the domain
 // and generally if it is valid to make the assignment.
-func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip.Addr, ttl time.Duration) (*addrs, error) {
+func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip.Addr, ttl time.Duration, connectorNode tailcfg.NodeView, token string) (*addrs, error) {
 	if !dst.IsValid() {
 		return nil, errors.New("dst is not valid")
+	}
+	if !connectorNode.Valid() {
+		return nil, errors.New("connector node is not valid")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.assignments.lookupByDomainDst(domain, dst); ok {
+		// We have the domain/dst, but it's possible this came from another connector
+		// and the original connector is dead, in which case we currently don't
+		// call enqueueAddressAssignment and register the TransitIP with the other
+		// connector. And we don't install the new connector's node key in WireGuard.
+		//
+		// The correct action would be to allocate a new TransitIP associated
+		// with that new connector, and then register the TransitIP address, and
+		// install the node key.
+		// But as of 2026-10-01, the data model doesn't support multiple TransitIPs
+		// per domain/dst/magic.
+		//
+		// For now, try to use the old connector, even if this new DNS request came from
+		// a new connector.
+		//
+		// Token management. If it came from the old connector, token should be updated,
+		// because it is what the connector will expect. If it came from a different
+		// connector, don't modify the token for the original connector.
+		//
+		// TODO(tailscale/corp#50318): support multiple TransitIPs/connectors per domain/dst/magic.
+		if existing.connectorAddr.node.ID() == connectorNode.ID() {
+			existing.connectorAddr.token = token
+		}
 		c.assignments.updateFromTTL(existing, ttl)
 		return existing, nil
 	}
@@ -129,46 +154,50 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 		}
 		if a.is4() {
 			c.v4MagicIPPool.returnAddr(a.magic)
-			c.v4TransitIPPool.returnAddr(a.transit)
+			c.v4TransitIPPool.returnAddr(a.connectorAddr.transit)
 		} else if a.is6() {
 			c.v6MagicIPPool.returnAddr(a.magic)
-			c.v6TransitIPPool.returnAddr(a.transit)
+			c.v6TransitIPPool.returnAddr(a.connectorAddr.transit)
 		} else {
 			return nil, errors.New("unexpected neither 4 nor 6")
 		}
 	}
 
-	var mip, tip netip.Addr
-	var err error
+	var magicPool, transitPool *ippool
 	if dst.Is4() {
-		mip, err = c.v4MagicIPPool.next()
-		if err != nil {
-			return nil, err
-		}
-		tip, err = c.v4TransitIPPool.next()
-		if err != nil {
-			return nil, err
-		}
+		magicPool, transitPool = c.v4MagicIPPool, c.v4TransitIPPool
 	} else if dst.Is6() {
-		mip, err = c.v6MagicIPPool.next()
-		if err != nil {
-			return nil, err
-		}
-		tip, err = c.v6TransitIPPool.next()
-		if err != nil {
-			return nil, err
-		}
+		magicPool, transitPool = c.v6MagicIPPool, c.v6TransitIPPool
 	} else {
 		return nil, errors.New("unexpected neither 4 nor 6")
 	}
+	// Addresses are only returned to the pools by the popExpired loop above,
+	// which can only see them once they're in c.assignments. So any failure
+	// before the insert below has to put them back itself, or they're leaked
+	// from the pool for the lifetime of the process.
+	mip, err := magicPool.next()
+	if err != nil {
+		return nil, err
+	}
+	tip, err := transitPool.next()
+	if err != nil {
+		magicPool.returnAddr(mip)
+		return nil, err
+	}
 	as := &addrs{
-		dst:     dst,
-		magic:   mip,
-		transit: tip,
-		app:     appName,
-		domain:  domain,
+		dst:   dst,
+		magic: mip,
+		connectorAddr: connectorAddr{
+			transit: tip,
+			node:    connectorNode,
+			token:   token,
+		},
+		app:    appName,
+		domain: domain,
 	}
 	if err := c.assignments.insertFromTTL(as, ttl); err != nil {
+		magicPool.returnAddr(mip)
+		transitPool.returnAddr(tip)
 		return nil, err
 	}
 	err = c.enqueueAddressAssignment(as)
@@ -179,14 +208,18 @@ func (c *client) reserveAddresses(appName string, domain dnsname.FQDN, dst netip
 }
 
 func (c *client) addTransitIPForConnector(tip netip.Addr, conn tailcfg.NodeView) error {
+	if !conn.Valid() {
+		return fmt.Errorf("unexpectedly received invalid connector node")
+	}
 	if conn.Key().IsZero() {
 		return fmt.Errorf("node with stable ID %q does not have a key", conn.StableID())
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return c.insertTransitConnMapping(tip, conn.Key())
 }
+
+// errQueueFull is returned when the address assignment send queue is full and
+// the assignment was dropped. It's backpressure, not a hard failure.
+var errQueueFull = errors.New("queue full")
 
 func (c *client) enqueueAddressAssignment(addrs *addrs) error {
 	select {
@@ -196,7 +229,7 @@ func (c *client) enqueueAddressAssignment(addrs *addrs) error {
 		return nil
 	default:
 		c.logf("address assignment queue full, dropping transit assignment for %v", addrs.domain)
-		return errors.New("queue full")
+		return errQueueFull
 	}
 }
 
@@ -224,8 +257,6 @@ func (c *client) flowRemoved(transit netip.Addr) {
 }
 
 func (c *client) extraWireGuardAllowedIPs(k key.NodePublic) views.Slice[netip.Prefix] {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	tips, ok := c.lookupTransitIPsByConnKey(k)
 	if !ok {
 		return views.Slice[netip.Prefix]{}
@@ -250,7 +281,7 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 
 	// make an answer for each rewrite
 	for _, rw := range answers {
-		as, err := c.reserveAddresses(appName, rw.domain, rw.dst, time.Duration(rw.ttlSeconds)*time.Second)
+		as, err := c.reserveAddresses(appName, rw.domain, rw.dst, time.Duration(rw.ttlSeconds)*time.Second, rw.connectorNode, rw.token)
 		if err != nil {
 			return nil, err
 		}
@@ -287,7 +318,7 @@ func (c *client) rewriteDNSResponse(appName string, hdr dnsmessage.Header, quest
 type addrs struct {
 	dst             netip.Addr
 	magic           netip.Addr
-	transit         netip.Addr
+	connectorAddr   connectorAddr
 	domain          dnsname.FQDN
 	app             string
 	expiresAt       time.Time
@@ -311,6 +342,8 @@ func (as addrs) is6() bool {
 // for the provided transitIP (as a prefix).
 // The provided transitIP must already be present in the byTransitIP map.
 func (c *client) insertTransitConnMapping(tip netip.Addr, connKey key.NodePublic) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, ok := c.assignments.lookupByTransitIP(tip); !ok {
 		return errors.New("transit IP is not already known")
 	}
@@ -329,6 +362,8 @@ func (c *client) insertTransitConnMapping(tip netip.Addr, connKey key.NodePublic
 // associated with the given connector (identified by node key), or (nil, false) if there is no entry
 // for the given key.
 func (c *client) lookupTransitIPsByConnKey(k key.NodePublic) ([]netip.Prefix, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	s, ok := c.byConnKey[k]
 	if !ok {
 		return nil, false
@@ -341,6 +376,8 @@ func (c *client) lookupTransitIPsByConnKey(k key.NodePublic) ([]netip.Prefix, bo
 // mapping does not exist on its end. If a mapping is not found on the client
 // either, this is a no-op.
 func (c *client) resendTransitIPMapping(transitIP netip.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	mapping, ok := c.assignments.lookupByTransitIP(transitIP)
 	if !ok {
 		// We have no mappings for this transit IP, so nothing to resend.

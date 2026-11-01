@@ -81,6 +81,21 @@ func TestOmitDNSResolveCache(t *testing.T) {
 	}.Check(t)
 }
 
+func TestOmitAppConnectors(t *testing.T) {
+	const msg = "unexpected app connector usage with ts_omit_appconnectors"
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		// conn25 also uses appc, so omit it too to check that nothing
+		// else pulls appc in.
+		Tags: "ts_omit_appconnectors,ts_omit_conn25,ts_include_cli",
+		BadDeps: map[string]string{
+			"tailscale.com/appc":                  msg,
+			"tailscale.com/feature/appconnectors": msg,
+		},
+	}.Check(t)
+}
+
 func TestOmitSyspolicy(t *testing.T) {
 	const msg = "unexpected syspolicy usage with ts_omit_syspolicy"
 	deptest.DepChecker{
@@ -369,4 +384,17 @@ func TestMinTailscaledWithCLI(t *testing.T) {
 			"github.com/mattn/go-colorable":          "unexpected go-colorable dep with ts_omit_colorable",
 		},
 	}.Check(t)
+}
+
+func TestOmitExitNodeHealth(t *testing.T) {
+	for _, tag := range []string{"ts_omit_exitnodehealth", "ts_omit_health", "ts_omit_useexitnode"} {
+		t.Run(tag, func(t *testing.T) {
+			deptest.DepChecker{
+				GOOS:    "linux",
+				GOARCH:  "amd64",
+				Tags:    tag + ",ts_include_cli",
+				BadDeps: map[string]string{"tailscale.com/feature/exitnodehealth": "unexpected exit node health feature"},
+			}.Check(t)
+		})
+	}
 }

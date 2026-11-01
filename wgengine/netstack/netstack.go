@@ -55,6 +55,7 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/set"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
@@ -137,6 +138,20 @@ var netstackKeepaliveIdle = envknob.RegisterDuration("TS_NETSTACK_KEEPALIVE_IDLE
 // netstackKeepaliveIdle; setting one without the other leaves the unset knob
 // at the netstack default. Value is a Go duration, e.g. "15s".
 var netstackKeepaliveInterval = envknob.RegisterDuration("TS_NETSTACK_KEEPALIVE_INTERVAL")
+
+// netstackEnableRACK overrides whether netstack's TCP uses RACK-TLP loss
+// detection (RFC 8985). RACK remains enabled by default; only explicitly
+// setting TS_NETSTACK_ENABLE_RACK=false disables it. When false, TCP falls
+// back to RFC 6675 SACK loss recovery, as netstack did from 1.82 through 1.102.
+//
+// Why: until go.mod has google/gvisor#15432 and google/gvisor#16081, RACK's
+// loss marks do not reduce the SACK recovery pipe, and after an RTO, RACK
+// starts fast recovery for the same flight with a cwnd of 5. After a burst
+// loss the sender can then retransmit about two segments per RTO for seconds
+// to tens of seconds (tailscale/tailscale#21946). RACK off is in turn slower
+// on paths that reorder packets (tailscale/tailscale#20893), so unset keeps
+// gVisor's default.
+var netstackEnableRACK = envknob.RegisterOptBool("TS_NETSTACK_ENABLE_RACK")
 
 var (
 	serviceIP   = tsaddr.TailscaleServiceIP()
@@ -394,6 +409,18 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	if tcpipErr != nil {
 		return nil, fmt.Errorf("could not set cubic congestion control: %v", tcpipErr)
 	}
+
+	// Disable RACK by default (again), the conditions under which it performs
+	// poorly are too common still. See google/gvisor#16670, #21946, #18714.
+	recovery := tcpip.TCPRecovery(0)
+	if rack, ok := netstackEnableRACK().Get(); ok && rack {
+		recovery = tcpip.TCPRACKLossDetection
+	}
+	tcpipErr = ns.ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &recovery)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("could not set TCP loss recovery: %v", tcpipErr)
+	}
+
 	err := setTCPBufSizes(ns.ipstack)
 	if err != nil {
 		return nil, err
@@ -442,11 +469,20 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	return ns, nil
 }
 
+// SetMetricsRegistry registers netstack's user-facing metrics with r, which
+// should be the registry used by ns's [tstun.Wrapper].
+func (ns *Impl) SetMetricsRegistry(r *usermetric.Registry) {
+	// Only WireGuard-bound packets are sent to other peers. Host and loopback
+	// drops are node-local, so they are reported only in debug and client metrics.
+	ns.linkEP.outboundDropped.Store(r.DroppedPacketsOutbound())
+}
+
 func (ns *Impl) Close() error {
 	stacksForMetrics.Delete(ns)
-	// Cancel the injection goroutines before ipstack.Wait closes linkEP's
-	// outbound queues. A nil queue read is expected only after cancellation.
+	// Cancel before closing the queues so consumers expect nil reads.
+	// Close linkEP before aborting endpoints that can generate replies.
 	ns.ctxCancel()
+	ns.linkEP.Close()
 	ns.ipstack.Close()
 	ns.ipstack.Wait()
 	ns.injectWG.Wait()
@@ -469,6 +505,17 @@ func init() {
 	// Please take care to avoid exporting clientmetrics with the same metric
 	// names as the ones used by Impl.ExpVar. Both get exposed via the same HTTP
 	// endpoint, and name collisions will result in Prometheus scraping errors.
+	clientmetric.NewCounterFunc("netstack_outbound_queue_full_dropped_packets", func() int64 {
+		var total int64
+		for ns := range stacksForMetrics.Keys() {
+			v := ns.linkEP.queueFullDroppedTotal()
+			if v > math.MaxInt64-total {
+				return math.MaxInt64
+			}
+			total += v
+		}
+		return total
+	})
 	clientmetric.NewCounterFunc("netstack_tcp_forward_dropped_attempts", func() int64 {
 		var total uint64
 		for ns := range stacksForMetrics.Keys() {
@@ -1053,17 +1100,13 @@ func (ns *Impl) injectToWireGuard() {
 			ns.logf("[v2] injectToWireGuard: % x",
 				stack.PayloadSince(pkt.NetworkHeader()).AsSlice())
 		}
-		if err := ns.tundev.InjectOutboundPacketBuffer(pkt); err != nil {
-			ns.logf("netstack injectToWireGuard err: %v", err)
-			// When failing to inject an outbound packet buffer, log the error, but
-			// continue serving the ReadContext for sending subsequent packets, as
-			// nothing manages or restarts a failed injectToWireGuard. An error here
-			// only applies to the current packet and should not terminate the long-lived
-			// packet pump.
-			// The exception to this is if the context has ended, indicating a shutdown.
-			if ns.ctx.Err() != nil {
+		if err := ns.tundev.InjectOutboundPacketBufferContext(ns.ctx, pkt); err != nil {
+			if ns.ctx.Err() != nil || errors.Is(err, tstun.ErrClosed) {
 				return
 			}
+			ns.logf("netstack injectToWireGuard err: %v", err)
+			// A per-packet error must not terminate this long-lived pump:
+			// nothing manages or restarts a failed injectToWireGuard.
 			continue
 		}
 	}
@@ -1427,7 +1470,7 @@ func (ns *Impl) userPing(dstIP netip.Addr, pingResPkt []byte, direction userPing
 		ns.logf("exec pinged %v in %v", dstIP, time.Since(t0))
 	}
 	if direction == userPingDirectionOutbound {
-		if err := ns.tundev.InjectOutbound(pingResPkt); err != nil {
+		if err := ns.tundev.InjectOutboundContext(ns.ctx, pingResPkt); err != nil && ns.ctx.Err() == nil && !errors.Is(err, tstun.ErrClosed) {
 			ns.logf("InjectOutbound ping response: %v", err)
 		}
 	} else if direction == userPingDirectionInbound {
@@ -2252,6 +2295,14 @@ func readStatCounter(sc *tcpip.StatCounter) int64 {
 // ExpVar returns an expvar variable suitable for registering with expvar.Publish.
 func (ns *Impl) ExpVar() expvar.Var {
 	m := new(metrics.Set)
+
+	for q, name := range map[outboundQueue]string{
+		outboundToWireGuard: "wireguard",
+		outboundToHost:      "host",
+		outboundLoopback:    "loopback",
+	} {
+		m.Set("counter_outbound_queue_full_dropped_packets_"+name, &ns.linkEP.queueFullDropped[q])
+	}
 
 	// Global metrics
 	stats := ns.ipstack.Stats()

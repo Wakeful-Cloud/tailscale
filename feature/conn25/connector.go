@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"tailscale.com/net/packet"
+	"tailscale.com/net/routelimits"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
@@ -27,6 +28,15 @@ func (c *connector) handleTransitIPRequest(n tailcfg.NodeView, peerV4 netip.Addr
 		c.logf("[Unexpected] peer attempt to map a transit IP to dest IP did not have matching families: node: %s, tIPv4: %v dIPv4: %v",
 			n.StableID(), tipr.TransitIP.Is4(), tipr.DestinationIP.Is4())
 		return TransitIPResponse{Code: AddrFamilyMismatch, Message: addrFamilyMismatchMessage}
+	}
+
+	if routelimits.IsDisallowed(tipr.DestinationIP) {
+		return TransitIPResponse{Code: DisallowedDestination, Message: disallowedDestinationMessage}
+	}
+
+	// TODO(tailscale/corp#50542): remove this condition when we have a configurable check
+	if tipr.DestinationIP.IsPrivate() {
+		return TransitIPResponse{Code: DisallowedDestination, Message: disallowedDestinationMessage}
 	}
 
 	// The transit address has to come from a transit IP pool we're configured with.
@@ -89,6 +99,9 @@ type connector struct {
 
 	// Remember to add new fields to [connector.reset] if needed.
 	mu sync.Mutex // protects the fields below
+	// tokenSecret is the random secret used to mint and verify tokens in TransitIPRequests.
+	// It is generated in memory at creation, rotated on [connector.reset] (ie on profile change), and not persisted.
+	tokenSecret [tokenSecretLen]byte
 	// transitIPs is a map of connector client peer IP -> client transitIPs that we update as connector client peers instruct us to, and then use to route traffic to its destination on behalf of connector clients.
 	// Note that each peer could potentially have two maps: one for its IPv4 address, and one for its IPv6 address. The transit IPs map for a given peer IP will contain transit IPs of the same family as the peer's IP.
 	transitIPs map[netip.Addr]map[netip.Addr]appAddr
@@ -224,4 +237,6 @@ func (c *connector) reset() {
 
 	c.transitIPs = make(map[netip.Addr]map[netip.Addr]appAddr)
 	c.expiryQueue = list.New()
+	// old tokens should no longer verify
+	c.tokenSecret = newTokenSecret()
 }

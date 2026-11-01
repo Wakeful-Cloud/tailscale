@@ -5,13 +5,16 @@ package conn25
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
 	"go4.org/mem"
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/packet"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
@@ -61,7 +64,7 @@ func TestReserveIPs(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			addrs, err := c.client.reserveAddresses(appName, domain, tt.dst, 10)
+			addrs, err := c.client.reserveAddresses(appName, domain, tt.dst, 10, testConnectorPeer, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -71,8 +74,8 @@ func TestReserveIPs(t *testing.T) {
 			if tt.wantMagic != addrs.magic {
 				t.Errorf("want %v, got %v", tt.wantMagic, addrs.magic)
 			}
-			if tt.wantTransit != addrs.transit {
-				t.Errorf("want %v, got %v", tt.wantTransit, addrs.transit)
+			if tt.wantTransit != addrs.connectorAddr.transit {
+				t.Errorf("want %v, got %v", tt.wantTransit, addrs.connectorAddr.transit)
 			}
 			if appName != addrs.app {
 				t.Errorf("want %s, got %s", appName, addrs.app)
@@ -107,12 +110,12 @@ func TestReserveAddressesDeduplicated(t *testing.T) {
 			c.v4TransitIPPool = newIPPool(mustIPSetFromPrefix("169.254.0.0/24"))
 			c.v6TransitIPPool = newIPPool(mustIPSetFromPrefix("fd7a:115c:a1e0:a99c:0200::/80"))
 
-			first, err := c.reserveAddresses(appName, "example.com.", tt.dst, 10)
+			first, err := c.reserveAddresses(appName, "example.com.", tt.dst, 10, testConnectorPeer, "")
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			second, err := c.reserveAddresses(appName, "example.com.", tt.dst, 10)
+			second, err := c.reserveAddresses(appName, "example.com.", tt.dst, 10, testConnectorPeer, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -132,15 +135,92 @@ func TestReserveAddressesDeduplicated(t *testing.T) {
 	}
 }
 
+// TestReserveAddressesNoLeakOnFailure checks that a magic IP isn't lost from
+// its pool when the reservation fails after the magic IP was handed out. Once
+// an address is marked in use it can only be returned via popExpired, which
+// never sees assignments that failed to be inserted, so a leak here is permanent.
+func TestReserveAddressesNoLeakOnFailure(t *testing.T) {
+	// An empty transit pool is reachable from config: the magic and transit
+	// pools come from independent node capabilities. A single-address transit
+	// pool exhausts itself after one reservation.
+	for _, tt := range []struct {
+		name    string
+		is6     bool
+		magic   string
+		transit *netipx.IPSet
+	}{
+		{
+			name:    "v4-empty-transit-pool",
+			magic:   "100.64.0.0/24",
+			transit: &netipx.IPSet{},
+		},
+		{
+			name:    "v4-exhausted-transit-pool",
+			magic:   "100.64.0.0/24",
+			transit: mustIPSetFromPrefix("169.254.0.0/30"),
+		},
+		{
+			name:    "v6-empty-transit-pool",
+			is6:     true,
+			magic:   "fd7a:115c:a1e0:a99c:0100::/80",
+			transit: &netipx.IPSet{},
+		},
+		{
+			name:    "v6-exhausted-transit-pool",
+			is6:     true,
+			magic:   "fd7a:115c:a1e0:a99c:0100::/80",
+			transit: mustIPSetFromPrefix("fd7a:115c:a1e0:a99c:0200::/127"),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const appName = "a"
+			c := newConn25(t.Logf).client
+
+			magicPool, transitPool := &c.v4MagicIPPool, &c.v4TransitIPPool
+			if tt.is6 {
+				magicPool, transitPool = &c.v6MagicIPPool, &c.v6TransitIPPool
+			}
+			*magicPool = newIPPool(mustIPSetFromPrefix(tt.magic))
+			*transitPool = newIPPool(tt.transit)
+
+			// Reserve until the transit pool runs out, then keep going. Every
+			// failure past that point must leave the magic pool untouched.
+			var gotErr error
+			var reserved int
+			for i := range 5 {
+				dst := netip.AddrFrom4([4]byte{0, 0, 0, byte(i + 1)})
+				if tt.is6 {
+					dst = netip.MustParseAddr(fmt.Sprintf("::%d", i+1))
+				}
+				domain := must.Get(dnsname.ToFQDN(fmt.Sprintf("e%d.example.com.", i)))
+				if _, err := c.reserveAddresses(appName, domain, dst, 10, testConnectorPeer, ""); err != nil {
+					gotErr = err
+				} else {
+					reserved++
+				}
+			}
+			if !errors.Is(gotErr, errPoolExhausted) {
+				t.Fatalf("want errPoolExhausted from the transit pool, got %v", gotErr)
+			}
+			if got := (*magicPool).inUseCount(); got != int64(reserved) {
+				t.Errorf("magic pool has %d addresses in use, want %d (one per successful reservation)", got, reserved)
+			}
+			if got := (*transitPool).inUseCount(); got != int64(reserved) {
+				t.Errorf("transit pool has %d addresses in use, want %d (one per successful reservation)", got, reserved)
+			}
+		})
+	}
+}
+
 func TestTransitIPConnMapping(t *testing.T) {
 	conn25 := newConn25(t.Logf)
 
 	as := &addrs{
-		dst:     netip.MustParseAddr("1.2.3.1"),
-		magic:   netip.MustParseAddr("100.64.0.1"),
-		transit: netip.MustParseAddr("169.254.0.1"),
-		domain:  "woo.example.com.",
-		app:     "app1",
+		dst:           netip.MustParseAddr("1.2.3.1"),
+		magic:         netip.MustParseAddr("100.64.0.1"),
+		connectorAddr: connectorAddr{transit: netip.MustParseAddr("169.254.0.1")},
+		domain:        "woo.example.com.",
+		app:           "app1",
 	}
 
 	connectorPeers := []tailcfg.NodeView{
@@ -159,7 +239,7 @@ func TestTransitIPConnMapping(t *testing.T) {
 	}
 
 	// Adding a transit IP that isn't known should fail
-	if err := conn25.client.addTransitIPForConnector(as.transit, connectorPeers[1]); err == nil {
+	if err := conn25.client.addTransitIPForConnector(as.connectorAddr.transit, connectorPeers[1]); err == nil {
 		t.Error("adding an unknown transit IP should fail")
 	}
 
@@ -167,16 +247,16 @@ func TestTransitIPConnMapping(t *testing.T) {
 	conn25.client.assignments.insert(as)
 
 	// Adding a transit IP for a node with an unset key should fail
-	if err := conn25.client.addTransitIPForConnector(as.transit, connectorPeers[0]); err == nil {
+	if err := conn25.client.addTransitIPForConnector(as.connectorAddr.transit, connectorPeers[0]); err == nil {
 		t.Error("adding an transit IP mapping for a connector with a zero key should fail")
 	}
 	// Adding a transit IP that is known should succeed
-	if err := conn25.client.addTransitIPForConnector(as.transit, connectorPeers[1]); err != nil {
+	if err := conn25.client.addTransitIPForConnector(as.connectorAddr.transit, connectorPeers[1]); err != nil {
 		t.Errorf("unexpected error for first time add: %v", err)
 	}
 	// And doing it again shouldn't fail (this is done when resending mappings
 	// to a restarted connector)
-	if err := conn25.client.addTransitIPForConnector(as.transit, connectorPeers[1]); err != nil {
+	if err := conn25.client.addTransitIPForConnector(as.connectorAddr.transit, connectorPeers[1]); err != nil {
 		t.Errorf("error adding duplicate transitIP for a connector: %v", err)
 	}
 }
@@ -187,7 +267,9 @@ func TestIsKnownTransitIP(t *testing.T) {
 
 	c := newConn25(t.Logf)
 	err := c.client.assignments.insert(&addrs{
-		transit: knownTip,
+		connectorAddr: connectorAddr{
+			transit: knownTip,
+		},
 	})
 	if err != nil {
 		t.Errorf("error inserting address assignment: %v", err)
@@ -207,7 +289,9 @@ func TestLinkLocalAllow(t *testing.T) {
 
 	c := newConn25(t.Logf)
 	err := c.client.assignments.insert(&addrs{
-		transit: knownTip,
+		connectorAddr: connectorAddr{
+			transit: knownTip,
+		},
 	})
 	if err != nil {
 		t.Fatalf("error inserting address assignment: %v", err)
@@ -271,18 +355,18 @@ func TestReconfigDoesNotReissueInUseAddresses(t *testing.T) {
 				conn25: c,
 			}
 
-			_, err := c.client.reserveAddresses(appName, domain, tt.dstOne, 10)
+			_, err := c.client.reserveAddresses(appName, domain, tt.dstOne, 10, testConnectorPeer, "")
 			if !errors.Is(err, errUninitializedIPPool) {
 				t.Fatalf("want %v, got %v", errUninitializedIPPool, err)
 			}
 
 			ext.onSelfChange(makeNodeFromMagicRange(beforeRangeV4, beforeRangeV6))
-			beforeAddrs, err := c.client.reserveAddresses(appName, domain, tt.dstOne, 10)
+			beforeAddrs, err := c.client.reserveAddresses(appName, domain, tt.dstOne, 10, testConnectorPeer, "")
 			if err != nil {
 				t.Fatal(err)
 			}
 			ext.onSelfChange(makeNodeFromMagicRange(afterRangeV4, afterRangeV6))
-			afterAddrs, err := c.client.reserveAddresses(appName, domain, tt.dstTwo, 10)
+			afterAddrs, err := c.client.reserveAddresses(appName, domain, tt.dstTwo, 10, testConnectorPeer, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -345,7 +429,7 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 	tests := []struct {
 		name                    string
 		flowsAndTimeFx          func(*Conn25, *tstest.Clock, netip.Addr)
-		secondDNSResponse       []byte
+		secondDNSResponse       *resolver.Response
 		assertSecondDNSResponse func(*testing.T, []byte)
 		wantUnexpiredDstIPs     set.Set[netip.Addr]
 		wantExpiredAtTime       map[netip.Addr]time.Duration // since the startTime
@@ -445,8 +529,15 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 			cfg := mustConfig(t, sn)
 			c.reconfig(cfg)
 
+			ext := &extension{
+				conn25: c,
+				host: &testHost{nb: &testNodeBackend{
+					peers: []tailcfg.NodeView{testConnectorPeer},
+				}},
+			}
+
 			// we get a dns response for ipone
-			bs1 := c.mapDNSResponse(dnsRespIPOne)
+			bs1 := ext.mapDNSResponse(dnsRespIPOne)
 			assertParsesToAnswers(
 				[]netip.Addr{
 					netip.MustParseAddr("100.64.0.0"),
@@ -459,7 +550,7 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 			}
 
 			// there are client flows and time passes
-			tt.flowsAndTimeFx(c, clock, c.client.assignments.byDomainDst[ipOneDD].transit)
+			tt.flowsAndTimeFx(c, clock, c.client.assignments.byDomainDst[ipOneDD].connectorAddr.transit)
 
 			// then a second dns response
 			dnsR2 := tt.secondDNSResponse
@@ -472,7 +563,7 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 					},
 				)
 			}
-			bs2 := c.mapDNSResponse(dnsR2)
+			bs2 := ext.mapDNSResponse(dnsR2)
 			assertSecondResponseFx(t, bs2)
 
 			// assert which addresses have expired / remain unexpired
@@ -497,4 +588,53 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResendTransitIPMappingConcurrent races resendTransitIPMapping, against a writer of client.assignments.
+func TestResendTransitIPMappingConcurrent(t *testing.T) {
+	const appName = "a"
+	conn25 := newConn25(logger.Discard)
+	c := conn25.client
+
+	// A mapping for the resending goroutine to find, so it takes the found
+	// path and copies *addrs rather than returning early on the miss.
+	knownTransit := netip.MustParseAddr("169.254.255.255")
+	if err := c.assignments.insert(&addrs{
+		dst:           netip.MustParseAddr("1.2.3.4"),
+		magic:         netip.MustParseAddr("100.64.255.255"),
+		connectorAddr: connectorAddr{transit: knownTransit},
+		app:           appName,
+		domain:        "example.com.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const iters = 2000
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for i := range iters {
+			as := &addrs{
+				dst:           netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1}),
+				magic:         netip.AddrFrom4([4]byte{100, 64, byte(i >> 8), byte(i)}),
+				connectorAddr: connectorAddr{transit: netip.AddrFrom4([4]byte{169, 254, byte(i >> 8), byte(i)})},
+				app:           appName,
+				domain:        must.Get(dnsname.ToFQDN(fmt.Sprintf("h%d.example.com.", i))),
+			}
+			// insert writes the maps resendTransitIPMapping reads, so hold
+			// c.mu around it exactly as the production writers do.
+			c.mu.Lock()
+			err := c.assignments.insert(as)
+			c.mu.Unlock()
+			if err != nil {
+				t.Errorf("insert(%v): %v", as.domain, err)
+				return
+			}
+		}
+	})
+	wg.Go(func() {
+		for range iters {
+			c.resendTransitIPMapping(knownTransit)
+		}
+	})
+	wg.Wait()
 }

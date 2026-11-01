@@ -150,7 +150,7 @@ func (de *endpoint) setBestAddrLocked(v addrQuality) {
 			}
 			// Regardless whether the netmap is cached, record how long it has
 			// been since the endpoint was initialized.
-			de.c.logf("magicsock: new contact: peer=%s usec=%d cached=%v via=direct",
+			de.c.logf("[v1] magicsock: new contact: peer=%s usec=%d cached=%v via=direct",
 				de.publicKey.ShortString(), int64(mono.Since(de.c.initializedAt)/time.Microsecond), isCached)
 		}
 	}
@@ -820,7 +820,9 @@ func (de *endpoint) scheduleHeartbeatForLifetimeLocked(after time.Duration, via 
 // sources are de.heartbeat() and de.probeUDPLifetimeCliffDoneLocked().
 func (de *endpoint) heartbeatForLifetime() {
 	de.mu.Lock()
+	defer de.checkExitNodeResponsiveness()
 	defer de.mu.Unlock()
+	defer de.reportExitNodeHeartbeatStateLocked()
 	p := de.probeUDPLifetime
 	if p == nil || p.timer == nil {
 		// We raced with a code path trying to p.timer.Stop() us. Give up early
@@ -871,7 +873,10 @@ func (de *endpoint) heartbeatForLifetime() {
 // lifetime on the tail end of an active session.
 func (de *endpoint) heartbeat() {
 	de.mu.Lock()
+	// Record endpoint state, unlock, then inspect WireGuard counters.
+	defer de.checkExitNodeResponsiveness()
 	defer de.mu.Unlock()
+	defer de.reportExitNodeHeartbeatStateLocked()
 
 	if de.probeUDPLifetime != nil && de.probeUDPLifetime.timer != nil {
 		de.probeUDPLifetime.timer.Stop()
@@ -1104,7 +1109,7 @@ var (
 	errPingTooBig  = errors.New("ping size too big")
 )
 
-func (de *endpoint) send(buffs [][]byte, offset int) error {
+func (de *endpoint) send(flow int, buffs [][]byte, offset int) error {
 	de.mu.Lock()
 	if de.expired {
 		de.mu.Unlock()
@@ -1143,7 +1148,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 	}
 	var err error
 	if hasUDPTransport && udpAddr.ap.IsValid() {
-		_, err = de.c.sendUDPBatch(udpAddr, buffs, offset)
+		_, err = de.c.sendUDPBatch(flow, udpAddr, buffs, offset)
 
 		// If the error is known to indicate that the endpoint is no longer
 		// usable, clear the endpoint statistics so that the next send will
@@ -1950,6 +1955,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	}
 
 	now := mono.Now()
+	de.c.reportExitNodePong(de.publicKey, now)
 	latency := now.Sub(sp.at)
 
 	if hasUDPTransport && !isDerp && !src.vni.IsSet() {

@@ -35,7 +35,6 @@ import (
 	"go4.org/mem"
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
-	"tailscale.com/appc"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/control/controlknobs"
@@ -72,6 +71,7 @@ import (
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tsconst"
 	"tailscale.com/tsd"
 	"tailscale.com/tstime"
 	"tailscale.com/types/appctype"
@@ -146,22 +146,37 @@ func RegisterNewSSHServer(fn newSSHServerFunc) {
 	newSSHServer = fn
 }
 
+// SSHAuthCallback reports whether to accept a new SSH session. It is
+// called for each session before the session is yielded to the
+// listener from [LocalBackend.ListenSSH], with the peer's node and
+// user profile. A session that the callback rejects is refused and is
+// never yielded to Accept.
+//
+// ListenSSH accepts a session from any peer that the tailnet ACL's TCP
+// rules allow. The ACL's SSHPolicy is not used. Use SSHAuthCallback to
+// reject sessions the application does not want.
+type SSHAuthCallback func(tailcfg.NodeView, tailcfg.UserProfile) (permitted bool)
+
 // HookListenSSH is set by the ssh/tailssh package (via feature/ssh) to provide
 // an implementation of ListenSSH for use by tsnet.
-var HookListenSSH feature.Hook[func(net.Listener, *LocalBackend, logger.Logf) (net.Listener, error)]
+var HookListenSSH feature.Hook[func(net.Listener, *LocalBackend, SSHAuthCallback, logger.Logf) (net.Listener, error)]
 
 // ListenSSH wraps the given listener with an SSH server that authenticates
 // connections using Tailscale peer identity. The returned listener's Accept
 // yields net.Conn values that are *tailssh.Session.
 //
+// If auth is nil, every session from a peer that the tailnet ACL's TCP
+// rules allow is accepted. If auth is non-nil, sessions that it rejects
+// are refused. See [SSHAuthCallback].
+//
 // If the ssh/tailssh package has not been linked (e.g. via
 // _ "tailscale.com/feature/ssh"), ListenSSH returns an error.
-func (b *LocalBackend) ListenSSH(ln net.Listener, logf logger.Logf) (net.Listener, error) {
+func (b *LocalBackend) ListenSSH(ln net.Listener, auth SSHAuthCallback, logf logger.Logf) (net.Listener, error) {
 	fn, ok := HookListenSSH.GetOk()
 	if !ok {
 		return nil, errors.New("SSH support not available; import _ \"tailscale.com/feature/ssh\"")
 	}
-	return fn(ln, b, logf)
+	return fn(ln, b, auth, logf)
 }
 
 // watchSession represents a WatchNotifications channel,
@@ -196,6 +211,10 @@ type watchSession struct {
 	// policyUID is the user ID used for policy snapshot scoping.
 	// Empty string means default/device scope.
 	policyUID string
+
+	// hiddenNetworkDevices is the parsed GUI visibility policy from the
+	// most recent effective policy snapshot for this session.
+	hiddenNetworkDevices hiddenNetworkDevices
 }
 
 var (
@@ -325,10 +344,10 @@ type LocalBackend struct {
 	conf             *conffile.Config // latest parsed config, or nil if not in declarative mode
 	pm               *profileManager  // mu guards access
 	lastFilterInputs *filterInputs
-	httpTestClient   *http.Client       // for controlclient. nil by default, used by tests.
-	ccGen            clientGen          // function for producing controlclient; lazily populated
-	sshServer        SSHServer          // or nil, initialized lazily.
-	appConnector     *appc.AppConnector // or nil, initialized when configured.
+	httpTestClient   *http.Client      // for controlclient. nil by default, used by tests.
+	ccGen            clientGen         // function for producing controlclient; lazily populated
+	sshServer        SSHServer         // or nil, initialized lazily.
+	appConnector     *appcAppConnector // or nil, initialized when configured.
 	// notifyCancel cancels notifications to the current SetNotifyCallback.
 	notifyCancel context.CancelFunc
 	cc           controlclient.Client // TODO(nickkhyl): move to nodeBackend
@@ -350,6 +369,7 @@ type LocalBackend struct {
 	endpoints         []tailcfg.Endpoint
 	blocked           bool
 	keyExpired        bool          // TODO(nickkhyl): move to nodeBackend
+	nodeRemoved       bool          // control said this node was deleted; cleared on the next netmap or profile switch
 	authURL           string        // non-empty if not Running; TODO(nickkhyl): move to nodeBackend
 	authURLTime       time.Time     // when the authURL was received from the control server; TODO(nickkhyl): move to nodeBackend
 	authActor         ipnauth.Actor // an actor who called [LocalBackend.StartLoginInteractive] last, or nil; TODO(nickkhyl): move to nodeBackend
@@ -941,10 +961,10 @@ func (b *LocalBackend) GetDNSOSConfig() (dns.OSConfig, error) {
 	return manager.GetBaseConfig()
 }
 
-// QueryDNS performs a DNS query for name and queryType using the built-in DNS resolver, and returns
-// the raw DNS response and the resolvers that are were able to handle the query (the internal forwarder
-// may race multiple resolvers).
-func (b *LocalBackend) QueryDNS(name string, queryType dnsmessage.Type) (res []byte, resolvers []*dnstype.Resolver, err error) {
+// QueryDNS queries name and queryType using the built-in DNS resolver.
+// It returns the wire-format response and the resolvers handling the query.
+// ctx bounds the query duration. Truncated responses are retried over TCP.
+func (b *LocalBackend) QueryDNS(ctx context.Context, name string, queryType dnsmessage.Type) (res []byte, resolvers []*dnstype.Resolver, err error) {
 	if !buildfeatures.HasDNS {
 		return nil, nil, feature.ErrUnavailable
 	}
@@ -966,7 +986,7 @@ func (b *LocalBackend) QueryDNS(name string, queryType dnsmessage.Type) (res []b
 	db := dnsmessage.NewBuilder(nil, dnsmessage.Header{
 		OpCode:           0,
 		RecursionDesired: true,
-		ID:               1,
+		ID:               uint16(rand.IntN(1 << 16)),
 	})
 	db.StartQuestions()
 	db.Question(dnsmessage.Question{
@@ -979,7 +999,7 @@ func (b *LocalBackend) QueryDNS(name string, queryType dnsmessage.Type) (res []b
 		b.logf("DNSQuery: failed to build query: %v", err)
 		return nil, nil, err
 	}
-	res, err = manager.Query(b.ctx, q, "tcp", from)
+	res, err = manager.Query(ctx, q, "tcp", from)
 	if err != nil {
 		b.logf("DNSQuery: failed to query %q: %v", name, err)
 		return nil, nil, err
@@ -1448,7 +1468,7 @@ func stripKeysFromPrefs(p ipn.PrefsView) ipn.PrefsView {
 	p2 := p.AsStruct()
 	p2.Persist.PrivateNodeKey = key.NodePrivate{}
 	p2.Persist.OldPrivateNodeKey = key.NodePrivate{}
-	p2.Persist.NetworkLockKey = key.NLPrivate{}
+	p2.Persist.NetworkLockKey = key.TLPrivate{}
 	p2.Persist.AttestationKey = nil
 	return p2.View()
 }
@@ -1854,6 +1874,30 @@ func (b *LocalBackend) SetControlClientStatus(c controlclient.Client, st control
 	b.setControlClientStatusLocked(c, st)
 }
 
+// nodeRemovedWarnable is set while control says this node has been deleted.
+var nodeRemovedWarnable = health.Register(&health.Warnable{
+	Code:                tsconst.HealthWarnableNodeRemoved,
+	Title:               "Device removed",
+	Severity:            health.SeverityHigh,
+	Text:                health.StaticMessage("This device has been removed from the tailnet. Log in again to reconnect."),
+	DependsOn:           []*health.Warnable{health.IPNStateWarnable},
+	ImpactsConnectivity: true,
+})
+
+// setNodeRemovedLocked sets b.nodeRemoved and the matching health warning.
+// b.mu must be held.
+func (b *LocalBackend) setNodeRemovedLocked(removed bool) {
+	if removed == b.nodeRemoved {
+		return
+	}
+	b.nodeRemoved = removed
+	if removed {
+		b.health.SetUnhealthy(nodeRemovedWarnable, nil)
+	} else {
+		b.health.SetHealthy(nodeRemovedWarnable)
+	}
+}
+
 // setControlClientStatusLocked is the locked version of SetControlClientStatus.
 //
 // b.mu must be held.
@@ -1871,6 +1915,10 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 		if vizerr, ok := vizerror.As(st.Err); ok {
 			s := vizerr.Error()
 			b.sendLocked(ipn.Notify{ErrMessage: &s})
+		}
+		if errors.Is(st.Err, controlclient.ErrNodeRemoved) && !b.nodeRemoved {
+			b.setNodeRemovedLocked(true)
+			b.stateMachineLocked()
 		}
 		return
 	}
@@ -1916,6 +1964,7 @@ func (b *LocalBackend) setControlClientStatusLocked(c controlclient.Client, st c
 			keyExpiryExtended = true
 		}
 		b.keyExpired = isExpired
+		b.setNodeRemovedLocked(false)
 	}
 
 	if keyExpiryExtended && wasBlocked {
@@ -2332,7 +2381,7 @@ func (b *LocalBackend) applyExitNodeSysPolicyLocked(prefs *ipn.Prefs) (anyChange
 		// older clients (in case a user downgrades to an earlier version)
 		// and GUIs/CLIs that have special handling for it.
 		if useAutoExitNode {
-			exitNodeID = unresolvedExitNodeID
+			exitNodeID = ipn.UnresolvedExitNodeID
 		}
 
 		// If the current exit node ID doesn't match the one enforced by the policy setting,
@@ -2440,12 +2489,17 @@ func (b *LocalBackend) sysPolicyChangedForSession(sess *watchSession) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	snapshot, err := b.polc.GetPolicySnapshot("")
+	snapshot, err := b.polc.GetPolicySnapshot(sess.policyUID)
 	if err != nil || snapshot == nil {
 		return
 	}
 
-	n := ipn.Notify{Policy: snapshot, Version: version.Long()}
+	sess.hiddenNetworkDevices = hiddenNetworkDevicesFromPolicy(snapshot)
+	n := ipn.Notify{
+		Policy:            snapshot,
+		NodeGUIVisibility: b.nodeGUIVisibilityLocked(sess.hiddenNetworkDevices),
+		Version:           version.Long(),
+	}
 	for _, f := range b.extHost.Hooks().MutateNotifyLocked {
 		f(&n)
 	}
@@ -2489,6 +2543,8 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	needsAuthReconfig := netmapDeltaNeedsAuthReconfig(cn, muts)
 
 	deltaRes, _ := cn.UpdateNetmapDelta(muts)
+	b.notifyPeerUpdateLocked()
+	b.checkCachedDNSLocked()
 	if buildfeatures.HasDrive {
 		// Drive's lazy remotes-source caches its rebuild keyed by this
 		// generation, so any delta — peer add/remove, address change,
@@ -2865,10 +2921,10 @@ func (b *LocalBackend) resolveAutoExitNodeLocked(prefs *ipn.Prefs) (prefsChanged
 		// specify an allowed auto exit node ID, retain it.
 		newExitNodeID = prefs.ExitNodeID
 	} else {
-		// Otherwise, use [unresolvedExitNodeID] to install a blackhole route,
+		// Otherwise, use [ipn.UnresolvedExitNodeID] to install a blackhole route,
 		// preventing traffic from leaking to the local network until an actual
 		// exit node is selected.
-		newExitNodeID = unresolvedExitNodeID
+		newExitNodeID = ipn.UnresolvedExitNodeID
 	}
 	if prefs.ExitNodeID != newExitNodeID {
 		prefs.ExitNodeID = newExitNodeID
@@ -3146,6 +3202,9 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 		prefsChanged = true
 		prefsChangedWhy = append(prefsChangedWhy, "opts.UpdatePrefs")
 	}
+	// Reset the always-on override whenever Start is called.
+	b.resetAlwaysOnOverrideLocked()
+
 	// Apply any syspolicy overrides, resolve exit node ID, etc.
 	// As of 2025-07-03, this is primarily needed in two cases:
 	//  - when opts.UpdatePrefs is not nil
@@ -3185,8 +3244,6 @@ func (b *LocalBackend) startLocked(opts ipn.Options) error {
 	}
 	prefs := newPrefs.View()
 
-	// Reset the always-on override whenever Start is called.
-	b.resetAlwaysOnOverrideLocked()
 	b.setAtomicValuesFromPrefsLocked(prefs)
 	b.updateNoSNATExitNodeWarning(prefs)
 
@@ -3821,6 +3878,7 @@ func (b *LocalBackend) WatchNotificationsAs(ctx context.Context, actor ipnauth.A
 	b.mu.Lock()
 
 	var policyUID string
+	var hiddenNetworkDevices hiddenNetworkDevices
 	const initialBits = ipn.NotifyInitialState | ipn.NotifyInitialPrefs |
 		ipn.NotifyInitialStatus |
 		ipn.NotifyInitialDriveShares | ipn.NotifyInitialSuggestedExitNode |
@@ -3865,6 +3923,9 @@ func (b *LocalBackend) WatchNotificationsAs(ctx context.Context, actor ipnauth.A
 			ini.Policy, err = b.polc.GetPolicySnapshot(policyUID)
 			if err != nil {
 				b.logf("syspolicy: GetPolicySnapshot(%q): %v", policyUID, err)
+			} else if ini.Policy != nil {
+				hiddenNetworkDevices = hiddenNetworkDevicesFromPolicy(ini.Policy)
+				ini.NodeGUIVisibility = b.nodeGUIVisibilityLocked(hiddenNetworkDevices)
 			}
 		}
 	}
@@ -3873,13 +3934,14 @@ func (b *LocalBackend) WatchNotificationsAs(ctx context.Context, actor ipnauth.A
 	defer cancel()
 
 	session := &watchSession{
-		ch:        ch,
-		ctx:       ctx,
-		owner:     actor,
-		sessionID: sessionID,
-		cancel:    cancel,
-		mask:      mask,
-		policyUID: policyUID,
+		ch:                   ch,
+		ctx:                  ctx,
+		owner:                actor,
+		sessionID:            sessionID,
+		cancel:               cancel,
+		mask:                 mask,
+		policyUID:            policyUID,
+		hiddenNetworkDevices: hiddenNetworkDevices,
 	}
 	mak.Set(&b.notifyWatchers, sessionID, session)
 	if mask&ipn.NotifyPeerWireGuardState != 0 {
@@ -4206,6 +4268,11 @@ func (b *LocalBackend) notifyForSessionLocked(sess *watchSession, n *ipn.Notify)
 	stripPatches := len(n.PeerChangedPatch) > 0 && !wantsPeerPatches
 	stripPeerState := len(n.PeerState) > 0 && sess.mask&ipn.NotifyPeerWireGuardState == 0
 	promotePatches := len(n.PeerChangedPatch) > 0 && wantsPeerChanges && !wantsPeerPatches
+	refreshNodeGUIVisibility :=
+		sess.mask&ipn.NotifySysPolicyChanges != 0 &&
+			(n.SelfChange != nil ||
+				len(n.PeersChanged) != 0 ||
+				len(n.PeersRemoved) != 0)
 
 	if sess.selfChangeResetsImplicitState(n.SelfChange.View()) {
 		sess.lastSentUserProfile = nil
@@ -4235,10 +4302,13 @@ func (b *LocalBackend) notifyForSessionLocked(sess *watchSession, n *ipn.Notify)
 	}
 	replaceUserProfiles := !stripUserProfiles && len(sessUserProfiles) != len(n.UserProfiles)
 
-	if !stripPeersChanged && !stripPeersRemoved && !stripPatches && !stripPeerState && !stripUserProfiles && !replaceUserProfiles && !promotePatches {
+	if !stripPeersChanged && !stripPeersRemoved && !stripPatches && !stripPeerState && !stripUserProfiles && !replaceUserProfiles && !promotePatches && !refreshNodeGUIVisibility {
 		return n
 	}
 	nCopy := *n
+	if refreshNodeGUIVisibility {
+		nCopy.NodeGUIVisibility = b.nodeGUIVisibilityLocked(sess.hiddenNetworkDevices)
+	}
 	if stripPeersChanged {
 		nCopy.PeersChanged = nil
 	}
@@ -5190,7 +5260,7 @@ func (b *LocalBackend) SetUseExitNodeEnabled(actor ipnauth.Actor, v bool) (ipn.P
 		if expr, ok := ipn.ParseAutoExitNodeString(mp.ExitNodeID); ok {
 			mp.AutoExitNodeSet = true
 			mp.AutoExitNode = expr
-			mp.ExitNodeID = unresolvedExitNodeID
+			mp.ExitNodeID = ipn.UnresolvedExitNodeID
 		}
 	} else {
 		mp.ExitNodeIDSet = true
@@ -5349,7 +5419,7 @@ func (b *LocalBackend) adjustEditPrefsLocked(prefs ipn.PrefsView, mp *ipn.Masked
 	}
 
 	// Clear ExitNodeID if AutoExitNode is disabled and ExitNodeID is still unresolved.
-	if mp.AutoExitNodeSet && mp.AutoExitNode == "" && prefs.ExitNodeID() == unresolvedExitNodeID {
+	if mp.AutoExitNodeSet && mp.AutoExitNode == "" && prefs.ExitNodeID() == ipn.UnresolvedExitNodeID {
 		mp.ExitNodeIDSet = true
 		mp.ExitNodeID = ""
 	}
@@ -6011,12 +6081,7 @@ func (b *LocalBackend) reconfigAppConnectorLocked(selfNode tailcfg.NodeView, pre
 			b.logf("Unsuccessful Read RouteInfo: %v", err)
 		}
 		b.appConnector.Close() // clean up a previous connector (safe on nil)
-		b.appConnector = appc.NewAppConnector(appc.Config{
-			Logf:            b.logf,
-			EventBus:        b.sys.Bus.Get(),
-			RouteInfo:       ri,
-			HasStoredRoutes: shouldStoreRoutes,
-		})
+		b.appConnector = newAppConnector(b.logf, b.sys.Bus.Get(), ri, shouldStoreRoutes)
 	}
 	if !selfNode.Valid() {
 		return
@@ -6138,7 +6203,11 @@ func (b *LocalBackend) authReconfigLocked() {
 	hasPAC := b.interfaceState.HasPAC()
 	disableSubnetsIfPAC := cn.SelfHasCap(nodecap.DisableSubnetsIfPAC)
 	dohURL, dohURLOK := cn.exitNodeCanProxyDNS(prefs.ExitNodeID())
-	dcfg := cn.dnsConfigForNetmap(prefs, b.keyExpired, cmp.Or(b.goos, runtime.GOOS))
+	var extraDNSRoutes map[string][]*dnstype.Resolver
+	if f, ok := b.extHost.hooks.ExtraDNSRoutes.GetOk(); ok {
+		extraDNSRoutes = f()
+	}
+	dcfg := cn.dnsConfigForNetmap(prefs, b.keyExpired, cmp.Or(b.goos, runtime.GOOS), extraDNSRoutes)
 	// If the current node is an app connector, ensure the app connector machine is started
 	b.reconfigAppConnectorLocked(nm.SelfNode, prefs)
 
@@ -6792,7 +6861,7 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 	// [pkey.ExitNodeID]), or an exit node is specified by ExitNodeIP
 	// instead of ExitNodeID , and we don't yet have enough info to resolve
 	// it (usually due to missing netmap or net report), then ExitNodeID in
-	// the prefs may be invalid (typically, [unresolvedExitNodeID]) until
+	// the prefs may be invalid (typically, [ipn.UnresolvedExitNodeID]) until
 	// the netmap is available.
 	//
 	// In this case, we shouldn't update the Hostinfo with the bogus
@@ -6800,7 +6869,7 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 	// the netmap and/or net report have been received to both pick the exit
 	// node and notify control of the change.
 	if buildfeatures.HasUseExitNode {
-		if sid := prefs.ExitNodeID(); sid != unresolvedExitNodeID {
+		if sid := prefs.ExitNodeID(); sid != ipn.UnresolvedExitNodeID {
 			hi.ExitNodeID = prefs.ExitNodeID()
 		}
 	}
@@ -6929,13 +6998,14 @@ func (b *LocalBackend) nextStateLocked() ipn.State {
 	}
 
 	var (
-		cc         = b.cc
-		cn         = b.currentNode()
-		netMap     = cn.NetMap()
-		state      = b.state
-		blocked    = b.blocked
-		st         = b.engineStatus
-		keyExpired = b.keyExpired
+		cc          = b.cc
+		cn          = b.currentNode()
+		netMap      = cn.NetMap()
+		state       = b.state
+		blocked     = b.blocked
+		st          = b.engineStatus
+		keyExpired  = b.keyExpired
+		nodeRemoved = b.nodeRemoved
 
 		wantRunning = false
 		loggedOut   = false
@@ -6948,6 +7018,13 @@ func (b *LocalBackend) nextStateLocked() ipn.State {
 	switch {
 	case !wantRunning && !loggedOut && !blocked && b.hasNodeKeyLocked():
 		return ipn.Stopped
+	case wantRunning && nodeRemoved:
+		// Control said this node was deleted, need to relogin. Checked
+		// before netMap so a node deleted after registering but before
+		// its first netmap, which then never gets one, goes to NeedsLogin
+		// rather than staying in NoState.
+		// See https://github.com/tailscale/tailscale/issues/18922#issuecomment-6198375286
+		return ipn.NeedsLogin
 	case netMap == nil:
 		if (cc != nil && cc.AuthCantContinue()) || loggedOut {
 			// Auth was interrupted or waiting for URL visit,
@@ -7239,6 +7316,19 @@ func (b *LocalBackend) setNetInfo(ni *tailcfg.NetInfo) {
 		refresh = b.refreshAutoExitNode
 		b.refreshAutoExitNode = false
 	}
+	// On a fresh install, the first netmap arrives before the first netcheck
+	// report. Auto exit node resolution runs without a preferred DERP region
+	// and installs the blackhole [ipn.UnresolvedExitNodeID]. Nothing else
+	// re-resolves it once the report arrives, so do it here.
+	//
+	// This is not gated on an active DERP connection. No exit node has been
+	// chosen yet, so a provisional choice is better than a blackhole. Later
+	// reports are deduplicated by magicsock and may never reach this callback.
+	//
+	// See tailscale/tailscale#18199.
+	if prefs := b.pm.CurrentPrefs(); prefs.AutoExitNode().IsSet() && prefs.ExitNodeID() == ipn.UnresolvedExitNodeID {
+		refresh = true
+	}
 	b.mu.Unlock()
 
 	if cc == nil {
@@ -7308,7 +7398,7 @@ func (b *LocalBackend) resolveExitNodeLocked() (changed bool) {
 	// TODO(sfllaw): Mutating b.hostinfo here is undesirable, mutating
 	// in-place doubly so.
 	sid := prefs.ExitNodeID
-	if sid != unresolvedExitNodeID && b.hostinfo.ExitNodeID != sid {
+	if sid != ipn.UnresolvedExitNodeID && b.hostinfo.ExitNodeID != sid {
 		b.hostinfo.ExitNodeID = sid
 		b.goTracker.Go(b.doSetHostinfoFilterServices)
 	}
@@ -7388,6 +7478,15 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 		login = cmp.Or(profileFromView(nm.UserProfiles[nm.User()]).LoginName, "<missing-profile>")
 	}
 	discoChanged, routeChanged := b.currentNode().SetNetMap(nm)
+	// A profile reset swaps in a fresh nodeBackend before clearing its map,
+	// so notify on every clear even if this node never received a map.
+	if !b.shutdownCalled && (oldNetMap == nil || nm == nil) {
+		for _, f := range b.extHost.Hooks().NetworkConfiguredChange {
+			f(nm != nil)
+		}
+	}
+	b.notifyPeerUpdateLocked()
+	b.checkCachedDNSLocked()
 	b.setDataPlanePeerRoutes()
 	if ms, ok := b.sys.MagicSock.GetOK(); ok {
 		if nm != nil {
@@ -7562,6 +7661,29 @@ var hookSetNetMapLockedDrive feature.Hook[func(*LocalBackend)]
 // remotes lazily instead of being pushed a fresh list on every netmap
 // update.
 var hookInstallDriveRemoteSource feature.Hook[func(*LocalBackend)]
+
+// notifyPeerUpdateLocked notifies extensions after processing a peer update,
+// even if the peer state did not change.
+// b.mu must be held.
+func (b *LocalBackend) notifyPeerUpdateLocked() {
+	if b.shutdownCalled {
+		return
+	}
+	for _, f := range b.extHost.Hooks().OnPeerUpdate {
+		f()
+	}
+}
+
+// checkCachedDNSLocked checks recent negative answers after updating the
+// live MagicDNS host records. b.mu must be held.
+func (b *LocalBackend) checkCachedDNSLocked() {
+	if b.shutdownCalled || !buildfeatures.HasDNS {
+		return
+	}
+	if dm, ok := b.sys.DNSManager.GetOK(); ok {
+		dm.MaybeCheckCachedDNS()
+	}
+}
 
 // roundTraffic rounds bytes. This is used to preserve user privacy within logs.
 func roundTraffic(bytes int64) float64 {
@@ -7883,18 +8005,6 @@ func (b *LocalBackend) OfferingAppConnector() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.appConnector != nil
-}
-
-// AppConnector returns the current AppConnector, or nil if not configured.
-//
-// TODO(nickkhyl): move app connectors to [nodeBackend], or perhaps a feature package?
-func (b *LocalBackend) AppConnector() *appc.AppConnector {
-	if !buildfeatures.HasAppConnectors {
-		return nil
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.appConnector
 }
 
 // allowExitNodeDNSProxyToServeName reports whether the Exit Node DNS
@@ -8433,6 +8543,11 @@ func (b *LocalBackend) resetForProfileChangeLocked() error {
 		// down, so no need to do any work.
 		return nil
 	}
+	if buildfeatures.HasDNS {
+		if dm, ok := b.sys.DNSManager.GetOK(); ok {
+			dm.Resolver().ClearNegativeCache()
+		}
+	}
 	newNode := newNodeBackend(b.ctx, b.logf, b.sys.Bus.Get())
 	if oldNode := b.currentNodeAtomic.Swap(newNode); oldNode != nil {
 		oldNode.shutdown(errNodeContextChanged)
@@ -8453,7 +8568,7 @@ func (b *LocalBackend) resetForProfileChangeLocked() error {
 	b.serveConfig = ipn.ServeConfigView{}
 	b.lastSuggestedExitNode = ""
 	b.keyExpired = false
-	b.overrideExitNodePolicy = false
+	b.setNodeRemovedLocked(false)
 	b.resetAlwaysOnOverrideLocked()
 	b.extHost.NotifyProfileChange(b.pm.CurrentProfile(), b.pm.CurrentPrefs(), false)
 	b.setAtomicValuesFromPrefsLocked(b.pm.CurrentPrefs())
@@ -8580,7 +8695,7 @@ func (b *LocalBackend) ObserveDNSResponse(res []byte) error {
 	if !buildfeatures.HasAppConnectors {
 		return nil
 	}
-	var appConnector *appc.AppConnector
+	var appConnector *appcAppConnector
 	b.mu.Lock()
 	if b.appConnector == nil {
 		b.mu.Unlock()
@@ -9195,17 +9310,6 @@ func longLatDistance(fromLat, fromLong, toLat, toLong float64) float64 {
 	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 	return earthRadiusMeters * c
 }
-
-const (
-	// unresolvedExitNodeID is a special [tailcfg.StableNodeID] value
-	// used as an exit node ID to install a blackhole route, preventing
-	// accidental non-exit-node usage until the [ipn.ExitNodeExpression]
-	// is evaluated and an actual exit node is selected.
-	//
-	// We use "auto:any" for compatibility with older, pre-[ipn.ExitNodeExpression]
-	// clients that have been using "auto:any" for this purpose for a long time.
-	unresolvedExitNodeID tailcfg.StableNodeID = "auto:any"
-)
 
 func isAllowedAutoExitNodeID(polc policyclient.Client, exitNodeID tailcfg.StableNodeID) bool {
 	if exitNodeID == "" {

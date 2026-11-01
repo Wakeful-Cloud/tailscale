@@ -59,10 +59,12 @@ const (
 // be running.
 const maxActiveQueries = 256
 
-// ResponseMapper is a function that accepts the bytes representing
-// a DNS response and returns bytes representing a DNS response.
+// ResponseMapper is a function that accepts a DNS response as
+// resolver.Response, which contains the bytes of the response,
+// and optional PeerAPI metadata.
+// It returns bytes representing a DNS response.
 // Used to observe and/or mutate DNS responses managed by this manager.
-type ResponseMapper func([]byte) []byte
+type ResponseMapper func(*resolver.Response) []byte
 
 // We use file-ignore below instead of ignore because on some platforms,
 // the lint exception is necessary and on others it is not,
@@ -89,6 +91,7 @@ type Manager struct {
 	config              *Config    // Tracks the last viable DNS configuration set by Set.  nil on failures other than compilation failures or if set has never been called.
 	queryResponseMapper ResponseMapper
 	waitingForBaseCfg   bool // a retry goroutine is waiting for OS upstream resolvers
+	managerCacheFlush        // platform-specific state, guarded by mu
 }
 
 // NewManager created a new manager from the given config.
@@ -450,7 +453,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 
 	// iOS still reads the base config below, even when scoped, so direct
 	// queries to quad-100 can be forwarded to the underlying resolver.
-	if supportsSplitDNS && !isIOS && (!isSandboxedApple || scopeApple) && !cfg.requiresPrimaryResolver() {
+	if supportsSplitDNS && !isIOS && (!isSandboxedApple || scopeApple) {
 		ocfg.MatchDomains = cfg.matchDomains()
 		return rcfg, ocfg, nil
 	}
@@ -663,16 +666,17 @@ func (m *Manager) Query(ctx context.Context, bs []byte, family string, from neti
 		return nil, errFullQueue
 	}
 	defer atomic.AddInt32(&m.activeQueriesAtomic, -1)
-	outbs, err := m.resolver.Query(ctx, bs, family, from)
+	res, err := m.resolver.Query(ctx, bs, family, from)
 	if err != nil {
-		return outbs, err
+		return nil, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	outbs := res.Bs
 	if m.queryResponseMapper != nil {
-		outbs = m.queryResponseMapper(outbs)
+		outbs = m.queryResponseMapper(res)
 	}
-	return outbs, err
+	return outbs, nil
 }
 
 const (
@@ -825,13 +829,6 @@ func (m *Manager) Down() error {
 	m.eventClient.Close()
 	m.resolver.Close()
 	return nil
-}
-
-func (m *Manager) FlushCaches() error {
-	if !buildfeatures.HasDNS {
-		return nil
-	}
-	return flushCaches()
 }
 
 // CleanUp restores the system DNS configuration to its original state

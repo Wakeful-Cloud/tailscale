@@ -31,14 +31,17 @@ import (
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/localapi"
+	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/traffic"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tstun"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstime"
 	"tailscale.com/types/appctype"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/views"
@@ -160,12 +163,12 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 	if !ok {
 		return errors.New("could not access system tun")
 	}
-	resolver := dnsManager.Resolver()
-	if resolver == nil {
+	r := dnsManager.Resolver()
+	if r == nil {
 		return errors.New("dns manager resolver not ready")
 	}
 
-	if err := resolver.RegisterCustomScheme(appc.DNSAddrScheme, func(addr string) (string, error) {
+	if err := r.RegisterCustomScheme(appc.DNSAddrScheme, func(addr string) (string, error) {
 		scheme, appName, ok := strings.Cut(addr, ":")
 		if !ok || scheme != appc.DNSAddrScheme {
 			return "", fmt.Errorf("unexpected conn25 scheme %q", scheme)
@@ -182,7 +185,7 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 		if !ok {
 			return "", errors.New("no app found for app name")
 		}
-		_, urlBase := e.pickConnectorURLBase(app)
+		urlBase := e.pickConnectorURLBase(app)
 		if urlBase == "" {
 			return "", nil
 		}
@@ -193,11 +196,11 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 
 	// Set up the DNS manager to rewrite responses for app domains
 	// to answer with Magic IPs.
-	dnsManager.SetQueryResponseMapper(func(bs []byte) []byte {
+	dnsManager.SetQueryResponseMapper(func(res *resolver.Response) []byte {
 		if !e.conn25.isConfigured() {
-			return bs
+			return res.Bs
 		}
-		return e.conn25.mapDNSResponse(bs)
+		return e.mapDNSResponse(res)
 	})
 
 	// Intercept packets from the tun device and from WireGuard
@@ -261,6 +264,20 @@ func (e *extension) installHooks(dph *datapathHandler) error {
 		return e.conn25.connector.packetFilterAllow(p)
 	})
 
+	// Route DNS queries for app domains to the connector that serves
+	// them, chosen at query time via the [appc.DNSAddrScheme] scheme.
+	e.host.Hooks().ExtraDNSRoutes.Set(func() map[string][]*dnstype.Resolver {
+		if !e.conn25.isConfigured() {
+			return nil
+		}
+		if e.conn25.prefsAdvertiseConnector.Load() {
+			// A node that is itself a connector resolves app domains
+			// directly rather than via another connector.
+			return nil
+		}
+		return e.conn25.appDNSRoutes.Load()
+	})
+
 	// Give the client the Magic IP range to install on the OS.
 	e.host.Hooks().ExtraRouterConfigRoutes.Set(func() views.Slice[netip.Prefix] {
 		if !e.conn25.isConfigured() {
@@ -298,6 +315,10 @@ func (c *Conn25) ClientTransitIPForMagicIP(m netip.Addr) (netip.Addr, error) {
 	if !cfg.ipSets.v4Magic.Contains(m) && !cfg.ipSets.v6Magic.Contains(m) {
 		return netip.Addr{}, nil
 	}
+	// TODO(tailscale/corp#50405): Just because there is a TransitIP associated with the MagicIP,
+	// that doesn't mean the TransitIP is ready to use. We should also make sure that the TransitIP
+	// is installed in WireGuard for the correct node, which happens after it is registered with the
+	// connector. Perhaps a different error message to represent that.
 	return netip.Addr{}, ErrUnmappedMagicIP
 }
 
@@ -445,6 +466,9 @@ func (e *extension) onSelfChange(selfNode tailcfg.NodeView) {
 		e.conn25.logf("error generating config from self node view: %v", err)
 		return
 	}
+	// Store the routes only once the config parsed, so a bad self node
+	// leaves the previous routes and config in place together.
+	e.conn25.appDNSRoutes.Store(appc.AppDNSRoutes(selfNode.HasCap, selfNode))
 	e.conn25.reconfig(cfg)
 }
 
@@ -458,6 +482,7 @@ func (e *extension) profileStateChange(loginProfile ipn.LoginProfileView, prefs 
 		// know once [extension.onSelfChange] is called with a new
 		// configuration, if any.
 		e.conn25.reconfig(&config{})
+		e.conn25.appDNSRoutes.Store(nil)
 
 		// If a client changes profiles and becomes a different node, all of its
 		// existing flows lose meaning, and we should delete them so that the
@@ -481,9 +506,16 @@ func (e *extension) extraWireGuardAllowedIPs(k key.NodePublic) views.Slice[netip
 type Conn25 struct {
 	config                  atomic.Pointer[config]
 	prefsAdvertiseConnector atomic.Bool
-	logf                    logger.Logf
-	client                  *client
-	connector               *connector
+
+	// appDNSRoutes holds the split DNS routes for the app domains in the
+	// self node's capabilities, as returned by [appc.AppDNSRoutes]. It is
+	// recomputed on each self node change and served to
+	// [ipnext.Hooks.ExtraDNSRoutes]. The map must not be mutated once stored.
+	appDNSRoutes syncs.AtomicValue[map[string][]*dnstype.Resolver]
+
+	logf      logger.Logf
+	client    *client
+	connector *connector
 }
 
 func (c *Conn25) getConfig() (*config, bool) {
@@ -519,6 +551,7 @@ func newConn25(logf logger.Logf) *Conn25 {
 		getIPSets:   getIPSets,
 		clock:       tstime.StdClock{},
 		expiryQueue: list.New(),
+		tokenSecret: newTokenSecret(),
 	}
 	return c
 }
@@ -543,6 +576,7 @@ const (
 	unknownAppNameMessage         = "The App name in the request does not match a configured App"
 	missingAppPermissionMessage   = "You do not have permission to use this App"
 	transitIPNotInPoolMessage     = "The transit address is not in a configured transit IP pool"
+	disallowedDestinationMessage  = "Destination address is in a disallowed address range"
 )
 
 // handleConnectorTransitIPRequest creates a ConnectorTransitIPResponse in response
@@ -634,6 +668,12 @@ type TransitIPRequest struct {
 	// App is the name of the connector application from the tailnet
 	// configuration.
 	App string `json:"app,omitzero"`
+
+	// Token is supplied by the connector in its PeerAPI DoH response. It should
+	// not be modified, and shouldn't need to be inspected. It should be
+	// sent back to the connector in this request for the DestinationIP
+	// and App for which it was originally received.
+	Token string `json:"token,omitzero"`
 }
 
 // ConnectorTransitIPRequest is the request body for a PeerAPI request to
@@ -679,6 +719,11 @@ const (
 	// which sees this has most likely allocated from a pool configuration that
 	// the connector has not received yet, or has already replaced.
 	TransitIPNotInPool = 7
+
+	// DisallowedDestination indicates that the destination IP address is not
+	// allowed (including but not limited to loopback, Tailscale, link-local,
+	// and private addresses).
+	DisallowedDestination = 8
 )
 
 // TransitIPResponse is the response to a TransitIPRequest
@@ -852,11 +897,11 @@ func (e *extension) sendLoop(ctx context.Context) {
 }
 
 func (e *extension) handleAddressAssignment(ctx context.Context, as addrs) error {
-	conn, err := e.sendAddressAssignment(ctx, as)
+	err := e.sendAddressAssignment(ctx, as)
 	if err != nil {
 		return err
 	}
-	err = e.conn25.client.addTransitIPForConnector(as.transit, conn)
+	err = e.conn25.client.addTransitIPForConnector(as.connectorAddr.transit, as.connectorAddr.node)
 	if err != nil {
 		return err
 	}
@@ -870,9 +915,10 @@ func makePeerAPIReq(ctx context.Context, httpClient *http.Client, urlBase string
 
 	reqBody := ConnectorTransitIPRequest{
 		TransitIPs: []TransitIPRequest{{
-			TransitIP:     as.transit,
+			TransitIP:     as.connectorAddr.transit,
 			DestinationIP: as.dst,
 			App:           as.app,
+			Token:         as.connectorAddr.token,
 		}},
 	}
 	bs, err := json.Marshal(reqBody)
@@ -906,43 +952,34 @@ func makePeerAPIReq(ctx context.Context, httpClient *http.Client, urlBase string
 	return nil
 }
 
-func (e *extension) pickConnectorURLBase(app appctype.Conn25Attr) (tailcfg.NodeView, string) {
+func (e *extension) pickConnectorURLBase(app appctype.Conn25Attr) string {
 	nb := e.host.NodeBackend()
 	peers := pickConnector(nb, app)
-	var urlBase string
-	var conn tailcfg.NodeView
 	for _, p := range peers {
-		urlBase = nb.PeerAPIBase(p)
-		if urlBase != "" {
-			conn = p
-			break
+		if urlBase := nb.PeerAPIBase(p); urlBase != "" {
+			return urlBase
 		}
 	}
-	return conn, urlBase
+	return ""
 }
 
-func (e *extension) sendAddressAssignment(ctx context.Context, as addrs) (tailcfg.NodeView, error) {
-	cfg, ok := e.conn25.getConfig()
-	if !ok {
-		return tailcfg.NodeView{}, errors.New("not configured")
-	}
-	app, ok := cfg.appsByName[as.app]
-	if !ok {
-		e.conn25.client.logf("App not found for app: %s (domain: %s)", as.app, as.domain)
-		return tailcfg.NodeView{}, errors.New("app not found")
-	}
-	conn, urlBase := e.pickConnectorURLBase(app)
+// sendAddressAssignment registers the TransitIP in as with the connector in as,
+// which is the connector that sent the DNS response with the destination IP in as.
+func (e *extension) sendAddressAssignment(ctx context.Context, as addrs) error {
+	urlBase := e.host.NodeBackend().PeerAPIBase(as.connectorAddr.node)
 	if urlBase == "" {
-		return tailcfg.NodeView{}, errors.New("no connector peer found to handle address assignment")
+		return fmt.Errorf("no PeerAPI URL base found for node stable ID %q", as.connectorAddr.node.StableID())
 	}
 	client := e.backend.Sys().Dialer.Get().PeerAPIHTTPClient()
-	return conn, makePeerAPIReq(ctx, client, urlBase, as)
+	return makePeerAPIReq(ctx, client, urlBase, as)
 }
 
 type dnsResponseRewrite struct {
-	domain     dnsname.FQDN
-	dst        netip.Addr
-	ttlSeconds uint32
+	domain        dnsname.FQDN
+	dst           netip.Addr
+	ttlSeconds    uint32
+	connectorNode tailcfg.NodeView
+	token         string
 }
 
 func makeServFail(logf logger.Logf, h dnsmessage.Header, q dnsmessage.Question) []byte {
@@ -990,10 +1027,42 @@ var (
 	)
 )
 
+// Question types whose upstream answers we write through instead of rewriting or dropping them.
+var passThroughQuestionTypes = set.Of(
+	// Types used for Email traffic.
+	dnsmessage.TypeMX,
+	dnsmessage.TypeTXT,
+
+	// Types used for VOIP traffic.
+	dnsmessage.TypeSRV,
+	dnsmessage.Type(35), // NAPTR
+)
+
+// connectorAddr is everything an [addrs] needs in order to register itself
+// with a connector: the transit address allocated for it, the connector that
+// answered the DNS query it came from, and the token that connector issued for
+// the destination address.
+type connectorAddr struct {
+	transit netip.Addr
+	node    tailcfg.NodeView
+	// token is opaque to the client. See [TokenHeader] and
+	// [TransitIPRequest.Token]. If it is empty, the connector
+	// did not issue one.
+	token string
+}
+
 // mapDNSResponse parses and inspects the DNS response. If the domain
 // is determined to belong to app this node is client for, it assigns addresses
 // for connecting and rewrites the response to contain Magic IPs.
-func (c *Conn25) mapDNSResponse(buf []byte) []byte {
+func (e *extension) mapDNSResponse(res *resolver.Response) []byte {
+	c := e.conn25
+	buf := res.Bs
+	// If there's no DoH metadata, we know this response didn't come
+	// from a connector's PeerAPI DoH.
+	if res.DoHMeta == nil {
+		return buf
+	}
+
 	var p dnsmessage.Parser
 	hdr, err := p.Start(buf)
 	if err != nil {
@@ -1027,16 +1096,32 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 		return buf
 	}
 
+	connectorNode, err := e.extractConnectorFromRequestURL(res.DoHMeta.RequestURL)
+	if err != nil {
+		c.logf("could not identify the connector that answered a DNS query: %v", err)
+		return buf
+	}
+
 	// There is guaranteed to be at least one matching app, so just take the first one for now
+	// TODO(tailscale/corp#50408): We have access to res.DoHMeta.RequestURL, so we can easily see the requested
+	// app name. So we can make sure we have that configured, bail if not, and use that instead
+	// of just taking the first one. We can also verify the connector node advertises the app in its
+	// CapMap.
 	appName := appNames[0]
+
+	// Write through record types we are sure are unrelated to conn25, as we try our best not to break
+	// user's application. If this causes problems in the future, it could be reasonable to not write through anything.
+	if passThroughQuestionTypes.Contains(question.Type) {
+		return buf
+	}
 
 	// Now we know this is a dns response we think we should rewrite, we're going to provide our response which
 	// currently means we will:
-	//  * write the questions through as they are
-	//  * not send through the additional section
-	//  * provide our answers, or no answers if we don't handle those answers (possibly in the future we should write through answers for eg TypeTXT)
-	//   * We handle A, AAAA and HTTPS type questions
-	//   * We drop all others
+	//  * Write the questions through as they are
+	//  * Not send through the additional section
+	//  * Provide our answers, or no answers if we don't handle those answers
+	//  * We handle A, AAAA and HTTPS type questions
+	//  * We drop all others
 
 	// Question Type HTTPS
 	if question.Type == dnsmessage.TypeHTTPS {
@@ -1059,6 +1144,8 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 		}
 		return newBuf
 	}
+
+	tokens := tokensFromHeader(res.DoHMeta.ResponseHeader)
 
 	// Question Type A/AAAA
 	var answers []dnsResponseRewrite
@@ -1163,7 +1250,20 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 					continue
 				}
 			}
-			answers = append(answers, dnsResponseRewrite{domain: queriedDomain, dst: dstAddr, ttlSeconds: h.TTL})
+
+			// The connector may or may not send a token.
+			// If it doesn't, we don't want to bail.
+			// If it does, it may require that the token
+			// be sent back in the TransitIPRequest.
+			token := tokens[dstAddr]
+
+			answers = append(answers, dnsResponseRewrite{
+				domain:        queriedDomain,
+				dst:           dstAddr,
+				ttlSeconds:    h.TTL,
+				connectorNode: connectorNode,
+				token:         token,
+			})
 		default:
 			// we already checked the question was for a supported type, this answer is unexpected
 			if err := p.SkipAnswer(); err != nil {
@@ -1267,4 +1367,60 @@ func pickConnector(nb ipnext.NodeBackend, app appctype.Conn25Attr) []tailcfg.Nod
 	})
 	sortByPreference(nb.Self(), matches)
 	return matches
+}
+
+// extractConnectorFromRequestURL returns the peer whose Tailscale address is
+// the host of u, the PeerAPI DoH URL that a DNS response came back from.
+//
+// That peer is the connector which answered the query, and so is the only peer
+// that will accept the tokens in that response (see [TokenHeader]).
+func (e *extension) extractConnectorFromRequestURL(u *url.URL) (tailcfg.NodeView, error) {
+	if u == nil {
+		return tailcfg.NodeView{}, errors.New("nil URL in PeerAPI DoH request")
+	}
+	nodeAddr, err := netip.ParseAddr(u.Hostname())
+	if err != nil {
+		return tailcfg.NodeView{}, err
+	}
+
+	nodeID, ok := e.host.NodeBackend().NodeByAddr(nodeAddr)
+	if !ok {
+		return tailcfg.NodeView{}, fmt.Errorf("did not find node ID for peer IP addr: %s", nodeAddr.String())
+	}
+
+	node, ok := e.host.NodeBackend().NodeByID(nodeID)
+	if !ok {
+		return tailcfg.NodeView{}, fmt.Errorf("did not find node with ID: %d", nodeID)
+	}
+
+	return node, nil
+}
+
+// TokenHeader is the PeerAPI DoH response header a connector uses to hand a
+// client a token for each address it answered with. One header line is sent
+// per A/AAAA answer, formatted as:
+//
+//	Tailscale-Conn25-Token: <ip> <token>
+//
+// The ip is the correlation key the client uses to match each token
+// to the answer it belongs to in the DNS response body.
+// The token itself is opaque to the client; see [TransitIPRequest.Token].
+const TokenHeader = "Tailscale-Conn25-Token"
+
+// tokensFromHeader returns the tokens in hdr, keyed by the address each one was
+// issued for. See [TokenHeader] for the format.
+func tokensFromHeader(hdr http.Header) map[netip.Addr]string {
+	var tokens map[netip.Addr]string
+	for _, line := range hdr.Values(TokenHeader) {
+		addrStr, token, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || token == "" || strings.Contains(token, " ") {
+			continue
+		}
+		addr, err := netip.ParseAddr(addrStr)
+		if err != nil {
+			continue
+		}
+		mak.Set(&tokens, addr, token)
+	}
+	return tokens
 }

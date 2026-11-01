@@ -150,6 +150,9 @@ func main() {
 		}()
 	}
 
+	// Read before the log upload tee below, which lowers the logger's level to debug.
+	logLevel := zlog.Level()
+
 	// Operator log uploads can be opted-out using the "TS_NO_LOGS_NO_SUPPORT" environment variable.
 	if !envknob.NoLogsNoSupport() {
 		zlog = zlog.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
@@ -159,6 +162,7 @@ func main() {
 
 	runReconcilers(reconcilerOpts{
 		log:                           zlog,
+		logLevel:                      logLevel,
 		tsServer:                      s,
 		tsClient:                      tsc,
 		tailscaleNamespace:            tsNamespace,
@@ -540,12 +544,14 @@ func runReconcilers(opts reconcilerOpts) {
 	// If a ProxyClassChanges, enqueue all Connectors that have
 	// .spec.proxyClass set to the name of this ProxyClass.
 	proxyClassFilterForConnector := handler.EnqueueRequestsFromMapFunc(proxyClassHandlerForConnector(mgr.GetClient(), startlog))
+	nodeFilterForConnector := handler.EnqueueRequestsFromMapFunc(nodeHandlerForConnector(mgr.GetClient(), startlog))
 	err = builder.ControllerManagedBy(mgr).
 		For(&tsapi.Connector{}).
 		Named("connector-reconciler").
 		Watches(&appsv1.StatefulSet{}, connectorFilter).
 		Watches(&corev1.Secret{}, connectorFilter).
 		Watches(&tsapi.ProxyClass{}, proxyClassFilterForConnector).
+		Watches(&corev1.Node{}, nodeFilterForConnector).
 		Complete(&ConnectorReconciler{
 			ssr:      ssr,
 			recorder: eventRecorder,
@@ -751,6 +757,7 @@ func runReconcilers(opts reconcilerOpts) {
 			tsFirewallMode:    opts.proxyFirewallMode,
 			defaultProxyClass: opts.defaultProxyClass,
 			loginServer:       opts.tsServer.ControlURL,
+			logLevel:          opts.logLevel,
 			reissuer:          tailscaled.NewReissuer(),
 
 			sharedACMEAccountKey: opts.sharedACMEAccountKey,
@@ -767,6 +774,7 @@ func runReconcilers(opts reconcilerOpts) {
 
 type reconcilerOpts struct {
 	log                *zap.SugaredLogger
+	logLevel           zapcore.Level // configured level; log's own level is debug while log uploads are on
 	tsServer           *tsnet.Server
 	tsClient           *tailscale.Client
 	tailscaleNamespace string       // namespace in which operator resources will be deployed
@@ -1065,6 +1073,60 @@ func nodeHandlerForProxyGroup(cl client.Client, defaultProxyClass string, logger
 
 			if selector.Matches(klabels.Set(o.GetLabels())) {
 				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pg)})
+			}
+		}
+		return reqs
+	}
+}
+
+// nodeHandlerForConnector returns a handler that, for a given Node, returns a
+// list of reconcile requests for Connectors that should be reconciled for the
+// Node event. Connectors need to be reconciled for Node events if they are
+// configured to expose tailscaled static endpoints to tailnet using NodePort
+// Services.
+func nodeHandlerForConnector(cl client.Client, logger *zap.SugaredLogger) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		cnList := new(tsapi.ConnectorList)
+		if err := cl.List(ctx, cnList); err != nil {
+			logger.Debugf("error listing Connectors for Node: %v", err)
+			return nil
+		}
+
+		reqs := make([]reconcile.Request, 0)
+		for _, cn := range cnList.Items {
+			if cn.Spec.ProxyClass == "" {
+				continue
+			}
+
+			proxyClass := &tsapi.ProxyClass{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: cn.Spec.ProxyClass}, proxyClass); err != nil {
+				if !apierrors.IsNotFound(err) {
+					logger.Debugf("error getting ProxyClass %q: %v", cn.Spec.ProxyClass, err)
+				}
+				continue
+			}
+
+			stat := proxyClass.Spec.StaticEndpoints
+			if stat == nil {
+				continue
+			}
+
+			// If the selector is empty, all nodes match.
+			if len(stat.NodePort.Selector) == 0 {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&cn)})
+				continue
+			}
+
+			selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+				MatchLabels: stat.NodePort.Selector,
+			})
+			if err != nil {
+				logger.Debugf("error converting `spec.staticEndpoints.nodePort.selector` to Selector: %v", err)
+				continue
+			}
+
+			if selector.Matches(klabels.Set(o.GetLabels())) {
+				reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&cn)})
 			}
 		}
 		return reqs
